@@ -1,0 +1,25 @@
+# deps & build
+node_modules/
+out/
+dist/
+*.log
+
+# secrets (never commit)
+.env
+.env.*
+!.env.example
+.pentbox/
+*.key
+*.pem
+*.pfx
+
+# temp
+tmp-*.cjs
+tmp-*.js
+
+# OS
+Thumbs.db
+.DS_Store
+
+# hermes local
+.hermes/
