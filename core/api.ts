@@ -27,6 +27,7 @@ import type { FlowMeta, ProxyEngine, Upstream } from './proxy.ts'
 import type { ChromeBrowser } from './browser.ts'
 import type { FirefoxBrowser } from './firefox.ts'
 import type { SshSession } from './ssh.ts'
+import { AgentBridgeClient } from './bridge.ts'
 
 /** 漏洞记录（Agent CRUD + UI 展示） */
 export interface Vuln {
@@ -73,6 +74,15 @@ export function parseReasoningEffort(effort?: string): { enabled: boolean; effor
   const norm = ['xhigh', 'max', 'ultra'].includes(e) ? 'max' : e
   if (!['low', 'medium', 'high', 'max'].includes(norm)) return null
   return { enabled: true, effort: norm }
+}
+
+/** 全局情报条目（结构化：多 Agent 战况共享；持久条目不淘汰，滚动条目 20 条窗口） */
+interface DigestEntry {
+  kind: 'vuln' | 'cred' | 'nday' | 'penetrating' | 'penetrated' | 'cancelled' | 'note'
+  host: string
+  path: string
+  data: string
+  persist: boolean
 }
 
 export class ApiServer {
@@ -156,16 +166,70 @@ export class ApiServer {
   // ---------------- Agent 分析队列（流量逐个入队，外部 Agent 消费 /api/analyze/next 并写回结果） ----------------
   private analyzeQueue: number[] = []
   private analyzeMap = new Map<number, { state: 'queued' | 'analyzing' | 'done'; vuln?: boolean; level?: string; detail?: unknown; url?: string; sensitive?: { type: string; value: string }[] }>()
-  /** 全局情报 digest：所有槽分析结论滚动汇总（注入每次分析 prompt——子 Agent 共享上下文，防记忆割裂） */
-  private analysisDigest: string[] = []
-  /** 已确认漏洞的 URL（基于全局情报去重：同 URL 不再重复推送渗透意见卡） */
-  private vulnUrls = new Set<string>()
+  /** 全局情报 digest：所有槽分析结论/凭据/渗透状态/取消记录结构化汇总（注入每次分析 prompt——子 Agent 共享上下文，防记忆割裂） */
+  private analysisDigest: DigestEntry[] = []
+  /** 已推送意见卡的去重 key（无协议 Host+路径+查询 | 渗透方式）：同 URL 同方式不再重复推送；不同方式可再推（与"不同方式可再渗"一致） */
+  private advisedKeys = new Set<string>()
   /** 已渗透成功的 URL+渗透方式（渗透成果去重：同 API 同方式不再重复渗透；不同方式可再渗） */
   private penetratedKeys = new Set<string>()
+  /** 进行中的渗透 key（URL+渗透方式，统一 key 格式）：防同一 URL 同方式并发双渗透/双卡 */
+  private penetratingKeys = new Set<string>()
   /** 进行中渗透的目标（slot → "Host+路径 方式"，供取消时写入全局情报） */
   private penetrateTargets = new Map<number, string>()
+  /** 已提出渗透意见卡、等待用户决策的子 Agent 槽位（暂停该槽流量分析；用户点渗透/取消/卡片关闭后恢复） */
+  private pendingAdviceSlots = new Set<number>()
   /** 本地 hermes gateway 进程（渗透经 gateway 执行：取消走 WebSocket abort 信号，参考 hermes-studio chat-run 实现） */
   private gatewayProc: ReturnType<typeof spawn> | null = null
+
+  // ---------------- Agent Bridge（主 Agent 对话 + 运行中引导 steer；参考 hermes-studio agent-bridge） ----------------
+  /** 本应用专用 bridge 端口（独立于桌面 backend 的 18765，避免冲突） */
+  private readonly bridgePort = 28766
+  /** bridge broker 进程 */
+  private bridgeProc: ReturnType<typeof spawn> | null = null
+  /** bridge 就绪标记（TCP 可连 = 就绪） */
+  private bridgeReady = false
+  /** bridge 客户端 */
+  private bridge = new AgentBridgeClient({ host: '127.0.0.1', port: this.bridgePort })
+
+  /** 确保本地 Agent Bridge broker 运行（hermes-studio 的 hermes_bridge.py；TCP line-protocol，独立端口）
+   * bridge 未启动时 spawn python hermes_bridge.py；就绪后 bridge 可调 action:chat/steer/get_output */
+  private ensureBridge(): Promise<void> {
+    if (this.bridgeReady) return Promise.resolve()
+    return new Promise((resolve) => {
+      const probe = () => {
+        this.bridge.ping()
+          .then(() => { this.bridgeReady = true; resolve() })
+          .catch(() => {
+            if (!this.bridgeProc) {
+              // 用 hermes-agent 的 venv python 启动本应用自带的 Agent Bridge（core/pentbox_bridge.py）
+              const py = join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent', 'venv', 'Scripts', 'python.exe')
+              // 优先环境变量指定，否则用应用自带脚本（部署/开发目录）
+              const candidates = [
+                process.env.PENTBOX_BRIDGE_SCRIPT,
+                join(process.cwd(), 'core', 'pentbox_bridge.py'),
+                join(__dirname, '..', 'core', 'pentbox_bridge.py'),
+              ]
+              const found = candidates.find((p) => p && existsSync(p))
+              if (!found) { console.warn('[pentbox] pentbox_bridge.py 未找到，steer/对话桥接不可用'); resolve(); return }
+              console.log('[pentbox] 启动 Agent Bridge broker…', found)
+              this.bridgeProc = spawn(py, [found, '--port', String(this.bridgePort), '--hermes-home', this.hermesHome], {
+                env: { ...process.env, HERMES_HOME: this.hermesHome, HERMES_AGENT_ROOT: join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent'), PENTBOX_BRIDGE_LOG: join(process.cwd(), 'core', 'pentbox_bridge.log') }, cwd: this.agentCwd, detached: true, stdio: 'ignore', windowsHide: true,
+              })
+              this.bridgeProc.on('exit', () => { this.bridgeProc = null; this.bridgeReady = false })
+              this.bridgeProc.unref()
+            }
+            // 轮询直到可连（broker 启动约 2-5s）
+            const t0 = Date.now()
+            const iv = setInterval(() => {
+              this.bridge.ping()
+                .then(() => { clearInterval(iv); this.bridgeReady = true; resolve() })
+                .catch(() => { if (Date.now() - t0 > 25000) { clearInterval(iv); console.warn('[pentbox] Agent Bridge 启动超时'); resolve() } })
+            }, 1000)
+          })
+      }
+      probe()
+    })
+  }
 
   /** 确保本地 gateway 运行（127.0.0.1:8642 探测；未运行则 spawn hermes gateway run 后台） */
   private ensureGateway(): Promise<void> {
@@ -190,57 +254,94 @@ export class ApiServer {
     })
   }
 
-  /** 渗透经本地 gateway 执行（官方 api_server：POST /v1/runs 启动 → GET /v1/runs/{id}/events SSE 聚合 → 取消 = POST /v1/runs/{id}/stop，参考官方 desktop 后端实现） */
+  /** 渗透经本地 Agent Bridge 执行（与主对话/分析同通道，会话可 steer；取消 = bridge interrupt） */
   private runViaGateway(input: string, sessionId: string | null, onChild?: (stop: () => void) => void): Promise<string> {
-    const http = require('node:http') as typeof import('node:http')
-    const fs = require('node:fs') as typeof import('node:fs')
-    const key = (fs.readFileSync(join(this.hermesHome, '.env'), 'utf8').match(/API_SERVER_KEY=(.+)/) || [])[1]?.trim() || ''
-    const base = { host: '127.0.0.1', port: 8642, headers: { Authorization: 'Bearer ' + key, 'content-type': 'application/json' } }
-    const post = (path: string, body: unknown) => new Promise<{ code: number; body: string }>((resolve, reject) => {
-      const data = JSON.stringify(body ?? {})
-      const r = http.request({ ...base, path, method: 'POST', headers: { ...base.headers, 'content-length': Buffer.byteLength(data) } }, (res) => {
-        let b = ''
-        res.on('data', (d) => (b += d))
-        res.on('end', () => resolve({ code: res.statusCode ?? 0, body: b }))
-      })
-      r.on('error', reject)
-      r.write(data)
-      r.end()
+    return this.bridgeAsk(input, sessionId, {
+      onAbort: (stop) => onChild?.(stop),
     })
+  }
+
+  /** 主 Agent 对话经本地 Agent Bridge 执行（参考 hermes-studio agent-bridge）：
+   * action:chat 启动会话（session_id 持久，跨轮续传）→ get_output 轮询流式输出（delta 增量）
+   * 运行中可调 action:steer 注入引导（不打断当前 turn）；onEvent 回调：delta 流式 / done 收尾 / error
+   * onAbort 回调：供前端中断（interrupt 优雅停止，保留会话历史） */
+  private chatViaGateway(input: string, sessionId: string | null, onEvent: (ev: { type: 'delta' | 'done' | 'error' | 'tool' | 'sid'; text?: string; reply?: string; error?: string; sessionId?: string; tool?: string; preview?: string; evType?: string }) => void, onAbort?: (stop: () => void) => void): Promise<string> {
+    return this.bridgeAsk(input, sessionId, {
+      onDelta: (t) => onEvent({ type: 'delta', text: t }),
+      onSid: (sid) => onEvent({ type: 'sid', sessionId: sid }),
+      onTool: (ev) => onEvent({ type: 'tool', evType: ev.type, tool: ev.tool, preview: ev.preview }),
+      onDone: (sid, reply) => onEvent({ type: 'done', reply, sessionId: sid }),
+      onError: (msg) => onEvent({ type: 'error', error: msg }),
+      onAbort,
+    })
+  }
+
+  /** 通用 Agent Bridge 单轮对话（分析/渗透/沟通/主对话共用）：
+   * 无会话则新建（persist）；有则续传。返回完整回复文本。 */
+  private bridgeAsk(input: string, sessionId: string | null, opts: { onDelta?: (t: string) => void; onDone?: (sid: string, reply: string) => void; onSid?: (sid: string) => void; onTool?: (ev: { type: string; tool: string; preview: string }) => void; onError?: (msg: string) => void; onAbort?: (stop: () => void) => void } = {}): Promise<string> {
     return new Promise((resolve, reject) => {
-      this.ensureGateway().then(() => {
-        post('/v1/runs', { input, session_id: sessionId ?? undefined, source: 'coding_agent' }).then((r) => {
-          if (r.code !== 202) return reject(new Error(`run 启动失败：${r.code} ${r.body.slice(0, 120)}`))
-          const runId = (r.body.match(/"run_id"\s*:\s*"([^"]+)"/) || [])[1]
-          if (!runId) return reject(new Error('run_id 缺失'))
+      this.ensureBridge().then(async () => {
+        try {
+          if (!this.bridgeReady) return reject(new Error('Agent Bridge 未就绪'))
+          // 无会话 → 新建 bridge 会话（persist）
+          let sid = sessionId
+          if (!sid) {
+            sid = `pentbox-chat-${Date.now()}`
+            if (this.chatSessionId === sessionId) this.chatSessionId = sid
+          }
+          opts.onSid?.(sid)  // 尽早通知会话 id（前端运行中 steer 需要）
+          const started = await this.bridge.chat(sid, input, 'hermespentbox')
+          if (!started?.ok) return reject(new Error('bridge 对话启动失败'))
+          // 会话已在运行（并发/串话）：等待当前 run 完成后自动续发（同 session 串行），避免丢失消息
+          if (started.status === 'already_running') {
+            // 轮询上一次 run 直到 done
+            const prevRun = started.run_id
+            await new Promise<void>((res) => {
+              const iv = setInterval(async () => {
+                try {
+                  const o = await this.bridge.getOutput(prevRun, 0, 0)
+                  if (o.done) { clearInterval(iv); res() }
+                } catch { clearInterval(iv); res() }
+              }, 300)
+            })
+            return this.bridgeAsk(input, sid, opts)  // 递归：上一轮完成后重发本条
+          }
+          const runId = started.run_id
           let out = ''
           let finished = false
+          let cursor = 0
+          let eventCursor = 0
+          let lastToolCount = 0
           const finish = (err?: Error) => { if (finished) return; finished = true; err ? reject(err) : resolve(out) }
-          // 取消：POST /v1/runs/{id}/stop（官方停止端点，替代杀进程）
-          onChild?.(() => { post(`/v1/runs/${runId}/stop`, {}).catch(() => {}); setTimeout(finish, 2000) })
-          // SSE 事件流聚合（message.delta 文本 → run.completed 收尾）
-          const ev = http.get({ ...base, path: `/v1/runs/${runId}/events` })
-          ev.on('response', (res) => {
-            let buf = ''
-            res.on('data', (d) => {
-              buf += d
-              let idx
-              while ((idx = buf.indexOf('\n\n')) >= 0) {
-                const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2)
-                const line = chunk.split('\n').find((l) => l.startsWith('data:'))
-                if (!line) continue
-                let f
-                try { f = JSON.parse(line.slice(5).trim()) } catch { continue }
-                if (f.event === 'message.delta') out += f.text ?? f.delta ?? ''
-                else if (f.event === 'run.completed') { if (f.output) out = f.output; finish() }
-                else if (f.event === 'run.failed') finish(new Error(f.error || 'run failed'))
+          opts.onAbort?.(() => { this.bridge.interrupt(sid, undefined, 'hermespentbox').catch(() => {}); setTimeout(finish, 1500) })
+          // 轮询 get_output（100ms 间隔）直到 done；delta 增量 + 工具进度转发
+          const pump = async () => {
+            while (!finished) {
+              let chunk
+              try { chunk = await this.bridge.getOutput(runId, cursor, eventCursor) } catch (e) { finish(new Error(`bridge 输出轮询失败：${(e as Error).message}`)); return }
+              if (!chunk?.ok) { finish(new Error('bridge get_output 失败')); return }
+              cursor = chunk.cursor ?? cursor
+              eventCursor = chunk.event_cursor ?? eventCursor
+              // 工具进度事件（新到才转发）
+              if (opts.onTool && Array.isArray(chunk.tool_events) && chunk.tool_events.length > lastToolCount) {
+                for (const ev of chunk.tool_events.slice(lastToolCount)) opts.onTool(ev)
+                lastToolCount = chunk.tool_events.length
               }
-            })
-            res.on('end', () => finish())
-            res.on('error', (e) => finish(new Error(`SSE 流错误：${e.message}`)))
-          })
-          ev.on('error', (e) => finish(new Error(`SSE 连接失败：${e.message}`)))
-        }).catch((e) => reject(e))
+              if (chunk.delta) { out += chunk.delta; opts.onDelta?.(chunk.delta) }
+              if (chunk.status === 'error' || chunk.error) { opts.onError?.(chunk.error || 'run error'); finish(new Error(chunk.error || 'run error')); return }
+              if (chunk.done) {
+                if (chunk.output) out = chunk.output
+                opts.onDone?.(sid, out)
+                finish()
+                return
+              }
+              await new Promise((r) => setTimeout(r, 120))
+            }
+          }
+          pump()
+        } catch (e) {
+          reject(e)
+        }
       }).catch(reject)
     })
   }
@@ -302,6 +403,7 @@ export class ApiServer {
     /clientservices\.google\.com/,      // Chrome 遥测
     /accounts\.google\.com\/domainreliability/,  // 账户域可靠性上传
     /www\.google\.com\/async\//,                 // 首页异步功能（folae 等）
+    /www\.google\.com\/complete\/search/,        // 地址栏自动补全（omnibox suggestions：client=chrome-omni 等）
     /ohttp_gateway/,                             // gstatic OHTTP 网关（隐私代理）
     /gvt1-cn\.com/,                              // 字典 CDN 镜像（sn-*.gvt1-cn.com）
     /update\.googleapis\.com/,                   // Chrome 组件更新服务
@@ -379,19 +481,23 @@ export class ApiServer {
   /** 本地 Hermes 在线状态（后端每 5s 探测，供 UI 实时刷新 HERMES AGENT 状态） */
   private hermesOnline = false
   private probeHermes(): void {
+    // 工作台 Agent 功能（对话/分析/渗透/steer）依赖自研 Agent Bridge（28766）+ hermes CLI。
+    // 状态正确判定：CLI 存在 && bridge 可连 → active；否则 offline。
     if (!existsSync(this.hermesCli)) { this.hermesOnline = false; return }
     let done = false
     const set = (v: boolean) => { if (!done) { done = true; this.hermesOnline = v } }
-    // desktop 后端端口（18765=backend，18766=内部桥），任一可连即在线
-    for (const port of [18765, 18766]) {
-      const s = connect({ host: '127.0.0.1', port, timeout: 800 })
-      s.once('connect', () => { s.destroy(); set(true) })
-      s.once('error', () => s.destroy())
-      s.once('timeout', () => s.destroy())
-      s.setTimeout(800)
-      // 全部失败后（两连接都 error/timeout）置离线
-      setTimeout(() => { if (!done) set(false) }, 900)
-    }
+    // 探测自研 Agent Bridge 端口（对话/分析/渗透/steer 实际依赖）
+    const s = connect({ host: '127.0.0.1', port: this.bridgePort, timeout: 800 })
+    s.once('connect', () => { s.destroy(); set(true) })
+    s.once('error', () => s.destroy())
+    s.once('timeout', () => s.destroy())
+    s.setTimeout(800)
+    // 探测失败 → offline；同时若 CLI 存在且 bridge 未运行，触发一次拉起（ensureBridge 幂等）
+    setTimeout(() => {
+      if (done) return
+      set(false)
+      this.ensureBridge().catch(() => {})
+    }, 900)
   }
   private hermesSessionId: string | null = null
   private hermesBusy = false
@@ -430,43 +536,34 @@ export class ApiServer {
     return this.runHermes(message, this.chatSessionId, (sid) => { this.chatSessionId = sid })
   }
 
-  /** 调本地 Hermes 分析一条流量（异步 spawn 不阻塞主进程）：首次建会话（抓 session_id），之后 --resume 同一会话；返回含 slot（提出意见的子 Agent 槽位） */
+  /** 调本地 Hermes 分析一条流量（Agent Bridge 并行会话，不阻塞主进程）：每槽独立 bridge 会话续传上下文；返回含 slot（提出意见的子 Agent 槽位） */
   private hermesAnalyze(detail: unknown): Promise<{ vuln: boolean; level: string; sensitive: { type: string; value: string }[]; advice: string; slot: number }> {
     const d = (detail ?? {}) as Record<string, unknown>
-    const digest = this.analysisDigest.length
-      ? `【全局情报】此前其他分析已发现：\n${this.analysisDigest.join('\n')}\n（结合这些情报判断当前流量是否与已知发现关联、是否同一目标的其他风险面）\n\n`
-      : ''
+    const digest = this.digestPrompt()
     const prompt = digest + '分析以下 HTTP 流量（完整请求/响应）：\n1. 判断是否存在可利用的安全漏洞；\n2. 提取流量中的可利用敏感信息，分三类：\n   a) 攻击凭据：API Key / Bearer Token / Access Token / Password / Secret / Session Cookie / Private Key / Cloud Access Key / Authorization 等；\n   b) 敏感个人信息：手机号(type=Phone) / 身份证号(type=ID Card) / 银行卡号(type=Bank Card) / Email 等；\n   c) Nday 线索：疑似存在已知漏洞 CVE 的 API 路径/组件/版本、可疑 JS 引用 → type 用 "Nday API" / "Nday JS" / "Nday 组件"。\n3. 若存在可利用漏洞（vuln=true），输出渗透意见 advice，格式必须为："经 Hermes 分析 <API路径> 可进行 <攻击方式> 渗透，是否进行"（攻击方式用具体手法：SQL 注入/未授权访问/SSRF/暴力破解/越权等）。注意：vuln=true 时 advice 必填，禁止输出空字符串。\n只输出一行 JSON，格式：{"vuln": true或false, "level": "high|medium|low|info", "sensitive": [{"type": "类型", "value": "值"}], "advice": "渗透意见或空"}。无漏洞时 advice 为空字符串。\n\n【请求】\n' +
       `${d.reqLine ?? ''}\n${((d.reqRawHeaders as string[]) ?? []).join('\n')}\n\n${d.reqBody ?? ''}\n\n【响应】\n${d.resLine ?? ''}\n${((d.resRawHeaders as string[]) ?? []).join('\n')}\n\n${String(d.resBody ?? '').slice(0, 4000)}`
     // 负载均衡：选当前最空闲的子 Agent 槽（最少连接算法），而非静态轮转
-    // 渗透中的槽不接新流量分析（Agent 提出渗透意见后专注渗透；超时/取消/完成后再恢复分配）
-    const busy = this.slotBusy.map((v, i) => (this.penetrateTargets.has(i) ? Infinity : v))
+    // 渗透中的槽 + 已提出渗透意见卡待决策的槽 不接新流量分析（Agent 专注渗透/等待决策；取消/完成/卡片关闭后再恢复分配）
+    const busy = this.slotBusy.map((v, i) => (this.penetrateTargets.has(i) || this.pendingAdviceSlots.has(i) ? Infinity : v))
     const slot = busy.indexOf(Math.min(...busy))
     this.slotBusy[slot]++
-    const sid = this.analyzeSlots[slot]
-    // spawn 不经 shell：prompt 含 | 等字符安全；session_id 在 stderr，需合并捕获
-    const args = ['chat', '-q', prompt, '-Q', '--source', 'pentbox-analyzer']
-    if (sid) args.push('--resume', sid)
-    return new Promise((resolve, reject) => {
-      const child = spawn(this.hermesCli, args, { timeout: 240000, env: this.hermesEnv, cwd: this.agentCwd, windowsHide: true })
-      let out = ''
-      child.stdout.on('data', (b) => { out += b })
-      child.stderr.on('data', (b) => { out += b })
-      child.on('error', reject)
-      child.on('close', () => {
-        this.slotBusy[slot]--
-        const newSid = out.match(/session_id:\s*(\S+)/)?.[1]
-        if (newSid) this.analyzeSlots[slot] = newSid
-        const p = this.extractJson(out)
-        const sens: { type: string; value: string }[] = Array.isArray(p?.sensitive) ? p.sensitive.filter((s: unknown) => s && typeof s === 'object' && (s as { value?: unknown }).value != null).map((s) => ({ type: String((s as { type?: unknown }).type ?? 'Secret'), value: String((s as { value?: unknown }).value).slice(0, 200) })) : []
-        let advice = p && typeof p.advice === 'string' && p.advice ? p.advice.slice(0, 300) : ''
-        // 兜底：模型判有漏洞但 advice 空（输出不稳定）→ 用请求路径生成渗透意见（保证意见卡出现）
-        if (p?.vuln && !advice) {
-          const pm = String(d.reqLine ?? '').match(/\S+\s+(\S+)/)
-          advice = `经 Hermes 分析 ${pm ? pm[1] : '目标'} 可进行 安全测试 渗透，是否进行`
-        }
-        resolve({ vuln: p ? !!p.vuln : false, level: p?.level ?? 'info', sensitive: sens, advice, slot })
-      })
+    const sid = this.analyzeSlots[slot]  // bridge 会话 id（首次 null → 自动新建）
+    return this.bridgeAsk(prompt, sid, {
+      onDone: (newSid) => { this.analyzeSlots[slot] = newSid },
+    }).then((out) => {
+      this.slotBusy[slot]--
+      const p = this.extractJson(out)
+      const sens: { type: string; value: string }[] = Array.isArray(p?.sensitive) ? p.sensitive.filter((s: unknown) => s && typeof s === 'object' && (s as { value?: unknown }).value != null).map((s) => ({ type: String((s as { type?: unknown }).type ?? 'Secret'), value: String((s as { value?: unknown }).value).slice(0, 200) })) : []
+      let advice = p && typeof p.advice === 'string' && p.advice ? p.advice.slice(0, 300) : ''
+      // 兜底：模型判有漏洞但 advice 空（输出不稳定）→ 用请求路径生成渗透意见（保证意见卡出现）
+      if (p?.vuln && !advice) {
+        const pm = String(d.reqLine ?? '').match(/\S+\s+(\S+)/)
+        advice = `经 Hermes 分析 ${pm ? pm[1] : '目标'} 可进行 安全测试 渗透，是否进行`
+      }
+      return { vuln: p ? !!p.vuln : false, level: p?.level ?? 'info', sensitive: sens, advice, slot }
+    }).catch((e) => {
+      this.slotBusy[slot]--
+      throw e
     })
   }
 
@@ -486,6 +583,74 @@ export class ApiServer {
     return null
   }
 
+  /** 目标 URL 统一规范化 key（P0：发卡去重/渗透前查重/成果写入三处共用，保证格式一致）：
+   * 去协议、host 小写、保留端口（显式时）+ 路径 + 查询参数；如 https://EXAMPLE.com:8443/api/login?x=1 → example.com:8443/api/login?x=1 */
+  private normalizeTargetKey(input: string): string {
+    if (!input) return ''
+    try {
+      const u = new URL(input.includes('://') ? input : `http://${input}`)
+      const host = (u.hostname || '').toLowerCase()
+      const port = u.port ? `:${u.port}` : ''
+      return `${host}${port}${u.pathname}${u.search}`
+    } catch {
+      return input.replace(/^https?:\/\//i, '').toLowerCase()
+    }
+  }
+
+  /** 从 URL 提取 host（含端口），用于按目标关联情报 */
+  private hostOf(url: string): string {
+    try { return new URL(url).host } catch { return '' }
+  }
+
+  /** 写入全局情报（持久条目不淘汰；滚动条目仅保留最近 20 条非持久流水） */
+  private pushDigest(entry: DigestEntry): void {
+    this.analysisDigest.push(entry)
+    // 滚动条目窗口：持久条目保留，非持久只留最近 20 条
+    const roll = this.analysisDigest.filter((e) => !e.persist)
+    if (roll.length > 20) {
+      const dropCount = roll.length - 20
+      let dropped = 0
+      this.analysisDigest = this.analysisDigest.filter((e) => {
+        if (e.persist || dropped >= dropCount) return true
+        dropped++
+        return false
+      })
+    }
+    // 全局 digest 总量上限（防 token 失控）：持久条目最多 60 条
+    const pers = this.analysisDigest.filter((e) => e.persist)
+    if (pers.length > 60) {
+      const overflow = pers.length - 60
+      let dropped = 0
+      this.analysisDigest = this.analysisDigest.filter((e) => {
+        if (!e.persist || dropped >= overflow) return true
+        dropped++
+        return false
+      })
+    }
+  }
+
+  /** 移除全局情报条目（按 kind+host+path 精确匹配；进行中渗透/临时标记移除用） */
+  private removeDigest(kind: DigestEntry['kind'], host: string, path: string): void {
+    this.analysisDigest = this.analysisDigest.filter((e) => !(e.kind === kind && e.host === host && e.path === path))
+  }
+
+  /** 渲染全局情报注入文本（结构化分类，按目标相关性突出） */
+  private digestPrompt(): string {
+    if (!this.analysisDigest.length) return ''
+    const pers = this.analysisDigest.filter((e) => e.persist)
+    const roll = this.analysisDigest.filter((e) => !e.persist)
+    const lines: string[] = []
+    if (pers.length) {
+      lines.push('【持久情报】（已确认/高价值，全生命周期保留）')
+      for (const e of pers) lines.push(`  [${e.kind}] ${e.host}${e.path}：${e.data}`)
+    }
+    if (roll.length) {
+      lines.push('【最近分析流水】')
+      for (const e of roll) lines.push(`  [${e.kind}] ${e.host}${e.path}：${e.data}`)
+    }
+    return `【全局情报】多 Agent 战况共享：\n${lines.join('\n')}\n（结合这些情报判断当前流量是否与已知发现关联、是否同一目标的其他风险面）\n\n`
+  }
+
   /** 分析消费泵（并发 10 个子 Agent）：队列取 → 本地 Hermes 并行分析（10 槽独立会话）→ 写回；单条失败跳过不阻塞 */
   private inFlight = 0
   private static readonly MAX_PARALLEL = 10
@@ -500,21 +665,51 @@ export class ApiServer {
         this.hermesAnalyze(st.detail)
           .then((r) => {
             st.state = 'done'; st.vuln = r.vuln; st.level = r.level; st.sensitive = r.sensitive
-            // 全局情报 digest：有发现的结论入滚动汇总（子 Agent 共享上下文）
-            if (r.vuln || r.sensitive?.length) {
-              const u = st.url || ''
-              const line = `${u}：${r.vuln ? `漏洞(${r.level})` : ''}${r.advice ? ` 意见:${r.advice.slice(0, 60)}` : ''}${(r.sensitive || []).slice(0, 3).map((s) => ` 敏感[${s.type}:${String(s.value).slice(0, 40)}]`).join('')}`.slice(0, 300)
-              this.analysisDigest.push(line)
-              if (this.analysisDigest.length > 20) this.analysisDigest.splice(0, this.analysisDigest.length - 20)  // 最多 20 条（token 可控）
+            const u = st.url || ''
+            const host = this.hostOf(u)
+            const path = u.replace(/^https?:\/\/[^/]+/i, '') || ''
+            // 全局情报 digest（结构化分层）：
+            // 1) 漏洞/分析结论 → 滚动流水（20 条窗口）
+            if (r.vuln || r.advice) {
+              this.pushDigest({ kind: 'vuln', host, path, data: `${r.vuln ? `漏洞(${r.level})` : '分析'}:${(r.advice || '').slice(0, 80)}`, persist: false })
+            }
+            // 2) 敏感凭据 → 持久情报（全生命周期保留，子 Agent 共享杠杆）+ 自动凭据利用意见卡
+            const credTypes = ['api key', 'bearer', 'token', 'password', 'secret', 'session cookie', 'private key', 'cloud access key', 'authorization', 'session']
+            for (const s of r.sensitive || []) {
+              const t = String(s.type || '').toLowerCase()
+              const isCred = credTypes.some((c) => t.includes(c))
+              const credHost = host || '未知'
+              if (isCred) {
+                this.pushDigest({ kind: 'cred', host: credHost, path, data: `${s.type}:${String(s.value).slice(0, 200)}`, persist: true })
+                // 凭据自动意见：攻击凭据是最高价值杠杆 → 自动推"凭据利用"意见卡（不打断分析）
+                if (u) {
+                  const credKey = `${this.normalizeTargetKey(u)}|凭据利用`
+                  if (!this.advisedKeys.has(credKey) && !this.penetratedKeys.has(credKey) && !this.penetratingKeys.has(credKey)) {
+                    this.pushSse({ type: 'analyze-advice', id, advice: `经 Hermes 分析 ${path || u} 可进行 凭据利用 渗透，是否进行`, level: r.level || 'high', slot: r.slot })
+                    this.advisedKeys.add(credKey)
+                    this.pendingAdviceSlots.add(r.slot)
+                  }
+                }
+              }
+            }
+            // 3) 非凭据敏感信息（手机号/身份证/nday 线索等）→ 滚动流水
+            for (const s of r.sensitive || []) {
+              const t = String(s.type || '').toLowerCase()
+              if (!credTypes.some((c) => t.includes(c))) {
+                this.pushDigest({ kind: t.includes('nday') ? 'nday' : 'note', host, path, data: `${s.type}:${String(s.value).slice(0, 60)}`, persist: false })
+              }
             }
             // 渗透意见 → SSE 推送（前端 Hermes Agent 聊天框渲染意见卡：进行/取消/回复；slot 绑定提出意见的子 Agent，进行渗透由该子 Agent 执行）
-            // 基于全局情报去重：同 URL 已确认漏洞（vulnUrls）→ 不再重复推送；同 URL 同方式已渗透过（penetratedKeys）→ 不再推送（发卡前查重，避免重复任务）
+            // 发卡去重（统一 key：normalizeTargetKey 规范化 Host+完整路径+查询 | 方式）：
+            // 同 URL 同方式已推送过（advisedKeys）/ 已渗透过（penetratedKeys）/ 正在渗透（penetratingKeys）→ 不再推送；不同方式可再推
             if (r.advice) {
               const u = st.url || ''
               const pm = r.advice.match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
-              if (!(r.vuln && u && this.vulnUrls.has(u)) && !(u && this.penetratedKeys.has(`${u}|${pm}`))) {
+              const key = u ? `${this.normalizeTargetKey(u)}|${pm}` : ''
+              if (key && !this.advisedKeys.has(key) && !this.penetratedKeys.has(key) && !this.penetratingKeys.has(key)) {
                 this.pushSse({ type: 'analyze-advice', id, advice: r.advice, level: r.level, slot: r.slot })
-                if (r.vuln && u) this.vulnUrls.add(u)
+                this.advisedKeys.add(key)
+                this.pendingAdviceSlots.add(r.slot)  // 提出卡片 → 暂停该槽流量分析（等用户决策渗透/取消）
               }
             }
           })
@@ -725,10 +920,63 @@ export class ApiServer {
         }
         // ---------------- 浏览器控制 ----------------
         case '/api/chat': {
-          const body = JSON.parse(await this.readBody(req)) as { message: string }
+          const body = JSON.parse(await this.readBody(req)) as { message: string; stream?: boolean }
           if (!body.message) throw new Error('empty message')
+          if (body.stream) {
+            // SSE 流式对话（经本地 gateway，与渗透同通道）：message.delta → data:{"type":"delta"...}；收尾 data:{"type":"done"...}
+            // 客户端断开（abort）→ 触发 gateway stop（不中断渗透/分析，独立会话）
+            res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...CORS })
+            let closed = false
+            const send = (obj: unknown) => { if (!closed) { try { res.write(`data: ${JSON.stringify(obj)}\n\n`) } catch { /* 客户端已断开 */ } } }
+            const stop = (abort: () => void) => { req.on('close', () => { closed = true; try { abort() } catch { /* 已结束 */ } }) }
+            try {
+              // chatViaGateway 的 onEvent 已推送 done/error，这里只需等它完成并结束响应
+              await this.chatViaGateway(body.message, this.chatSessionId, (ev) => send(ev), stop)
+              // 主 Agent 回流：用户消息中含目标 URL/明确指示 → 写入全局情报（子 Agent 共享，最高优先级）
+              const msgUrl = (body.message || '').match(/https?:\/\/[^\s"'）)\]]+/)?.[0]
+              const msgKey = (body.message || '').match(/(?:目标|target|渗透|测试)[:：]?\s*([a-zA-Z0-9.\-:]+)/)?.[1]
+              const refUrl = msgUrl || msgKey
+              if (refUrl) {
+                const nHost = this.hostOf(msgUrl || refUrl.includes('://') ? msgUrl || refUrl : `http://${refUrl}`)
+                const nPath = msgUrl ? msgUrl.replace(/^https?:\/\/[^/]+/i, '') : ''
+                this.pushDigest({ kind: 'note', host: nHost, path: nPath, data: `主 Agent 指示：${body.message.slice(0, 80)}`, persist: true })
+              }
+            } catch (e) {
+              if (!closed) send({ type: 'error', error: e instanceof Error ? e.message : String(e) })
+            }
+            res.end()
+            break
+          }
           const reply = await this.hermesChat(body.message)
           this.json(res, 200, { reply, sessionId: this.analyzeSlots[0] })
+          break
+        }
+        // ---------------- Agent Bridge 运行中引导（steer）/ 状态 / 中断 ----------------
+        case '/api/chat/steer': {
+          const body = JSON.parse(await this.readBody(req)) as { text: string; sessionId?: string }
+          if (!body.text) throw new Error('text 缺失')
+          const sid = body.sessionId || this.chatSessionId || `pentbox-chat-${Date.now()}`
+          if (body.sessionId) this.chatSessionId = sid
+          await this.ensureBridge()
+          if (!this.bridgeReady) throw new Error('Agent Bridge 未就绪')
+          const r = await this.bridge.steer(sid, body.text, 'hermespentbox')
+          this.json(res, 200, r)
+          break
+        }
+        case '/api/chat/status': {
+          const body = JSON.parse(await this.readBody(req)) as { sessionId?: string }
+          const sid = body.sessionId || this.chatSessionId
+          await this.ensureBridge()
+          if (!sid || !this.bridgeReady) { this.json(res, 200, { exists: false, running: false }); break }
+          this.json(res, 200, await this.bridge.status(sid, 'hermespentbox'))
+          break
+        }
+        case '/api/chat/interrupt': {
+          const body = JSON.parse(await this.readBody(req)) as { sessionId?: string; message?: string }
+          const sid = body.sessionId || this.chatSessionId
+          await this.ensureBridge()
+          if (sid && this.bridgeReady) await this.bridge.interrupt(sid, body.message, 'hermespentbox').catch(() => {})
+          this.json(res, 200, { ok: true })
           break
         }
         case '/api/browser/launch': {
@@ -1070,29 +1318,52 @@ export class ApiServer {
           const body = JSON.parse(await this.readBody(req)) as { advice?: string; slot?: number; reqRaw?: string; resRaw?: string }
           if (!body.advice) throw new Error('advice 缺失')
           const slot = typeof body.slot === 'number' && body.slot >= 0 && body.slot < ApiServer.MAX_PARALLEL ? body.slot : 0
-          // 渗透前查重：从原始请求包提取目标（Host+路径）+ advice 提取渗透方式；同 API 同方式已渗透过 → 不重复执行
+          // 渗透前查重：从原始请求包提取目标（Host+路径）+ advice 提取渗透方式；同 API 同方式已渗透过/正在渗透 → 不重复执行
+          // P0：targetKey 用 normalizeTargetKey 统一规范化（与发卡/成果写入格式一致）
           const rawT = (body.reqRaw || '').match(/^\S+\s+(\S+)\s+HTTP\/1\.[01]\r?\n(?:[^\r\n]*\r?\n)*?Host:\s*(\S+)/i)
-          const targetKey = rawT ? `${rawT[2]}${rawT[1]}` : ''
+          let targetKey = rawT ? this.normalizeTargetKey(`${rawT[2]}${rawT[1]}`) : ''
+          // fallback：reqRaw 缺失时尝试从 advice 中的绝对 URL 提取目标
+          if (!targetKey) {
+            const absUrl = (body.advice || '').match(/https?:\/\/[^\s"'）)]+/)?.[0]
+            if (absUrl) targetKey = this.normalizeTargetKey(absUrl)
+          }
           const method = (body.advice || '').match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
-          if (targetKey && this.penetratedKeys.has(`${targetKey}|${method}`)) {
+          const penKey = targetKey ? `${targetKey}|${method}` : ''
+          if (penKey && (this.penetratedKeys.has(penKey) || this.penetratingKeys.has(penKey))) {
             this.json(res, 200, { started: false, slot, reply: `该目标API渗透方式已进行过 不再重复渗透（${targetKey} ${method}）` })
             break
           }
           const sess = this.analyzeSlots[slot]
+          this.pendingAdviceSlots.delete(slot)  // 用户点渗透 → 卡片决策完成，由渗透接管该槽
           this.penetrating = true  // 渗透窗口：期间流量跳过子 Agent 审计（防循环）
-          // 记录渗透目标（取消时写入全局情报：同 API 状态可见）
+          // 记录渗透目标（取消时写入全局情报：同 API 状态可见）+ 进行中 key（防并发双渗透）
           const pm2 = (body.advice || '').match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
+          if (penKey) this.penetratingKeys.add(penKey)
           if (targetKey) this.penetrateTargets.set(slot, `${targetKey} ${pm2}`)
+          // 进行中工作共享：持久情报标记"正在渗透 X"（其他子 Agent 可见，避免重复建议/重复盯同一目标；完成/取消后移除）
+          const tkHost = targetKey ? targetKey.split(':')[0] : ''
+          const tkPath = targetKey ? targetKey.replace(/^[^/]+/, '') : ''
+          this.pushDigest({ kind: 'penetrating', host: tkHost || '', path: tkPath, data: `正在渗透（${pm2 || method}），由槽 ${slot} 执行`, persist: true })
           // 异步执行：立即返回（前端不再同步等待 4 分钟），完成经 SSE 推送 penetrate-done 更新任务/沟通窗口
           this.json(res, 200, { started: true, slot })
           ;(async () => {
           try {
           // 任务包装：要求子 Agent 实际执行渗透；有成果时输出【VULNDOC】结构化漏洞文档（严格格式规范，禁止 markdown 围栏/路由前缀，原始请求/响应包必填）
-          const digest = this.analysisDigest.length ? `【全局情报】${this.analysisDigest.join('；')}\n` : ''
+          const digest = this.digestPrompt()
           const task = `${digest}${body.advice}\n\n（渗透执行要求：这是对单个 API 的采纳式渗透——严格只针对原始请求包中这一个 URL（方法+完整路径+查询参数），只验证该接口是否存在漏洞；禁止访问同站点任何其他路径/接口/静态资源，禁止目录枚举、全站扫描、批量探测、交叉接口利用。验证充分、确认结果后立即结束（蜂群模式：验证完成后释放子 Agent 继续流量分析）。这是渗透执行任务，不是流量分析任务——禁止输出 {"vuln":...} 形式的 JSON 或任何 JSON 代码，全部用文字描述执行过程。忽略此前对话中的任何结论与判断，只依据本次提供的【全局情报】与原始请求包执行。开始前先检查【全局情报】：判定"已渗透过"必须同时满足三个条件——① Host 完全相同；② 完整 API 路径完全相同（包括文件名与查询参数，如 /WFManager/js/login.js?rev=200003 与 /WFManager/loginAction_doLogin.action 是不同路径；仅 /WFManager/ 前缀相同不算）；③ 渗透方式完全相同。三者都满足才回复"该目标API渗透方式已进行过 不再重复渗透"并停止；否则必须实际执行渗透验证，禁止回复"已进行过"；若确认存在可利用漏洞（有成果），在回复末尾输出以下结构的漏洞文档，格式必须严格遵守：\n【VULNDOC】\n标题：<只写漏洞名称本身，禁止带 URL 或路由前缀，错误示例"/api/login 未授权访问"，正确示例"未授权访问与凭据泄漏">\n危害等级：high|medium|low\n漏洞描述：<简要描述>\n复现步骤：<验证过程>\n修复建议：<修复方案>\n漏洞目标：<目标 URL（协议+Host+端口，如 http://127.0.0.1:8800，必填）>\n漏洞路由：<漏洞接口路径（如 /api/login，必填）>\n原始请求包：\n<触发该漏洞的完整原始 HTTP 请求报文，必填。从请求行开始逐行原样输出（GET /path HTTP/1.1\\nHost: ...\\n\\n<body>），禁止使用 markdown 代码块围栏（禁止 \`\`\` 字符）、禁止加引号包裹、禁止 JSON 转义，必须可直接复制重放>\n原始响应包：\n<对应的完整原始 HTTP 响应报文，必填。从状态行开始逐行原样输出（HTTP/1.1 200 OK\\nHeader: ...\\n\\n<body>），同样禁止 \`\`\` 与任何修饰字符>\n若未确认漏洞，只需输出执行过程说明，不要输出【VULNDOC】）`
           const reply = await this.runViaGateway(task, sess, (abort) => { this.penetrateChildren.set(slot, abort) })  // 渗透经本地 gateway 执行（取消 = WebSocket abort，参考 hermes-studio chat-run）
           this.penetrateChildren.delete(slot)
           this.penetrateTargets.delete(slot)  // 渗透正常完成：清除目标记录（取消记录只由 cancel 路径写入全局情报）
+          // 子 Agent 执行时判定"该目标API渗透方式已进行过 不再重复渗透"（渗透前查重 miss、但子 Agent 依据【全局情报】识别出已渗透过）：
+          // 视为自动取消——不写漏洞库、释放槽位会话（子 Agent 继续流量分析）、SSE 通知前端移除后台任务条
+          if (reply.includes('该目标API渗透方式已进行过')) {
+            const skHost = targetKey ? targetKey.split(':')[0] : ''
+            const skPath = targetKey ? targetKey.replace(/^[^/]+/, '') : ''
+            this.pushDigest({ kind: 'penetrated', host: skHost, path: skPath, data: `${method} 已渗透过 自动跳过`, persist: true })
+            this.removeDigest('penetrating', skHost, skPath)  // 移除进行中标记
+            this.analyzeSlots[slot] = ''  // 释放槽位会话：下次分析新建干净会话，子 Agent 继续流量分析
+            this.pushSse({ type: 'penetrate-done', slot, reply, vulnDoc: false, skipped: true })
+          } else {
           // 解析 VULNDOC（兼容省略【VULNDOC】标记：检测"原始请求包："即视为漏洞文档正文）→ 写入漏洞库 + 静默注入主 Agent 会话记忆
           const docBody = reply.includes('【VULNDOC】') ? (reply.match(/【VULNDOC】\s*\n([\s\S]*?)(?=\n【|$)/) || [])[1] ?? '' : /原始请求包[:：]/.test(reply) ? reply : ''
           if (docBody) {
@@ -1109,20 +1380,48 @@ export class ApiServer {
             // 渗透成果写入全局情报（子 Agent 共享：后续分析/渗透前可见，避免同 API 同方式重复渗透）
             if (uri) {
               const pm = (body.advice || '').match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
-              // 去协议统一格式（与渗透前 reqRaw 提取的 targetKey 一致：无协议 Host+路径）——否则后端查重 miss
-              this.penetratedKeys.add(`${uri.replace(/^https?:\/\//i, '')}|${pm}`)
-              // 去协议统一格式（如 http://127.0.0.1:8800/api/login → 127.0.0.1:8800/api/login）——子 Agent 对比当前目标（reqRaw Host+路径，无协议）不误判
-              this.analysisDigest.push(`渗透成果: ${uri.replace(/^https?:\/\//i, '')}（${pm}）漏洞(${level}) ${v.name}`)
+              // reqRaw 推导的规范 key（normalizeTargetKey 统一格式）优先记入——堵住 VULNDOC 漏洞路由不带 query 导致的 key 漂移
+              if (targetKey) this.penetratedKeys.add(`${targetKey}|${pm}`)
+              // 模型报告 uri 兜底（normalizeTargetKey 规范化，如 http://127.0.0.1:8800/api/login → 127.0.0.1:8800/api/login）
+              const normUri = this.normalizeTargetKey(uri)
+              if (normUri) this.penetratedKeys.add(`${normUri}|${pm}`)
+              // 无 query 版本兜底（模型漏 query 时，同路径不同 query 仍视为已渗透）
+              const uriNoQuery = normUri.split('?')[0]
+              if (uriNoQuery) this.penetratedKeys.add(`${uriNoQuery}|${pm}`)
+              // 全局情报（结构化持久条目 + 移除进行中标记）
+              const resHost = normUri ? normUri.split(':')[0] : ''
+              const resPath = normUri ? normUri.replace(/^[^/]+/, '') : ''
+              this.pushDigest({ kind: 'penetrated', host: resHost, path: resPath, data: `${pm} 漏洞(${level}) ${v.name}`, persist: true })
+              this.removeDigest('penetrating', resHost, resPath)
             }
             this.pushSse({ type: 'vuln-doc', vuln: { id: v.id, name: v.name, level: v.level, desc: v.desc, exploit: v.exploit, ts: v.ts } })
             // 静默注入主 Agent 会话（仅记录到上下文，主 Agent 记住所有 vuln；不回复不执行）
             this.runHermes(`（记忆记录，无需回复与执行任何操作）已知漏洞档案：漏洞 ${v.id}：${v.name}（${level}）\n描述：${g('漏洞描述').slice(0, 300)}\n复现：${g('复现步骤').slice(0, 300)}`, this.chatSessionId, (sid) => { this.chatSessionId = sid }).catch(() => { /* 记忆注入失败不影响主流程 */ })
           }
           this.pushSse({ type: 'penetrate-done', slot, reply, vulnDoc: !!docBody })  // 异步完成通知（前端更新任务/沟通窗口）
+          }
           } catch (e) {
             this.pushSse({ type: 'penetrate-done', slot, reply: `（渗透执行失败：${(e as Error).message}）`, vulnDoc: false })
-          } finally { this.penetrating = false }  // 结束渗透窗口（无论成败都恢复审计）
+          } finally {
+            this.penetrating = false  // 结束渗透窗口（无论成败都恢复审计）
+            if (penKey) this.penetratingKeys.delete(penKey)  // 释放进行中标记（防并发双渗透）
+            // 兜底移除"正在渗透"digest 条目（成果/跳过分支已移；失败/无成果时此处兜底）
+            const fkHost = targetKey ? targetKey.split(':')[0] : ''
+            const fkPath = targetKey ? targetKey.replace(/^[^/]+/, '') : ''
+            this.removeDigest('penetrating', fkHost, fkPath)
+          }
           })()
+          break
+        }
+        // ---------------- 子 Agent 运行中引导（steer：注入运行中渗透/分析 turn，不打断） ----------------
+        case '/api/penetrate/steer': {
+          const body = JSON.parse(await this.readBody(req)) as { text: string; slot?: number }
+          if (!body.text) throw new Error('text 缺失')
+          const slot = typeof body.slot === 'number' && body.slot >= 0 && body.slot < ApiServer.MAX_PARALLEL ? body.slot : 0
+          const sid = this.analyzeSlots[slot]
+          await this.ensureBridge()
+          if (!sid || !this.bridgeReady) { this.json(res, 200, { accepted: false, status: 'rejected' }); break }
+          this.json(res, 200, await this.bridge.steer(sid, body.text, 'hermespentbox'))
           break
         }
         // ---------------- 取消渗透任务（杀对应子 Agent 进程） ----------------
@@ -1139,9 +1438,30 @@ export class ApiServer {
           if (child) this.penetrateChildren.delete(slot)
           // 取消同步到全局情报（后续子 Agent 可见该 API 渗透已被用户取消，不再重复提议/可结合成果判断）
           const ptarget = this.penetrateTargets.get(slot)
-          if (ptarget) { this.analysisDigest.push(`已取消渗透: ${ptarget}（用户中断）`); this.penetrateTargets.delete(slot) }
+          if (ptarget) {
+            // 移除进行中 key（ptarget 格式 `${targetKey} ${pm2}` → 重建 penKey）
+            const pv = ptarget.split(' ')
+            const pk = pv[0]
+            const pkm = pv.slice(1).join(' ')
+            if (pk) this.penetratingKeys.delete(`${pk}|${pkm}`)
+            // 取消信号降权：结构化持久记录（后续子 Agent 可见该方向曾被取消，避免重复建议）
+            const chHost = pk ? pk.split(':')[0] : ''
+            const chPath = pk ? pk.replace(/^[^/]+/, '') : ''
+            this.pushDigest({ kind: 'cancelled', host: chHost, path: chPath, data: `${pkm} 渗透被用户取消（中断）`, persist: true })
+            this.removeDigest('penetrating', chHost, chPath)
+            this.penetrateTargets.delete(slot)
+          }
+          this.pendingAdviceSlots.delete(slot)  // 取消卡片/任务 → 恢复该槽流量分析
           this.penetrating = false  // 取消即恢复流量审计（防 kill 后 close 未触发的极端情况）
           this.analyzeSlots[slot >= 0 && slot < ApiServer.MAX_PARALLEL ? slot : 0] = ''  // 释放槽位会话：下次分析新建干净会话，继续流量分析工作
+          this.json(res, 200, { ok: true })
+          break
+        }
+        // ---------------- 恢复子 Agent 流量分析（卡片被用户关闭/超时未渗透时，前端通知后端释放槽位） ----------------
+        case '/api/advice/resume': {
+          const body = JSON.parse(await this.readBody(req)) as { slot?: number }
+          const slot = typeof body.slot === 'number' && body.slot >= 0 && body.slot < ApiServer.MAX_PARALLEL ? body.slot : -1
+          if (slot >= 0) this.pendingAdviceSlots.delete(slot)
           this.json(res, 200, { ok: true })
           break
         }

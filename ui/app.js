@@ -85,28 +85,123 @@ function addAiMsg(role, text) {
   aiMsgs.scrollTop = aiMsgs.scrollHeight
   return div
 }
+// 子 Agent 运行跟踪：主聊天"回复子 Agent"或子 Agent 沟通窗口发起后，等待 penetrate-done SSE 送达结果
+// key = slot → { show: (reply) => void }（展示回复 + 恢复 UI）
+const pendingSubRuns = new Map()
+// 主聊天 Send/Stop/Steer 按钮切换
+const aiSendBtn = document.getElementById('aiChatSend')
+let aiBusy = false  // 主聊天是否正在生成（防止并发）
+let aiChatSid = ''  // 当前主对话的 bridge 会话 id（steer/status 用）
+let aiStopFn = null // 运行中"停止"回调（abort）
+let aiQueue = []    // 待发送队列（busy 时快速连发的消息排队，当前轮结束后自动发送）
+function refreshAiSendBtn() {
+  // 运行中：输入框有文字 → Steer（注入引导不打断）；空 → Stop（中断）
+  if (aiBusy) {
+    const hasText = aiInput.value.trim().length > 0
+    if (hasText) {
+      aiSendBtn.textContent = 'Steer'
+      aiSendBtn.style.background = '#3a2a1e'
+      aiSendBtn.style.color = '#f0b35c'
+      aiSendBtn.title = '向运行中的 Agent 注入引导（不打断）'
+      aiSendBtn.onclick = async () => {
+        const text = aiInput.value.trim()
+        if (!text) return
+        aiInput.value = ''
+        refreshAiSendBtn()
+        try {
+          const r = await fetch(`${API}/api/chat/steer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, sessionId: aiChatSid }) }).then((x) => x.json())
+          // 复刻官方语义：仅运行中 accepted；空闲 rejected（提示而非静默）
+          if (r.accepted) addAiMsg('ai', `↪ 已向运行中的 Agent 注入引导：${text}`)
+          else addAiMsg('ai', `（当前 Agent 无活跃运行，引导未接受${r.reason ? `：${r.reason}` : ''}）`)
+        } catch (e) { addAiMsg('ai', `（引导失败：${e.message}）`) }
+      }
+    } else {
+      aiSendBtn.textContent = 'Stop'
+      aiSendBtn.style.background = '#3a2020'
+      aiSendBtn.style.color = '#f76b6b'
+      aiSendBtn.title = '停止生成'
+      aiSendBtn.onclick = () => { if (aiStopFn) aiStopFn() }
+    }
+  } else {
+    aiSendBtn.textContent = 'Send'
+    aiSendBtn.style.background = '#1e3a5f'
+    aiSendBtn.style.color = '#4fc3f7'
+    aiSendBtn.title = ''
+    aiSendBtn.onclick = aiSend
+  }
+}
+// 运行中监听输入变化切换 Steer/Stop
+aiInput.addEventListener('input', refreshAiSendBtn)
+function setAiSendBtn(running) {
+  refreshAiSendBtn()
+}
 async function aiSend() {
   const msg = aiInput.value.trim()
   const selIds = [...selFlowIds].filter((id) => smSelFlowIds.has(id) || !deletedFlowIds.has(id))  // 站点地图选中的可发（含假删除）；流量表选中的过滤假删除
   const selN = selIds.length
   if (!msg && !selN && !selVulnIds.size) return
+  // busy 并发保护：快速连发时消息入队（不丢弃、不产生假"思考中"气泡），当前轮结束后自动发送
+  if (aiBusy) {
+    if (msg && !selN && !selVulnIds.size) {
+      aiInput.value = ''
+      refreshAiSendBtn()  // 输入框清空后按钮回到 Stop
+      const hint = addAiMsg('ai', `⏳ 已排队待发送：${msg.slice(0, 40)}`)
+      aiQueue.push({ text: msg, el: hint })
+    } else {
+      addAiMsg('ai', '（Agent 正在工作中，请稍候再发送）')
+    }
+    return
+  }
   let prompt = msg
   // 回复模式：点回复 ICON 后 = 与该子 Agent 沟通（消息走 /api/penetrate 到对应槽位会话）；不点则正常与主 Agent 对话
   if (aiReplyRef) {
+    if (aiBusy) return
+    aiBusy = true
     aiInput.placeholder = 'Ask Hermes...'
     const penMsg = `${msg}\n\n（回复渗透意见：${aiReplyRef}）`
     const penSlot = aiReplyRefSlot
     aiReplyRef = ''
+    const think = addAiMsg('ai', '思考中…')
+    setAiSendBtn(true)
+    aiSendBtn.onclick = async () => {
+      try { await fetch(`${API}/api/penetrate/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ slot: penSlot }) }) } catch { /* 已结束 */ }
+      pendingSubRuns.delete(penSlot)
+      think.remove()
+      addAiMsg('ai', '✕ 已停止与子 Agent 沟通')
+      aiBusy = false
+      setAiSendBtn(false)
+      aiSendBtn.onclick = aiSend
+    }
+    // 结果经 penetrate-done SSE 送达（/api/penetrate 异步返回 started:true）
+    pendingSubRuns.set(penSlot, {
+      show: (reply) => {
+        think.remove()
+        addAiMsg('ai', reply || '（子 Agent 无响应）')
+        aiBusy = false
+        setAiSendBtn(false)
+        aiSendBtn.onclick = aiSend
+      },
+    })
     try {
       const pen = await fetch(`${API}/api/penetrate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ advice: penMsg, slot: penSlot }) }).then((x) => x.json())
-      think.remove()
-      addAiMsg('ai', pen.reply || '（子 Agent 无响应）')
-      return
+      // 后端查重直接拒绝（started:false + reply 立即返回）→ 不再等 SSE
+      if (!pen.started) {
+        pendingSubRuns.delete(penSlot)
+        think.remove()
+        addAiMsg('ai', pen.reply || '（子 Agent 无响应）')
+        aiBusy = false
+        setAiSendBtn(false)
+        aiSendBtn.onclick = aiSend
+      }
     } catch (e) {
+      pendingSubRuns.delete(penSlot)
       think.remove()
       addAiMsg('ai', `（子 Agent 沟通失败：${e.message}）`)
-      return
+      aiBusy = false
+      setAiSendBtn(false)
+      aiSendBtn.onclick = aiSend
     }
+    return
   }
   if (selN) {
     // 实际发送：完整请求/响应数据包（多条拼接）+ 用户提示词
@@ -126,18 +221,92 @@ async function aiSend() {
   // 聊天框显示："已选中流量 N 条"（不展开完整数据包）
   addAiMsg('user', msg + (selN ? `\n（已选中流量 ${selN} 条）` : '') + (selVulnIds.size ? `\n（已选中漏洞 ${selVulnIds.size} 条）` : ''))
   const think = addAiMsg('ai', '思考中…')
+  if (aiBusy) return  // 已在生成中（并发保护：Enter 连发/重复点击不重复发起）
+  aiBusy = true
+  let aborted = false
+  const abort = new AbortController()
+  aiStopFn = () => { aborted = true; abort.abort() }
+  // 生成期间 Send → Stop/Steer（动态切换；结束后恢复 Send）
+  setAiSendBtn(true)
+  // 运行时长提示：Agent 推理/工具间隙无输出时，实时显示"已工作 Xs"（避免看起来像卡死）
+  const thinkStart = Date.now()
+  let lastActivity = Date.now()
+  const thinkTimer = setInterval(() => {
+    if (Date.now() - lastActivity < 2500) return  // 近期有输出，不覆盖真实内容
+    const sec = Math.round((Date.now() - thinkStart) / 1000)
+    think.textContent = `思考中…（已工作 ${sec}s）`
+  }, 1000)
+  const bumpActivity = () => { lastActivity = Date.now() }
   try {
-    const r = await fetch(`${API}/api/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: prompt }) })
-    const j = await r.json()
-    think.remove()
-    addAiMsg('ai', j.reply || '（无回复）')
-  } catch {
-    think.remove()
-    addAiMsg('ai', '（与 Hermes 通信失败）')
+    // SSE 流式对话（经本地 gateway，与渗透同通道）：delta 增量实时渲染（打字效果），done 收尾
+    const r = await fetch(`${API}/api/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: prompt, stream: true }), signal: abort.signal })
+    const reader = r.body.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    let acc = ''
+    think.innerHTML = ''  // 清掉"思考中…"，后续 delta 追加渲染
+    while (!aborted) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      let nl
+      while ((nl = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, nl); buf = buf.slice(nl + 2)
+        const line = chunk.split('\n').find((l) => l.startsWith('data:'))
+        if (!line) continue
+        let f
+        try { f = JSON.parse(line.slice(5).trim()) } catch { continue }
+        if (f.type === 'delta' && f.text) {
+          bumpActivity()
+          acc += f.text
+          think.textContent = acc
+          aiMsgs.scrollTop = aiMsgs.scrollHeight
+        } else if (f.type === 'sid') {
+          if (f.sessionId) aiChatSid = f.sessionId
+        } else if (f.type === 'tool') {
+          // Agent 正在执行工具：显示进度（区别于"思考中…"转圈）
+          bumpActivity()
+          if (f.evType === 'tool.completed') {
+            think.textContent = acc || '思考中…'
+          } else if (f.tool) {
+            think.textContent = `⚙ 正在执行 ${f.tool}${f.preview ? ` · ${f.preview.slice(0, 40)}` : ''}…`
+          }
+          aiMsgs.scrollTop = aiMsgs.scrollHeight
+        } else if (f.type === 'done') {
+          bumpActivity()
+          if (f.reply) { acc = f.reply; think.textContent = acc }
+          if (f.sessionId) aiChatSid = f.sessionId
+        } else if (f.type === 'error') {
+          bumpActivity()
+          acc = `（对话失败：${f.error || '未知错误'}）`
+          think.textContent = acc
+        }
+      }
+    }
+    think.textContent = acc || '（无回复）'
+  } catch (e) {
+    // 用户 Stop：保留已生成内容；否则报通信失败
+    if (aborted) { think.textContent = acc || '（已停止）' }
+    else { think.remove(); addAiMsg('ai', '（与 Hermes 通信失败）') }
+  } finally {
+    clearInterval(thinkTimer)
+    aiBusy = false
+    aiStopFn = null
+    setAiSendBtn(false)
+    aiSendBtn.onclick = aiSend
+    // 队列：当前轮结束后自动发送下一条排队消息（发送前移除"已排队"提示气泡）
+    if (aiQueue.length) {
+      const next = aiQueue.shift()
+      setTimeout(() => {
+        if (next.el) next.el.remove()  // 自动隐藏排队提示
+        aiInput.value = next.text
+        aiSend()
+      }, 100)
+    }
   }
   if (selN || selVulnIds.size) clearAiSel()  // 发送后清空选择（流量+漏洞）
 }
-document.getElementById('aiChatSend').onclick = aiSend
+aiSendBtn.onclick = aiSend
 aiInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') aiSend() })
 
 // ---- 状态栏（footer HERMES AGENT 实时状态） ----
@@ -1011,9 +1180,31 @@ es.onmessage = (e) => {
     return
   }
   if (f.type === 'penetrate-done') {
-    // 异步渗透完成：更新对应任务（reply → 沟通窗口可见；状态 done）
     const t = [...aiTasks.values()].find((x) => x.slot === f.slot)
-    if (t) { t.reply = f.reply || ''; t.status = 'done'; renderAiTasks() }
+    if (t) {
+      if (f.skipped) {
+        // 子 Agent 判定该目标API渗透方式已进行过 → 自动取消：移除后台任务条，子 Agent 释放槽位继续流量分析
+        aiTasks.delete(t.id)
+        renderAiTasks()
+        for (const w of document.querySelectorAll('#aiChatMsgs [data-role="ai"]')) {
+          if (t.advice && w.textContent.includes(t.advice.slice(0, 20))) {
+            const st = [...w.querySelectorAll('div')].find((d) => d.textContent.includes('已确认进行渗透') || d.textContent.includes('渗透执行中'))
+            if (st) st.textContent = '该目标API渗透方式已进行过 自动跳过'
+            // 已跳过卡（无后台任务）→ 30s 自动淡出移除
+            setTimeout(() => { w.style.transition = 'opacity .5s'; w.style.opacity = '0'; setTimeout(() => w.remove(), 600) }, 30000)
+            break
+          }
+        }
+      } else {
+        t.reply = f.reply || ''; t.status = 'done'; renderAiTasks()
+      }
+    }
+    // 主聊天"回复子 Agent" / 子 Agent 沟通窗口：等待该 slot 结果（SSE 送达）→ 展示回复并恢复 UI
+    const pend = pendingSubRuns.get(f.slot)
+    if (pend) {
+      pendingSubRuns.delete(f.slot)
+      pend.show(f.skipped ? '该目标API渗透方式已进行过 自动跳过' : (f.reply || '（子 Agent 无响应）'))
+    }
     return
   }
   if (f.method) addFlowRow(f)
@@ -1078,7 +1269,9 @@ function renderAdviceCard(a) {
     st.textContent = txt2
     wrap.appendChild(st)
   }
-  const timer = setTimeout(() => { closeCard('⏱ 超时未确认，已自动取消渗透'); setTimeout(() => { wrap.style.transition = 'opacity .5s'; wrap.style.opacity = '0'; setTimeout(() => wrap.remove(), 600) }, 5000) }, 60000)  // 60s 自动取消 + 取消后 5s 自动隐藏
+  const timer = setTimeout(() => { closeCard('⏱ 超时未确认，已自动取消渗透'); resumeSlot(); setTimeout(() => { wrap.style.transition = 'opacity .5s'; wrap.style.opacity = '0'; setTimeout(() => wrap.remove(), 600) }, 5000) }, 60000)  // 60s 自动取消 + 取消后 5s 自动隐藏
+  // 卡片关闭/取消 → 通知后端恢复该子 Agent 流量分析（pendingAdviceSlots 释放）
+  const resumeSlot = () => { const s = a.slot ?? 0; fetch(`${API}/api/advice/resume`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ slot: s }) }).catch(() => {}) }
   go.onclick = async () => {
     closeCard('✓ 已确认进行渗透，由对应子 Agent 执行中…')
     const m2 = a.advice.match(/分析\s*(\S+)\s*可进行\s*(.+?)\s*渗透/)
@@ -1119,7 +1312,7 @@ function renderAdviceCard(a) {
       renderAiTasks()
     }
   }
-  cancel.onclick = () => closeCard('✕ 已取消渗透')
+  cancel.onclick = () => { closeCard('✕ 已取消渗透'); resumeSlot() }
   reply.onclick = () => { closeCard('↩ 已选中该子 Agent，输入内容将直接与它沟通'); aiReplyRef = a.advice; aiReplyRefSlot = a.slot ?? 0; aiInput.value = ''; aiInput.placeholder = '回复该子 Agent…'; aiInput.focus() }
 }
 let aiReplyRef = ''        // 回复引用（点回复 ICON 后设置；不点则空 = 正常与主 Agent 对话）
@@ -1198,7 +1391,7 @@ function openAgentChat(t) {
   }
   const send = async () => {
     const msg = input.value.trim()
-    if (!msg) return
+    if (!msg || win.dataset.busy === '1') return
     input.value = ''
     const u = document.createElement('div')
     u.style.cssText = 'align-self:flex-end;background:#1e3a5f;color:#d7dde4;padding:5px 9px;border-radius:6px;max-width:85%'
@@ -1209,25 +1402,105 @@ function openAgentChat(t) {
     think.style.cssText = 'align-self:flex-start;color:#8b98a8;padding:4px;display:flex;align-items:center;gap:6px'
     think.innerHTML = '<span class="an-spinner"></span>子 Agent 思考中…'  // 转圈 ICON 与流量表 analyzing 一致
     msgs.appendChild(think)
-    try {
-      const r = await fetch(`${API}/api/penetrate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ advice: msg, slot: t.slot }) }).then((x) => x.json())
+    // 发送/运行期间按钮变 Stop/Steer（动态：输入框有文字 → Steer 注入引导；空 → Stop）
+    const btn = win.querySelector('#agentChatSend')
+    win.dataset.busy = '1'
+    const subStop = () => {
+      try { fetch(`${API}/api/penetrate/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ slot: t.slot }) }) } catch { /* 已结束 */ }
+      pendingSubRuns.delete(t.slot)
       think.remove()
       const a = document.createElement('div')
-      a.style.cssText = 'align-self:flex-start;background:#16212e;border:1px solid #2c3542;color:#d7dde4;padding:5px 9px;border-radius:6px;max-width:85%;white-space:pre-wrap'
-      a.textContent = r.reply || '（子 Agent 无响应）'
+      a.style.cssText = 'align-self:flex-start;color:#f76b6b;padding:4px;font-size:11px'
+      a.textContent = '✕ 已停止'
       msgs.appendChild(a)
       msgs.scrollTop = msgs.scrollHeight
+      restore()
+    }
+    const subSteer = async () => {
+      const text = input.value.trim()
+      if (!text) return
+      input.value = ''
+      refreshSubBtn()
+      try {
+        const r = await fetch(`${API}/api/penetrate/steer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, slot: t.slot }) }).then((x) => x.json())
+        const a = document.createElement('div')
+        a.style.cssText = 'align-self:flex-start;color:#f0b35c;padding:4px;font-size:11px'
+        a.textContent = r.accepted
+          ? `↪ 已向运行中的子 Agent 注入引导：${text}`
+          : `（子 Agent 当前无活跃运行，引导未接受${r.reason ? `：${r.reason}` : ''}）`
+        msgs.appendChild(a)
+        msgs.scrollTop = msgs.scrollHeight
+      } catch (e) {
+        const a = document.createElement('div')
+        a.style.cssText = 'align-self:flex-start;color:#f76b6b;padding:4px;font-size:11px'
+        a.textContent = `（引导失败：${e.message}）`
+        msgs.appendChild(a)
+      }
+      refreshSubBtn()
+    }
+    const restore = () => {
+      win.dataset.busy = '0'
+      input.removeEventListener('input', refreshSubBtn)
+      btn.textContent = '发送'
+      btn.style.background = '#1e3a5f'
+      btn.style.color = '#d7dde4'
+      btn.onclick = send
+    }
+    const refreshSubBtn = () => {
+      if (win.dataset.busy !== '1') return
+      const hasText = input.value.trim().length > 0
+      if (hasText) {
+        btn.textContent = 'Steer'
+        btn.style.background = '#3a2a1e'
+        btn.style.color = '#f0b35c'
+        btn.onclick = subSteer
+      } else {
+        btn.textContent = 'Stop'
+        btn.style.background = '#3a2020'
+        btn.style.color = '#f76b6b'
+        btn.onclick = subStop
+      }
+    }
+    input.addEventListener('input', refreshSubBtn)
+    refreshSubBtn()
+    // 结果经 penetrate-done SSE 送达（/api/penetrate 异步返回 started:true）
+    pendingSubRuns.set(t.slot, {
+      show: (reply) => {
+        think.remove()
+        const a = document.createElement('div')
+        a.style.cssText = 'align-self:flex-start;background:#16212e;border:1px solid #2c3542;color:#d7dde4;padding:5px 9px;border-radius:6px;max-width:85%;white-space:pre-wrap'
+        a.textContent = reply || '（子 Agent 无响应）'
+        msgs.appendChild(a)
+        msgs.scrollTop = msgs.scrollHeight
+        restore()
+      },
+    })
+    try {
+      const r = await fetch(`${API}/api/penetrate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ advice: msg, slot: t.slot }) }).then((x) => x.json())
+      // 后端查重直接拒绝（started:false + reply 立即返回）→ 不再等 SSE
+      if (!r.started) {
+        pendingSubRuns.delete(t.slot)
+        think.remove()
+        const a = document.createElement('div')
+        a.style.cssText = 'align-self:flex-start;background:#16212e;border:1px solid #2c3542;color:#d7dde4;padding:5px 9px;border-radius:6px;max-width:85%;white-space:pre-wrap'
+        a.textContent = r.reply || '（子 Agent 无响应）'
+        msgs.appendChild(a)
+        msgs.scrollTop = msgs.scrollHeight
+        restore()
+      }
     } catch (e) {
+      pendingSubRuns.delete(t.slot)
       think.remove()
       const a = document.createElement('div')
       a.textContent = `（沟通失败：${e.message}）`
       a.style.cssText = 'align-self:flex-start;color:#f76b6b;padding:4px'
       msgs.appendChild(a)
+      restore()
     }
   }
   win.querySelector('#agentChatSend').onclick = send
   input.onkeydown = (e) => { if (e.key === 'Enter') send() }
-  win.querySelector('#agentChatClose').onclick = () => { ov.remove(); agentChatOpen = null }
+  win.querySelector('#agentChatClose').onclick = () => { ov.remove(); agentChatOpen = null; pendingSubRuns.delete(t.slot) }
   input.focus()
 }
 // ---- 上游设置（在设置页，见 btnSaveUp） ----
