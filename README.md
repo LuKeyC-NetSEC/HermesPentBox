@@ -10,19 +10,16 @@ An Electron-based desktop penetration testing workbench: built-in MITM traffic p
 
 ## Features
 
-- **MITM traffic proxy** (default port 8899): HTTP/HTTPS transparent proxy with built-in CA (`PentBox MITM Root CA`), WebSocket frame-level capture
-- **Browser control**: Chrome CDP (port 9334) / Firefox one-click takeover, browser traffic auto-merges into the traffic panel
-- **Sub-agent swarm analysis**: 10 parallel sub-agent slots, traffic load-balanced for vuln detection / sensitive-info extraction / Nday hints
-- **Penetration advice cards**: sub-agents push advice cards; clicking "进行渗透" adopts the advice for that **single API** (strict single-URL scope, no site-wide expansion)
-- **Self-built Agent Bridge** (`core/pentbox_bridge.py`): TCP JSON-line service driving the Hermes `AIAgent` directly — no external project dependency. All chat / analysis / penetration / steer run through it
-- **Streaming chat**: main agent conversation streams SSE deltas (typewriter effect) with cross-turn session persistence
-- **Steer (live guidance, non-interrupting)**: while an agent is running, typing in the composer switches the button to **Steer** — inject guidance into the running turn without stopping it (official-GUI semantics: accepted only when a turn is active, rejected when idle). Available for both the main agent and sub-agent windows
-- **Tool progress feedback**: while the agent calls tools, the UI shows "⚙ executing X" instead of a bare spinner
-- **Vulnerability library**: penetration results auto-written as structured VULNDOC (title / severity / reproduction / raw request-response); result card replaces the advice card and persists
-- **Structured global intelligence**: multi-agent battlefield sharing — digests are structured by kind (`vuln` / `cred` / `nday` / `penetrating` / `penetrated` / `cancelled` / `note`) with persistent vs. rolling layers (credentials / findings / cancellations never age out; analysis streams rotate in a 20-entry window). Credentials auto-generate a "凭据利用" advice card; main-agent target instructions flow back into the digest; cancellation records act as downgrade signals
-- **Dedup**: unified `normalizeTargetKey` (host + full path + query) across card-push / pre-penetration / result-write; `penetratingKeys` prevents concurrent double-penetration of the same target
+- **MITM traffic proxy** (default port 8899): HTTP/HTTPS capture, auto-trusted built-in CA, WebSocket frame-level capture
+- **Browser control**: one-click takeover of Chrome / Firefox, browser traffic auto-merges into the traffic panel
+- **Sub-agent swarm analysis**: 10 parallel sub-agents analyze traffic automatically — vuln detection / sensitive-info extraction / Nday hints
+- **Penetration advice cards**: sub-agents push a card when a target looks promising; clicking "进行渗透" verifies that **single API** only (strict single-endpoint scope, no site-wide expansion)
+- **Streaming chat**: main agent conversation streams responses with cross-turn memory
+- **Steer (live guidance)**: while an agent is running, typing in the composer switches the button to Steer — inject guidance into the running task without interrupting it
+- **Vulnerability library**: penetration results auto-written as structured VULNDOC (title / severity / reproduction / raw request-response), card stays visible
+- **Shared intelligence**: sub-agents automatically share analysis conclusions / extracted credentials / penetration results; credentials auto-generate a "凭据利用" advice; same-target dedup avoids repeated penetration
 - **Repeater**: HTTP/HTTPS/WS auto protocol detection, multi-tab, Burp-style UX
-- **Site map**: aggregated traffic view grouped by domain/path
+- **Site map**: aggregated traffic grouped by domain/path
 - **Per-agent chat window**: talk to an individual sub-agent to inspect details
 
 ## Architecture
