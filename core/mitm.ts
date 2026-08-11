@@ -240,6 +240,8 @@ export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream:
       agent: upstreamAgent(upstream),
     }
     delete opts.headers['proxy-connection']
+    // 内部标记头（WebShell/Repeater）不转发到目标，避免暴露工具特征
+    delete opts.headers['x-pentbox-source']
     const up = httpsRequestTls(opts, (upRes) => {
       // 全量捕获响应体（cap 256KB）；响应结束才发 flow（body 快照完整 + 按编码解压）
       const resChunks: Buffer[] = []

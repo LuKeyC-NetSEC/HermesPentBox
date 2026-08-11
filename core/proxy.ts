@@ -26,6 +26,8 @@ export interface FlowMeta {
   bytes: number
   upstream: string
   error?: string
+  /** 应用自身流量（WebShell/Repeater 经内部转发）：仍记录流量，但跳过 Agent 审计 */
+  self?: boolean
   /** MITM 全量报文（请求/响应头+体）——不随列表/SSE 传输，走 /api/flows/:id/detail */
   detail?: {
     reqHeaders: Record<string, string>; reqBody: string; resHeaders: Record<string, string>; resBody: string
@@ -48,6 +50,19 @@ export class ProxyEngine {
   interceptQueue: { id: number; kind: 'http' | 'connect' | 'mitm'; method: string; url: string; ts: number; req?: IncomingMessage; res?: ServerResponse; target?: URL; client?: Socket; head?: Buffer; resolve?: (allow: boolean) => void }[] = []
   private interceptSeq = 0
   onIntercept?: () => void
+
+  /** 渗透目标（规范化 Host+路径）：代理层命中该目标的流量 emit 时标记 self（记录但跳过 Agent 审计，防循环） */
+  private penetrateTargetKeys = new Set<string>()
+
+  setPenetrateTarget(key: string): void { if (key) this.penetrateTargetKeys.add(key) }
+  clearPenetrateTarget(key: string): void { this.penetrateTargetKeys.delete(key) }
+  clearAllPenetrateTargets(): void { this.penetrateTargetKeys.clear() }
+
+  private isPenetrateTarget(url: string): boolean {
+    if (!url) return false
+    for (const k of this.penetrateTargetKeys) if (k && url.includes(k)) return true
+    return false
+  }
 
   async start(port: number, host = '127.0.0.1'): Promise<void> {
     this.server = createServer((req, res) => this.handleHttp(req, res))
@@ -99,6 +114,47 @@ export class ProxyEngine {
 
   private emit(f: Omit<FlowMeta, 'id'>): void {
     this.onFlow?.({ id: ++this.seq, ...f })
+  }
+
+  /** 应用内部转发（WebShell / Repeater）：直连目标（走上游链），流量正常记录但标记 self（跳过 Agent 审计）；不产生任何特征头 */
+  async forwardInternal(target: URL, method: string, headers: Record<string, string>, body?: Buffer): Promise<{ code: number; headers: Record<string, string>; body: Buffer }> {
+    const start = Date.now()
+    let bytes = 0
+    const isHttps = target.protocol === 'https:'
+    const doReq = isHttps ? httpsRequest : httpRequest
+    const opts: any = {
+      method,
+      headers,
+      hostname: target.hostname,
+      port: Number(target.port || (isHttps ? 443 : 80)),
+      path: target.pathname + target.search,
+      agent: this.upstreamAgent(),
+    }
+    if (isHttps) opts.rejectUnauthorized = false
+    return new Promise((resolve, reject) => {
+      const req = doReq(opts, (res) => {
+        const chunks: Buffer[] = []
+        let resLen = 0
+        res.on('data', (c: Buffer) => { bytes += c.length; resLen += c.length; if (resLen <= BODY_CAP) chunks.push(c) })
+        res.on('end', () => {
+          const buf = Buffer.concat(chunks)
+          this.emit({
+            ts: start, method, url: target.href, status: res.statusCode ?? 0, bytes, upstream: this.upstreamLabel(), self: true,
+            detail: {
+              reqHeaders: headers, reqBody: body ? body.toString('utf8').slice(0, BODY_CAP) : '', reqRawHeaders: [], reqLine: `${method} ${target.pathname + target.search} HTTP/1.1`,
+              resHeaders: res.headers as Record<string, string>, resBody: buf.toString('utf8').slice(0, BODY_CAP), resRawHeaders: [], resLine: `HTTP/${res.httpVersion} ${res.statusCode}`,
+            },
+          })
+          resolve({ code: res.statusCode ?? 0, headers: res.headers as Record<string, string>, body: buf })
+        })
+      })
+      req.on('error', (e) => {
+        this.emit({ ts: start, method, url: target.href, status: 0, bytes, upstream: this.upstreamLabel(), self: true, error: e.message, detail: { reqHeaders: headers, reqBody: '', reqRawHeaders: [], reqLine: '', resHeaders: {}, resBody: '', resRawHeaders: [], resLine: '' } })
+        reject(e)
+      })
+      if (body && body.length) req.write(body)
+      req.end()
+    })
   }
 
   // ---------------- HTTP ----------------
@@ -181,6 +237,8 @@ export class ProxyEngine {
       agent: this.upstreamAgent(),
     }
     delete (options.headers as Record<string, string>)['proxy-connection']
+    // 内部标记头（WebShell/Repeater）不转发到目标，避免暴露工具特征
+    delete (options.headers as Record<string, string>)['x-pentbox-source']
 
     const up = doReq(options, (upRes) => {
       res.writeHead(upRes.statusCode ?? 502, upRes.headers)
@@ -192,6 +250,7 @@ export class ProxyEngine {
         const rawLines = (arr: string[]) => { const l: string[] = []; for (let i = 0; i + 1 < arr.length; i += 2) l.push(`${arr[i]}: ${arr[i + 1]}`); return l }
         this.emit({
           ts: start, method: req.method ?? 'GET', url: target.href, status: upRes.statusCode ?? 0, bytes, upstream: this.upstreamLabel(),
+          self: this.isPenetrateTarget(target.href),
           detail: {
             reqHeaders: req.headers as Record<string, string>, reqBody, reqRawHeaders: rawLines(req.rawHeaders), reqLine: `${req.method ?? 'GET'} ${req.url} HTTP/${req.httpVersion}`,
             resHeaders: upRes.headers as Record<string, string>, resBody: resChunks.length ? decodeBody(Buffer.concat(resChunks), (upRes.headers['content-encoding'] as string) || undefined) : '', resRawHeaders: rawLines(upRes.rawHeaders), resLine: `HTTP/${upRes.httpVersion} ${upRes.statusCode} ${upRes.statusMessage ?? ''}`,
@@ -256,7 +315,7 @@ export class ProxyEngine {
         },
         onFlow: (f) => {
           if (repeaterFlow) { repeaterFlow = false; return }  // 重发器流量跳过记录/审计
-          this.emit(f)
+          this.emit({ ...f, self: f.self || this.isPenetrateTarget(f.url) })
         },
       })
       tunnels.add(t)
@@ -271,7 +330,7 @@ export class ProxyEngine {
         up.on('data', (c) => (bytes += c.length))
         up.pipe(client)
         client.pipe(up)
-        up.on('close', () => this.emit({ ts: start, method: 'CONNECT', url: `${host}:${port}`, status: 200, bytes, upstream: this.upstreamLabel() }))
+        up.on('close', () => this.emit({ ts: start, method: 'CONNECT', url: `${host}:${port}`, status: 200, bytes, upstream: this.upstreamLabel(), self: this.isPenetrateTarget(`${host}:${port}`) }))
       })
       .catch((e: Error) => {
         client.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')

