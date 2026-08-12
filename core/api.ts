@@ -1046,6 +1046,50 @@ export class ApiServer {
     } catch { /* 无下游配置或读取失败 → 直连 */ }
   }
 
+  /** 监听配置持久化文件（~/.pentbox/listen.json）：{ip, api}——监听地址 + 主服务端口；代理/终端端口固定默认 */
+  private static readonly LISTEN_FILE = (() => {
+    try { return join(homedir(), '.pentbox', 'listen.json') } catch { return '' }
+  })()
+  /** 监听配置（默认 0.0.0.0 + API 8877；代理 8899 / 终端 8878 固定默认，仅 IP 跟随）——供 electron/main.ts 绑定 */
+  static loadListen(): { ip: string; api: number } {
+    const def = { ip: '0.0.0.0', api: Number(process.env.PENTBOX_API_PORT ?? 8877) }
+    try {
+      const { existsSync, readFileSync } = require('node:fs') as typeof import('node:fs')
+      if (ApiServer.LISTEN_FILE && existsSync(ApiServer.LISTEN_FILE)) {
+        const d = JSON.parse(readFileSync(ApiServer.LISTEN_FILE, 'utf8')) as { ip?: string; api?: number }
+        return {
+          ip: d?.ip || def.ip,
+          api: d?.api && Number(d.api) > 0 ? Number(d.api) : def.api,
+        }
+      }
+    } catch { /* 无配置 → 默认 */ }
+    return def
+  }
+  /** 可监听 IP 选项：全部接口 / 仅本机 / 各网卡 IPv4（去重） */
+  private static listenOptions(): string[] {
+    const set = new Set<string>()
+    try {
+      const os = require('node:os') as typeof import('node:os')
+      const nets = os.networkInterfaces()
+      for (const list of Object.values(nets)) {
+        for (const n of list || []) {
+          if (n && n.family === 'IPv4' && !n.internal) set.add(n.address)
+        }
+      }
+    } catch { /* 网卡枚举失败 */ }
+    return ['0.0.0.0', '127.0.0.1', ...[...set].sort()]
+  }
+  /** 探测端口是否被占用（bind 试听；当前实例正在使用的端口由调用方排除） */
+  private static portInUse(port: number): Promise<boolean> {
+    const net = require('node:net') as typeof import('node:net')
+    return new Promise((resolve) => {
+      const srv = net.createServer()
+      srv.once('error', () => resolve(true))
+      srv.once('listening', () => srv.close(() => resolve(false)))
+      srv.listen(port, '127.0.0.1')
+    })
+  }
+
   private saveVulns(): void {
     try {
       const { writeFileSync, mkdirSync } = require('node:fs') as typeof import('node:fs')
@@ -1615,7 +1659,7 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
         case '/api/browser/launch': {
           const body = JSON.parse(await this.readBody(req)) as { engine?: 'chrome' | 'firefox'; proxyPort?: number; customProxy?: string; headless?: boolean; port?: number }
           const engine = body.engine ?? 'chrome'
-          const lopts = { proxyPort: body.proxyPort, customProxy: body.customProxy, headless: body.headless, url: body.url }
+          const lopts = { proxyPort: body.proxyPort || this.opts.proxyPort, customProxy: body.customProxy, headless: body.headless, url: body.url }
           if (engine === 'chrome') {
             if (!this.deps.chrome) throw new Error('chrome not wired')
             await this.deps.chrome.launch({ ...lopts, port: body.port })
@@ -2524,6 +2568,29 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
               this.json(res, 200, { ok: true, downstream: ds })
             } else {
               this.json(res, 200, { downstream: this.engine.getDownstream() })
+            }
+            break
+          }
+          // ---------------- 监听设置（监听地址 + 主服务端口，重启生效；代理/终端端口固定默认） ----------------
+          if (url.pathname === '/api/listen') {
+            if (req.method === 'PUT') {
+              const body = JSON.parse(await this.readBody(req)) as { ip?: string; api?: number }
+              const ip = String(body?.ip ?? '').trim()
+              const options = ApiServer.listenOptions()
+              if (!(ip === '0.0.0.0' || ip === '127.0.0.1' || options.includes(ip))) throw new Error(`invalid listen ip: ${ip}`)
+              const api = body?.api ? Number(body.api) : this.opts.port ?? this.port
+              if (!Number.isInteger(api) || api < 1 || api > 65535) throw new Error(`端口 ${body?.api} 不在合理范围（1-65535）`)
+              if (api === 8899 || api === 8878) throw new Error(`端口 ${api} 与代理/终端默认端口冲突`)
+              // 占用检查：排除当前正在使用的 API 端口，其余须未被占用
+              if (api !== (this.opts.port ?? this.port) && await ApiServer.portInUse(api)) throw new Error(`端口 ${api} 已被占用`)
+              try {
+                const { writeFileSync, mkdirSync } = require('node:fs') as typeof import('node:fs')
+                const { dirname } = require('node:path') as typeof import('node:path')
+                if (ApiServer.LISTEN_FILE) { mkdirSync(dirname(ApiServer.LISTEN_FILE), { recursive: true }); writeFileSync(ApiServer.LISTEN_FILE, JSON.stringify({ ip, api })) }
+              } catch { /* 落盘失败不影响返回 */ }
+              this.json(res, 200, { ok: true, ip, api, restart: true })
+            } else {
+              this.json(res, 200, { ...ApiServer.loadListen(), options: ApiServer.listenOptions() })
             }
             break
           }

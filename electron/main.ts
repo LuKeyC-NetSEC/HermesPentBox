@@ -12,12 +12,14 @@ import { ChromeBrowser } from '../core/browser.ts'
 import { FirefoxBrowser } from '../core/firefox.ts'
 import { SshSession } from '../core/ssh.ts'
 
+const L = ApiServer.loadListen()  // 监听配置（设置-网络配置-监听设置：监听地址 + 主服务端口，重启生效）
 const PROXY_PORT = Number(process.env.PENTBOX_PROXY_PORT ?? 8899)
-const API_PORT = Number(process.env.PENTBOX_API_PORT ?? 8877)
+const API_PORT = L.api
 const WS_PORT = Number(process.env.PENTBOX_WS_PORT ?? 8878)
+const LISTEN_IP = L.ip
 
 function startTerminalWs(ssh: SshSession): void {
-  const wss = new WebSocketServer({ port: WS_PORT })
+  const wss = new WebSocketServer({ port: WS_PORT, host: LISTEN_IP })
   wss.on('connection', (ws) => {
     let shell: NodeJS.ReadWriteStream | null = null
     ws.on('message', async (raw) => {
@@ -53,11 +55,11 @@ app.whenReady().then(async () => {
   // MITM 默认开启（打开浏览器即抓 HTTPS 明文）
   engine.mitmEnabled = true
   console.log(`[pentbox] upstream=${engine.upstreamLabel()} mitm=on`)
-  await engine.start(PROXY_PORT)
+  await engine.start(PROXY_PORT, LISTEN_IP)
   const chrome = new ChromeBrowser()
   const firefox = new FirefoxBrowser()
   const ssh = new SshSession()
-  const api = new ApiServer(engine, { chrome, firefox, ssh }, { port: API_PORT, proxyPort: PROXY_PORT, host: '0.0.0.0' })
+  const api = new ApiServer(engine, { chrome, firefox, ssh }, { port: API_PORT, proxyPort: PROXY_PORT, host: LISTEN_IP })
   await api.start()
   // 浏览器流量汇入统一流量库
   // MITM 开启时流量已由代理引擎全量捕获（含详情），跳过 CDP 冗余记录避免 http/https 双条

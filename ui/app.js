@@ -2508,6 +2508,31 @@ document.getElementById('btnSaveDs').onclick = async () => {
     } else document.getElementById('dsState').textContent = '失败: ' + (j.error || '')
   } catch (e) { document.getElementById('dsState').textContent = '失败: ' + e.message }
 }
+// 监听设置：监听地址 + 主服务端口（代理/终端端口固定默认；保存后重启应用生效）
+async function loadListen() {
+  try {
+    const j = await fetch(`${API}/api/listen`).then((x) => x.json())
+    const sel = document.getElementById('listenIp')
+    sel.innerHTML = (j.options || []).map((ip) =>
+      `<option value="${ip}">${ip}${ip === '0.0.0.0' ? '（全部接口）' : ip === '127.0.0.1' ? '（仅本机）' : ''}</option>`
+    ).join('')
+    sel.value = j.ip || '0.0.0.0'
+    document.getElementById('listenPort').value = j.api || ''
+    document.getElementById('listenState').textContent = ''
+  } catch { /* 拉取失败忽略 */ }
+}
+document.getElementById('btnSaveListen').onclick = async () => {
+  const body = {
+    ip: document.getElementById('listenIp').value,
+    api: Number(document.getElementById('listenPort').value) || undefined,
+  }
+  try {
+    const j = await fetch(`${API}/api/listen`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
+    if (j.ok) document.getElementById('listenState').textContent = `已保存：${j.ip}:${j.api}（重启应用生效）`
+    else document.getElementById('listenState').textContent = '失败: ' + (j.error || '')
+  } catch (e) { document.getElementById('listenState').textContent = '失败: ' + e.message }
+}
+loadListen()
 // 浏览器 launch：始终走内置代理（抓包由下游代理设置决定；不再改浏览器代理参数）
 document.getElementById('btnLaunch').onclick = async () => {
   const engine = document.getElementById('engineSel').value

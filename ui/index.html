@@ -392,6 +392,12 @@
             <button id="btnMitmCa">获取 CA 证书</button><button id="btnMitmInstall">一键安装 CA</button><span id="mitmState" class="hint"></span></div>
         </div>
         <div class="settings-card">
+          <h3>监听设置</h3>
+          <div class="row"><label>监听地址</label><select id="listenIp" style="flex:1"></select></div>
+          <div class="row"><label>监听端口</label><input type="text" id="listenPort" placeholder="8877" style="flex:1"></div>
+          <div class="row"><button id="btnSaveListen">保存并应用</button><span id="listenState" class="hint"></span></div>
+        </div>
+        <div class="settings-card">
           <h3>上游代理设置</h3>
           <div class="row"><label>类型</label><select id="setUpType"><option value="direct">直连</option><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></div>
           <div class="row"><label>主机</label><input type="text" id="setUpHost" placeholder="127.0.0.1"></div>
