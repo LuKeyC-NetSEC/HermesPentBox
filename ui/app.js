@@ -393,6 +393,14 @@ async function refreshStatus() {
       stEl.textContent = 'OFFLINE'
       el.style.color = '#f76b6b'  // 异常红色
     }
+    // 设置页「Hermes Agent 连接状态」两行信息同步（连接信息 + Agent 状态）
+    const connEl = document.getElementById('dsConn')
+    if (connEl) connEl.textContent = `已连接到 127.0.0.1:${st.proxy?.port ?? 8877}`
+    const astEl = document.getElementById('dsAgentState')
+    if (astEl) {
+      astEl.textContent = st.hermes === 'active' ? 'ACTIVE' : 'OFFLINE'
+      astEl.style.color = st.hermes === 'active' ? '#5cd67a' : '#f76b6b'
+    }
   } catch {
     const el = document.getElementById('hermesAgent')
     if (el) { document.getElementById('hermesState').textContent = 'OFFLINE'; el.style.color = '#f76b6b' }
@@ -528,7 +536,7 @@ function renderSmTable(host, prefix) {
   title.textContent = `${host}${prefix ? prefix : ''} — ${flows.length} 条请求`
   body.innerHTML = flows.slice().reverse().map((f) =>
     `<tr style="cursor:pointer" data-id="${f.id}" data-method="${esc(f.method)}" data-url="${esc(f.url)}">
-      <td style="padding:3px 8px;color:#66788a">${f.id}</td>
+      <td class="an-col" data-fid="${f.id}" style="padding:3px 8px;color:#66788a">${f.id}</td>
       <td style="padding:3px 8px" class="src-${f.source ?? 'proxy'}">${esc(f.method)}</td>
       <td style="padding:3px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:0">${esc(f.url)}</td>
       <td style="padding:3px 8px" class="${f.status >= 400 || f.status === 0 ? 'status-err' : 'status-ok'}">${f.status}</td>
@@ -557,6 +565,7 @@ async function refreshSitemap() {
     if (!smSelHost && smCache.length) { try { smSelHost = new URL(smCache[0].url).host } catch {} }
     renderSmTree()
     if (smSelHost) renderSmTable(smSelHost, smSelPrefix)  // 保持当前路径筛选
+    for (const [id, s] of Object.entries(window.__anStatus || {})) paintAnState(id, s)  // 重渲染后立即补刷 ICON/行染色（不依赖 1s 轮询）
   } catch { /* 拉取失败忽略 */ }
 }
 const fviews = { intercept: document.getElementById('fview-intercept'), http: document.getElementById('fview-http'), repeater: document.getElementById('fview-repeater'), ws: document.getElementById('fview-ws') }
@@ -591,7 +600,11 @@ setInterval(() => { if (intTabActive) refreshIntercept() }, 1000)
 const AN_LEVEL_COLOR = { high: '#f76b6b', medium: '#f7a35c', low: '#f7e05c', info: '#8b98a8' }
 // Lucide bug 图标（iconfont 同款 BUG 象征：圆身+六腿+触角），描边颜色标识漏洞等级
 function bugSvg(color) {
-  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" title="发现漏洞"><path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/><path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/><path d="M12 20v-9"/><path d="M6.53 9C4.6 8.8 3 7.1 3 5"/><path d="M6 13H2"/><path d="M3 21c0-2.1 1.7-3.9 3.8-4"/><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/><path d="M22 13h-4"/><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/></svg>`
+  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" title="已确认漏洞"><path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/><path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/><path d="M12 20v-9"/><path d="M6.53 9C4.6 8.8 3 7.1 3 5"/><path d="M6 13H2"/><path d="M3 21c0-2.1 1.7-3.9 3.8-4"/><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/><path d="M22 13h-4"/><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/></svg>`
+}
+// Lucide circle-help：疑似漏洞问号（Agent 分析判定有漏洞但未渗透确认），描边色=等级
+function questionSvg(color) {
+  return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" title="疑似漏洞（未渗透确认）"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>`
 }
 // Lucide check-circle（与 bug 同描边风格），绿色 = 无漏洞
 function checkSvg() {
@@ -601,6 +614,45 @@ function checkSvg() {
 function skipSvg() {
   return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8b98a8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 14 20 9 15 4"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/></svg>'
 }
+// 单条流量 Agent 状态落盘：行染色（最高敏感等级 HAE 色）+ an-col ICON（转圈/✓/问号=疑似/BUG=已确认/拐弯=跳过；站点地图只渲染有漏洞的 ICON）
+function paintAnState(id, s) {
+  const lvRank = { high: 3, medium: 2, low: 1, info: 0 }
+  let maxLv = ''
+  let maxR = -1
+  for (const si of (s && s.sensitive) || []) { const r = lvRank[si.level] ?? 0; if (r > maxR) { maxR = r; maxLv = si.level } }
+  for (const tr of document.querySelectorAll(`#flowTable tr[data-fid2="${id}"], #smTable tr[data-id="${id}"]`)) {
+    if (tr.dataset.anColor === maxLv) continue
+    tr.dataset.anColor = maxLv
+    tr.classList.remove('an-row-high', 'an-row-medium', 'an-row-low', 'an-row-info')
+    if (maxLv) tr.classList.add(`an-row-${maxLv}`)
+  }
+  const td = document.querySelector(`.an-col[data-fid="${id}"]`)
+  if (!td) return
+  const inSm = !!td.closest('#smTable')
+  // 缓存 key 含 skipped/builtin/confirmed 标记：避免状态变化后旧图标残留
+  const stKey = s.state + (s.vuln ? 'v' : '') + (s.level || '') + (s.confirmed ? 'c' : '') + (s.confLevel || '') + (s.skipped || s.builtin ? 's' : '')
+  if (td.dataset.state === stKey) return
+  td.dataset.state = stKey
+  if (inSm) {
+    // 站点地图：ICON 渲染进原 # 列（id 左侧），不加独立 Agent 列；无漏洞/跳过只显示 id（不同步绿勾）
+    const idTxt = String(td.dataset.fid ?? '')
+    td.innerHTML = s.state === 'queued' || s.state === 'analyzing'
+      ? `<span class="an-spinner" title="Agent 分析中…"></span> ${idTxt}`
+      : s.vuln
+        ? `${s.confirmed ? bugSvg(AN_LEVEL_COLOR[s.confLevel] || AN_LEVEL_COLOR[s.level] || '#8b98a8') : questionSvg(AN_LEVEL_COLOR[s.level] || '#8b98a8')} ${idTxt}`
+        : idTxt
+    return
+  }
+  td.innerHTML = s.state === 'queued' || s.state === 'analyzing'
+    ? '<span class="an-spinner" title="Agent 分析中…"></span>'
+    : s.skipped || s.builtin
+      ? skipSvg()  // 黑名单/错误码流量统一跳过 ICON（builtin 不再绿勾）
+      : s.vuln
+        ? s.confirmed
+          ? bugSvg(AN_LEVEL_COLOR[s.confLevel] || AN_LEVEL_COLOR[s.level] || '#8b98a8')  // 渗透已确认 → BUG（确认等级色）
+          : questionSvg(AN_LEVEL_COLOR[s.level] || '#8b98a8')  // 疑似漏洞 → 问号（分析等级色）
+        : checkSvg()
+}
 setInterval(async () => {
   try {
     const j = await (await fetch(`${API}/api/analyze/status`)).json()
@@ -609,19 +661,7 @@ setInterval(async () => {
     for (const [id, s] of Object.entries(j.items || {})) {
       if (s.sensitive?.length) window.__anSensitive[id] = s.sensitive
       if (s.state === 'done' && window.__fdFlowId === Number(id)) applyFdHighlight(s)  // 详情打开中：分析完成即刷等级色高亮
-      const td = document.querySelector(`.an-col[data-fid="${id}"]`)
-      if (!td) continue
-      // 缓存 key 含 skipped/builtin 标记：避免 done+skipped 与 done 普通绿勾共用缓存导致旧图标残留
-      const stKey = s.state + (s.vuln ? 'v' : '') + (s.level || '') + (s.skipped || s.builtin ? 's' : '')
-      if (td.dataset.state === stKey) continue
-      td.dataset.state = stKey
-      td.innerHTML = s.state === 'queued' || s.state === 'analyzing'
-        ? '<span class="an-spinner" title="Agent 分析中…"></span>'
-        : s.skipped || s.builtin
-          ? skipSvg()  // 黑名单/错误码流量统一跳过 ICON（builtin 不再绿勾）
-          : s.vuln
-            ? bugSvg(AN_LEVEL_COLOR[s.level] || '#8b98a8')
-            : checkSvg()
+      paintAnState(id, s)
     }
   } catch { /* 分析状态拉取失败忽略 */ }
 }, 1000)
@@ -728,8 +768,21 @@ function applyFdHighlight(an) {
     pre.style.background = vuln && color ? color + '1f' : '#1c222c'
   }
 }
-// ---- MarkInfo（Hea 风格）：Agent 提取的敏感信息横向 chips，点击高亮正文 ----
-const MARK_COLORS = { 'API Key': '#f76b6b', 'Bearer Token': '#4fc3f7', Password: '#f7a35c', Secret: '#f7e05c', Token: '#4fc3f7', Cookie: '#b388ff', Email: '#ce93d8', Phone: '#80cbc4', 'ID Card': '#ffb74d', 'Bank Card': '#ff8a65', 'Private Key': '#ef5350', Authorization: '#4fc3f7', 'Nday API': '#ff5252', 'Nday JS': '#ff7043', 'Nday 组件': '#ff5252', Username: '#8b98a8' }
+// ---- MarkInfo（Hea 风格）：Agent 提取的敏感信息横向 chips，点击高亮正文（HaENet 5 组标签色表） ----
+const MARK_COLORS = {
+  // Fingerprint
+  'Shiro': '#66bb6a', 'JSON Web Token': '#4fc3f7', 'Swagger UI': '#f76b6b', 'Ueditor': '#66bb6a', 'Druid': '#f7a35c', 'PDF.js Viewer': '#66bb6a', 'Vite DevMode': '#f76b6b',
+  // Maybe Vulnerability
+  'Java Deserialization': '#f7e05c', 'Debug Logic Parameters': '#80cbc4', 'URL As A Value': '#80cbc4', 'Upload Form': '#f7e05c', 'DoS Parameters': '#80cbc4', 'Passwd File': '#f76b6b', 'Win.ini File': '#f76b6b', 'Nday API': '#ff5252', 'Nday JS': '#ff7043', 'Nday 组件': '#ff5252',
+  // Basic Information
+  'Email': '#ce93d8', 'Chinese IDCard': '#ffb74d', 'Chinese Mobile Number': '#80cbc4', 'Internal IP Address': '#80cbc4', 'MAC Address': '#66bb6a',
+  // Sensitive Information
+  'Cloud Key': '#f7e05c', 'Cloud Access Key': '#f7e05c', 'Windows File/Dir Path': '#66bb6a', 'Password Field': '#f7a35c', 'Username Field': '#66bb6a', 'WeCom Key': '#66bb6a', 'JDBC Connection': '#f7e05c', 'Authorization Header': '#4fc3f7', 'Sensitive Field': '#f7e05c', 'Mobile Number Field': '#66bb6a', 'Userinfo In Link': '#66bb6a', 'User Identity': '#66bb6a',
+  // 兼容原凭据
+  'API Key': '#f76b6b', 'Bearer Token': '#4fc3f7', 'Password': '#f7a35c', 'Secret': '#f7e05c', 'Token': '#4fc3f7', 'Cookie': '#b388ff', 'Session Cookie': '#b388ff', 'Private Key': '#ef5350', 'Authorization': '#4fc3f7',
+  // Other
+  'Linkfinder': '#8b98a8', 'Source Map': '#f48fb1', 'Create Script': '#66bb6a', 'URL Schemes': '#f7e05c', 'Router Push': '#ce93d8', 'All URL': '#8b98a8', '302 Location': '#8b98a8', 'OSKeys': '#8b98a8',
+}
 const markColor = (t) => MARK_COLORS[t] || '#8b98a8'
 function renderFdMarks(side, flowId) {
   const el = document.getElementById(side === 'req' ? 'fdMarkReq' : 'fdMarkRes')
@@ -2132,7 +2185,7 @@ function renderAdviceCard(a) {
       const det = a.id ? await fetch(`${API}/api/flows/${a.id}/detail`).then((x) => x.json()).catch(() => null) : null
       const reqRaw = det ? `${det.reqLine || ''}\n${(det.reqRawHeaders || []).join('\n')}\n\n${det.reqBody || ''}`.trim() : ''
       const resRaw = det ? `${det.resLine || ''}\n${(det.resRawHeaders || []).join('\n')}\n\n${det.resBody || ''}`.trim() : ''
-      const r = await fetch(`${API}/api/penetrate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ advice: a.advice, slot: a.slot, reqRaw, resRaw }) }).then((x) => x.json())
+      const r = await fetch(`${API}/api/penetrate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ advice: a.advice, slot: a.slot, reqRaw, resRaw, id: a.id }) }).then((x) => x.json())
       think.remove()
       if (!r.started) {
         // 后端查重拒绝（该目标API渗透方式已进行过）：删任务条 + 意见卡状态改为"已有其他Agent渗透历史 自动跳过"
@@ -2377,16 +2430,13 @@ initFlowResizers()
     document.getElementById('setUpUser').value = s.upstream.username || ''
     document.getElementById('setUpPass').value = s.upstream.password || ''
   }
-  if (s.forward) {
-    document.getElementById('setFwdMode').value = s.forward.mode
-    document.getElementById('setFwdCustom').value = s.forward.custom || ''
+  if (s.downstream) {
+    document.getElementById('dsProtocol').value = s.downstream.protocol || 'http'
+    document.getElementById('dsHost').value = s.downstream.host || ''
+    document.getElementById('dsPort').value = s.downstream.port || ''
   }
 }
-// MITM（HTTPS 抓包）：开关 + CA 证书下载
-document.getElementById('mitmOn').onchange = async (e) => {
-  await fetch(`${API}/api/mitm/state`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: e.target.checked }) })
-  document.getElementById('mitmState').textContent = e.target.checked ? '已开启（浏览器需信任 CA 或已带 --ignore-certificate-errors）' : '已关闭'
-}
+// MITM（HTTPS 抓包）证书：获取/安装（MITM 引擎默认开启，证书入口在设置-网络配置）
 document.getElementById('btnMitmCa').onclick = async () => {
   try {
     const j = await fetch(`${API}/api/mitm/ca`).then((r) => r.json())
@@ -2444,28 +2494,26 @@ document.getElementById('btnSaveUp').onclick = async () => {
   if (j.ok) { saveSettings({ upstream: body }); document.getElementById('upState').textContent = '已保存并应用' }
   else document.getElementById('upState').textContent = '失败: ' + (j.error || '')
 }
-// 转发
-document.getElementById('btnSaveFwd').onclick = () => {
-  const fwd = {
-    mode: document.getElementById('setFwdMode').value,
-    custom: document.getElementById('setFwdCustom').value,
-  }
-  saveSettings({ forward: fwd })
-  document.getElementById('fwdState').textContent = '已保存（下次启动浏览器生效）'
+// 下游代理（类 Burp：内置代理抓包/分析后转发给下游；独立通道，保存即生效）
+document.getElementById('btnSaveDs').onclick = async () => {
+  const host = document.getElementById('dsHost').value.trim()
+  const port = document.getElementById('dsPort').value.trim()
+  const protocol = document.getElementById('dsProtocol').value
+  const body = host && port ? { host, port: Number(port), protocol } : {}
+  try {
+    const j = await fetch(`${API}/api/downstream`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
+    if (j.ok) {
+      saveSettings({ downstream: body })
+      document.getElementById('dsState').textContent = body.host ? `已应用：${body.host}:${body.port}${body.protocol === 'socks5' ? '（SOCKS5）' : '（HTTP）'}` : '已关闭（直连目标）'
+    } else document.getElementById('dsState').textContent = '失败: ' + (j.error || '')
+  } catch (e) { document.getElementById('dsState').textContent = '失败: ' + e.message }
 }
-// 浏览器 launch 时应用转发设置（浏览器默认走内置代理抓包；customProxy 用于转发 Burp）
+// 浏览器 launch：始终走内置代理（抓包由下游代理设置决定；不再改浏览器代理参数）
 document.getElementById('btnLaunch').onclick = async () => {
   const engine = document.getElementById('engineSel').value
   evalOut.textContent = `正在启动 ${engine}…`
   try {
-    const s = loadSettings()
-    const fwd = s.forward || { mode: 'system' }
-    const body = { engine, headless: false }
-    if (fwd.mode === 'custom' && fwd.custom) {
-      const [h, p] = fwd.custom.split(':')
-      body.customProxy = `${h}:${p}`  // ponytail: 自定义转发目标（Burp）由主进程 launch 参数使用
-    }
-    const r = await fetch(`${API}/api/browser/launch`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const r = await fetch(`${API}/api/browser/launch`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ engine, headless: false }) })
     evalOut.textContent = JSON.stringify(await r.json(), null, 2)
   } catch (e) { evalOut.textContent = '启动失败: ' + e.message }
 }

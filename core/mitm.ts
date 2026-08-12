@@ -9,11 +9,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import zlib from 'node:zlib'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, request as httpRequestProxy, type IncomingMessage, type ServerResponse } from 'node:http'
 import { request as httpsRequestTls } from 'node:https'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
-import type { Upstream } from './proxy.ts'
+import type { Downstream, Upstream } from './proxy.ts'
 
 export interface MitmCallbacks {
   /** 明文请求到达（拦截点）：返回 true 放行转发，false 丢弃 */
@@ -115,6 +115,23 @@ function upstreamAgent(up: Upstream): HttpsProxyAgent<string> | SocksProxyAgent 
   return undefined
 }
 
+/** 类 Burp：向下游代理建 CONNECT 隧道，在隧道内做 TLS 二次握手（MITM 解密后仍经下游到达目标） */
+function connectViaDownstream(ds: Downstream, host: string, port: number): Promise<tls.TLSSocket> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequestProxy({
+      host: ds.host, port: ds.port, method: 'CONNECT', path: `${host}:${port}`,
+      headers: { host: `${host}:${port}` },
+    })
+    req.once('connect', (res, socket) => {
+      const ts = tls.connect({ socket, servername: host, rejectUnauthorized: false })
+      ts.once('secureConnect', () => resolve(ts))
+      ts.once('error', reject)
+    })
+    req.once('error', reject)
+    req.end()
+  })
+}
+
 /** 扁平 rawHeaders 转原始头行数组（保留大小写/顺序/重复头） */
 function rawToLines(raw: string[]): string[] {
   const lines: string[] = []
@@ -183,7 +200,7 @@ export interface MitmTunnel {
  * @param upstream 当前上游配置（仅用于打标签）
  * @param cb 回调（onRequest 返回 false 时请求被丢弃）
  */
-export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream: Upstream, cb: MitmCallbacks): MitmTunnel {
+export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream: Upstream, downstream: Downstream | null, cb: MitmCallbacks): MitmTunnel {
   let key: string, cert: string
   try {
     const c = signForHost(host)
@@ -229,6 +246,7 @@ export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream:
       }
     }
     const start = Date.now()
+    const ds = downstream
     const opts = {
       hostname: target.hostname,
       port: target.port || 443,
@@ -236,8 +254,9 @@ export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream:
       method: req.method,
       headers: { ...req.headers } as Record<string, string>,
       rejectUnauthorized: false,
-      // 走与代理引擎相同的上游链（本机直连外网不通时必须走系统代理）
-      agent: upstreamAgent(upstream),
+      // 类 Burp：设置了下游代理则出口经下游（CONNECT 隧道内做 TLS 二次握手），否则走原上游链
+      agent: ds ? undefined : upstreamAgent(upstream),
+      ...(ds ? { createConnection: () => connectViaDownstream(ds, target.hostname, target.port || 443) } : {}),
     }
     delete opts.headers['proxy-connection']
     // 内部标记头（WebShell/Repeater）不转发到目标，避免暴露工具特征
@@ -252,7 +271,7 @@ export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream:
       upRes.on('end', () => {
         const enc = (upRes.headers['content-encoding'] as string) || undefined
         cb.onFlow?.({
-          ts: start, method: req.method ?? 'GET', url: flowUrl, status: upRes.statusCode ?? 0, bytes, upstream: upstream.type === 'direct' ? 'direct' : `${upstream.type}://${upstream.host}:${upstream.port}`,
+          ts: start, method: req.method ?? 'GET', url: flowUrl, status: upRes.statusCode ?? 0, bytes, upstream: ds ? `downstream:${ds.protocol || 'http'}://${ds.host}:${ds.port}` : upstream.type === 'direct' ? 'direct' : `${upstream.type}://${upstream.host}:${upstream.port}`,
           detail: {
             reqHeaders: req.headers as Record<string, string>,
             reqBody: decodeBody(Buffer.concat(reqChunks), (req.headers['content-encoding'] as string) || undefined),
@@ -271,7 +290,7 @@ export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream:
       res.writeHead(502, { 'content-type': 'text/plain' })
       res.end(`mitm error: ${e.message}`)
       cb.onFlow?.({
-        ts: start, method: req.method ?? 'GET', url: flowUrl, status: 502, bytes: 0, upstream: upstream.type === 'direct' ? 'direct' : `${upstream.type}://${upstream.host}:${upstream.port}`,
+        ts: start, method: req.method ?? 'GET', url: flowUrl, status: 502, bytes: 0, upstream: ds ? `downstream:${ds.protocol || 'http'}://${ds.host}:${ds.port}` : upstream.type === 'direct' ? 'direct' : `${upstream.type}://${upstream.host}:${upstream.port}`,
         detail: { reqHeaders: req.headers as Record<string, string>, reqBody: decodeBody(Buffer.concat(reqChunks), (req.headers['content-encoding'] as string) || undefined), resHeaders: {}, resBody: '' },
       })
     })

@@ -58,6 +58,11 @@
   .ftab.active { background: #232b36; color: #4fc3f7; border-top: 2px solid #4fc3f7; }
   .an-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #2c3542; border-top-color: #4fc3f7; border-radius: 50%; animation: an-spin 0.8s linear infinite; vertical-align: middle; }
   @keyframes an-spin { to { transform: rotate(360deg); } }
+  /* 流量条目按最高敏感等级染色（HAE 等级色；选中态 .sel 带 !important 优先覆盖） */
+  #flowTable tr.an-row-high, #smTable tr.an-row-high { background: rgba(247, 107, 107, 0.16); }
+  #flowTable tr.an-row-medium, #smTable tr.an-row-medium { background: rgba(247, 163, 92, 0.14); }
+  #flowTable tr.an-row-low, #smTable tr.an-row-low { background: rgba(247, 224, 92, 0.12); }
+  #flowTable tr.an-row-info, #smTable tr.an-row-info { background: rgba(139, 152, 168, 0.10); }
   .rep-tab.active { background: #1e3a5f !important; color: #4fc3f7 !important; border-color: #2c3542 !important; }
   .fview { display: flex; min-height: 0; }
   /* 终端 */
@@ -67,14 +72,18 @@
   #evalBox { flex: 1; width: auto; }
   #evalOut { flex: 1; padding: 10px 14px; overflow: auto; font-size: 12px; white-space: pre-wrap; color: #9fd6a2; }
   /* 设置 */
-  .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; padding: 14px; overflow: auto; }
+  /* 设置：左右两大块（各 50%） */
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px; overflow: auto; }
+  .settings-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  .settings-block-title { font-size: 14px; color: #4fc3f7; font-weight: 600; padding: 2px 2px 4px; border-bottom: 1px solid #2c3542; margin-bottom: 2px; }
   .settings-card { background: #171b22; border: 1px solid #262c36; border-radius: 8px; padding: 14px; }
   .settings-card h3 { font-size: 13px; color: #4fc3f7; margin-bottom: 10px; }
   .settings-card .desc { color: #8b98a8; font-size: 11px; margin-bottom: 8px; }
   .settings-card .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .settings-card .row label { width: 70px; color: #8b98a8; font-size: 12px; text-align: right; }
   .settings-card .row input, .settings-card .row select { flex: 1; background: #1c222c; border: 1px solid #2c3542; color: #d7dde4; padding: 5px 8px; border-radius: 4px; }
-  .settings-card .row button { flex: 0 0 auto; }
+  .settings-card .row button { flex: 0 0 auto; background: #1e3a5f; border: 1px solid #2c3542; color: #4fc3f7; cursor: pointer; padding: 5px 12px; border-radius: 4px; font-size: 12px; }
+  .settings-card .row button:hover { background: #28507f; }
   .hint { color: #8b98a8; font-size: 11px; margin-left: 6px; }
   /* AI 助手 */
   .ai-tool { color: #8b98a8; font-size: 11px; padding-left: 8px; border-left: 2px solid #2c3542; margin: 2px 0; }
@@ -93,9 +102,6 @@
 </header>
 <div style="flex:1;display:flex;flex-direction:row;min-height:0">
 <nav>
-  <div style="display:flex;justify-content:center;align-items:center;width:44px;height:44px;margin:0 auto 6px;color:#4fc3f7" title="HermesPentBox">
-    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
-  </div>
   <button data-panel="flows" class="active">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="1"/><rect x="2" y="14" width="20" height="7" rx="1"/><line x1="6" y1="6.5" x2="6" y2="6.5"/><line x1="6" y1="17.5" x2="6" y2="17.5"/></svg>
   </button>
@@ -239,7 +245,7 @@
     <div style="flex:1;min-width:0;display:flex;flex-direction:column">
       <div style="padding:6px 10px;font-size:11px;color:#8b98a8;border-bottom:1px solid #262c36" id="smTitle">选择左侧站点查看请求</div>
       <div style="flex:1;overflow:auto">
-        <table style="width:100%;font-size:12px;border-collapse:collapse"><thead><tr>
+        <table id="smTable" style="width:100%;font-size:12px;border-collapse:collapse"><thead><tr>
           <th style="width:60px;text-align:left;padding:4px 8px;color:#8b98a8">#</th><th style="width:70px;text-align:left;padding:4px 8px;color:#8b98a8">Method</th>
           <th style="text-align:left;padding:4px 8px;color:#8b98a8">URL</th><th style="width:80px;text-align:left;padding:4px 8px;color:#8b98a8">Status</th><th style="width:70px;text-align:left;padding:4px 8px;color:#8b98a8">Length</th>
         </tr></thead><tbody id="smBody"></tbody></table>
@@ -379,56 +385,65 @@
   </section>
   <section class="panel" id="panel-settings">
     <div class="settings-grid">
-      <div class="settings-card">
-        <h3>上游代理</h3>
-        <div class="row"><label>类型</label><select id="setUpType"><option value="direct">直连</option><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></div>
-        <div class="row"><label>主机</label><input type="text" id="setUpHost" placeholder="127.0.0.1"></div>
-        <div class="row"><label>端口</label><input type="text" id="setUpPort" placeholder="7890"></div>
-        <div class="row"><label>用户名</label><input type="text" id="setUpUser" placeholder="可选"></div>
-        <div class="row"><label>密码</label><input type="password" id="setUpPass" placeholder="可选"></div>
-        <div class="row"><button id="btnSaveUp">保存上游</button><span id="upState" class="hint"></span></div>
+      <div class="settings-col">
+        <div class="settings-block-title">网络配置</div>
+        <div class="settings-card">
+          <div class="row"><label>HTTPS 抓包证书</label>
+            <button id="btnMitmCa">获取 CA 证书</button><button id="btnMitmInstall">一键安装 CA</button><span id="mitmState" class="hint"></span></div>
+        </div>
+        <div class="settings-card">
+          <h3>上游代理设置</h3>
+          <div class="row"><label>类型</label><select id="setUpType"><option value="direct">直连</option><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></div>
+          <div class="row"><label>主机</label><input type="text" id="setUpHost" placeholder="127.0.0.1"></div>
+          <div class="row"><label>端口</label><input type="text" id="setUpPort" placeholder="7890"></div>
+          <div class="row"><label>用户名</label><input type="text" id="setUpUser" placeholder="可选"></div>
+          <div class="row"><label>密码</label><input type="password" id="setUpPass" placeholder="可选"></div>
+          <div class="row"><button id="btnSaveUp">保存上游</button><span id="upState" class="hint"></span></div>
+        </div>
+        <div class="settings-card">
+          <h3>下游代理设置</h3>
+          <div class="row"><label>协议</label><select id="dsProtocol">
+            <option value="http">HTTP</option>
+            <option value="socks5">SOCKS5</option>
+          </select></div>
+          <div class="row"><label>IP</label><input type="text" id="dsHost" placeholder="127.0.0.1"></div>
+          <div class="row"><label>端口</label><input type="text" id="dsPort" placeholder="8889"></div>
+          <div class="row"><button id="btnSaveDs">保存并应用</button><span id="dsState" class="hint"></span></div>
+        </div>
       </div>
-      <div class="settings-card">
-        <h3>流量转发（浏览器 → 代理）</h3>
-        <p class="desc">启动浏览器时流量走向。转发给 Burp 时填 Burp 监听地址（如 127.0.0.1:8889）。</p>
-        <div class="row"><label>转发目标</label><select id="setFwdMode">
-          <option value="system">系统代理（默认）</option>
-          <option value="engine">内置代理引擎（8899）</option>
-          <option value="custom">自定义代理（Burp）</option>
-        </select></div>
-        <div class="row"><label>自定义地址</label><input type="text" id="setFwdCustom" placeholder="127.0.0.1:8889"></div>
-        <div class="row"><button id="btnSaveFwd">保存转发设置</button><span id="fwdState" class="hint"></span></div>
-      </div>
-      <div class="settings-card">
-        <h3>Hermes 对接</h3>
-        <p class="desc" style="margin-top:6px">使用本地 Hermes（本机 desktop）——直接在 Hermes 对话中指挥即可，工作台 API（浏览器/流量/SSH）位于 127.0.0.1:8877，本地 Hermes 可直接调用，无需任何对接配置。Agent 读取流量：<code>GET /api/traffic?limit=20&full=1</code>（HTTP/HTTPS 完整请求/响应报文 + WebSocket 帧一次返回）、<code>GET /api/flows?q=关键字</code>（搜索过滤）、<code>GET /api/flows/:id/detail</code>（单条完整报文）。</p>
-        <div class="row"><button id="btnTestLocal">验证本地 Hermes 访问</button><span id="hermesState" class="hint"></span></div>
-        <hr style="border:none;border-top:1px solid #262c36;margin:10px 0">
-        <h3 style="margin-bottom:4px">LLM 管理</h3>
-        <p class="desc">管理多套 LLM 配置（端点/Key/模型/思考深度）。「设为默认」后 AI 助手任务使用该模型；「测试直连」验证端点/Key/模型可用（纯 HTTP）。「查看本地 Hermes 配置」直接读取本机 hermes 的 config.yaml 模型段（只读展示）。</p>
-        <div class="row"><label style="min-width:auto"><input type="checkbox" id="mitmOn"> HTTPS 抓包（MITM）</label>
-          <button id="btnMitmCa">获取 CA 证书</button><button id="btnMitmInstall">一键安装 CA</button><span id="mitmState" class="hint"></span></div>
-        <div class="row"><select id="llmList" size="4" style="flex:2;background:#1c222c;border:1px solid #2c3542;color:#d7dde4">
-          <option value="">（无 LLM 配置）</option>
-        </select>
-          <div style="flex:1;display:flex;flex-direction:column;gap:4px">
-            <button id="btnLlmApply">设为默认</button>
-            <button id="btnLlmDelete">删除</button>
-            <button id="btnLlmTest">测试直连</button>
-            <button id="btnLocalHermes">查看本地 Hermes 配置</button>
-          </div></div>
-        <div class="row"><label>名称</label><input type="text" id="llmName" placeholder="如 DeepSeek 官方" style="flex:2"></div>
-        <div class="row"><label>API 端点</label><input type="text" id="llmBase" placeholder="https://api.deepseek.com/v1" style="flex:2"></div>
-        <div class="row"><label>Provider</label><input type="text" id="llmProvider" placeholder="deepseek / minimax（留空自动从端点推断）" style="flex:2"></div>
-        <div class="row"><label>API Key</label><input type="password" id="llmKey" placeholder="sk-..." style="flex:2"></div>
-        <div class="row"><label>模型名称</label><input type="text" id="llmModel" placeholder="deepseek-v4-flash" style="flex:2" list="modelList">
-          <datalist id="modelList"></datalist></div>
-        <div class="row"><label>思考深度</label><select id="llmReasoning" style="flex:2">
-          <option value="">默认</option><option value="none">none</option><option value="low">low</option>
-          <option value="medium">medium</option><option value="high">high</option>
-          <option value="xhigh">xhigh</option>
-        </select></div>
-        <div class="row"><button id="btnLlmSave">新增/保存</button><span id="llmState" class="hint"></span></div>
+      <div class="settings-col">
+        <div class="settings-block-title">Hermes 引擎管理</div>
+        <div class="settings-card">
+          <h3>Hermes Agent 连接状态</h3>
+          <div class="row"><label>连接信息</label><span id="dsConn" style="color:#d7dde4">检测中…</span></div>
+          <div class="row"><label>Agent 状态</label><span id="dsAgentState" style="color:#8b98a8">检测中…</span></div>
+          <div class="row"><button id="btnTestLocal">验证本地 Hermes 访问</button><span id="hermesState" class="hint"></span></div>
+        </div>
+        <div class="settings-card">
+          <h3>LLM 模型管理</h3>
+          <p class="desc">管理多套 LLM 配置（端点/Key/模型/思考深度）。「设为默认」后 AI 助手任务使用该模型；「测试直连」验证端点/Key/模型可用（纯 HTTP）。「查看本地 Hermes 配置」直接读取本机 hermes 的 config.yaml 模型段（只读展示）。</p>
+          <div class="row"><select id="llmList" size="4" style="flex:2;background:#1c222c;border:1px solid #2c3542;color:#d7dde4">
+            <option value="">（无 LLM 配置）</option>
+          </select>
+            <div style="flex:1;display:flex;flex-direction:column;gap:4px">
+              <button id="btnLlmApply">设为默认</button>
+              <button id="btnLlmDelete">删除</button>
+              <button id="btnLlmTest">测试直连</button>
+              <button id="btnLocalHermes">查看本地 Hermes 配置</button>
+            </div></div>
+          <div class="row"><label>名称</label><input type="text" id="llmName" placeholder="如 DeepSeek 官方" style="flex:2"></div>
+          <div class="row"><label>API 端点</label><input type="text" id="llmBase" placeholder="https://api.deepseek.com/v1" style="flex:2"></div>
+          <div class="row"><label>Provider</label><input type="text" id="llmProvider" placeholder="deepseek / minimax（留空自动从端点推断）" style="flex:2"></div>
+          <div class="row"><label>API Key</label><input type="password" id="llmKey" placeholder="sk-..." style="flex:2"></div>
+          <div class="row"><label>模型名称</label><input type="text" id="llmModel" placeholder="deepseek-v4-flash" style="flex:2" list="modelList">
+            <datalist id="modelList"></datalist></div>
+          <div class="row"><label>思考深度</label><select id="llmReasoning" style="flex:2">
+            <option value="">默认</option><option value="none">none</option><option value="low">low</option>
+            <option value="medium">medium</option><option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+          </select></div>
+          <div class="row"><button id="btnLlmSave">新增/保存</button><span id="llmState" class="hint"></span></div>
+        </div>
       </div>
     </div>
   </section>

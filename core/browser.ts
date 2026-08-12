@@ -63,8 +63,7 @@ export class ChromeBrowser {
     const proxyArg = opts.customProxy
       ? `--proxy-server=http://${opts.customProxy}`
       : `--proxy-server=http://127.0.0.1:${opts.proxyPort ?? 8899}`
-    // 浏览器 launch：CA 已受信任则走真证书校验（正规 CA 流程），否则带 --ignore-certificate-errors 保可用
-    const { isCaTrusted } = await import('../core/mitm.ts')
+    // 类 Burp 证书方案：不忽略证书错误——流量由 pentbox CA MITM，浏览器需先信任 CA（设置-网络配置-一键安装 CA）
     const args = [
       `--remote-debugging-port=${this.debugPort}`,
       `--user-data-dir=${this.userDataDir}`,
@@ -73,7 +72,6 @@ export class ChromeBrowser {
       '--disable-background-networking',
       '--disable-component-update',
       '--proxy-bypass-list=<-loopback>',
-      ...(isCaTrusted() ? [] : ['--ignore-certificate-errors']),
       ...(proxyArg ? [proxyArg] : []),
       ...(opts.headless ? ['--headless=new'] : []),
       'about:blank',

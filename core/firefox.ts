@@ -42,9 +42,7 @@ export class FirefoxBrowser {
     mkdirSync(profileDir, { recursive: true })
     const proxyServer = opts.customProxy
       ? `http://${opts.customProxy}`
-      : opts.proxyPort
-        ? `http://127.0.0.1:${opts.proxyPort}`
-        : undefined
+      : `http://127.0.0.1:${opts.proxyPort ?? 8899}`  // 与 Chrome 一致：未显式传 proxyPort 时兜底内置代理 8899
     if (proxyServer) {
       const [ph, pp] = proxyServer.replace(/^http:\/\//, '').split(':')
       writeFileSync(join(profileDir, 'user.js'), [
@@ -54,6 +52,9 @@ export class FirefoxBrowser {
         `user_pref("network.proxy.ssl", "${ph}");`,
         `user_pref("network.proxy.ssl_port", ${pp});`,
         'user_pref("network.proxy.no_proxies_on", "");',
+        // MITM 证书信任：Firefox 默认不读 Windows 系统根证书库（不像 Chrome 有 --ignore-certificate-errors），
+        // 必须开启 enterprise_roots 才能信任已安装的 pentbox CA，否则 HTTPS 全部报"连接不安全"抓不到包
+        'user_pref("security.enterprise_roots.enabled", true);',
       ].join('\n'))
     }
     const args = ['-profile', profileDir, '-no-remote']

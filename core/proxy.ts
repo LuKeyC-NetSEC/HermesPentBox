@@ -17,6 +17,9 @@ export type Upstream =
   | { type: 'http' | 'https'; host: string; port: number; username?: string; password?: string }
   | { type: 'socks4' | 'socks5' | 'socks5h'; host: string; port: number; username?: string; password?: string }
 
+/** 下游代理（独立于上游链：内置代理 → 下游 → 目标；浏览器流量先经内置代理抓包/分析再转发） */
+export type Downstream = { host: string; port: number; protocol?: 'http' | 'socks5' }
+
 export interface FlowMeta {
   id: number
   ts: number
@@ -41,12 +44,15 @@ const BODY_CAP = 1024 * 1024 // 明文 HTTP 请求体捕获上限
 export class ProxyEngine {
   private server?: Server
   private upstream: Upstream = { type: 'direct' }
+  /** 下游代理（独立链，优先于上游：设置了下游则出口连接走下游代理，上游链不参与） */
+  private downstream: Downstream | null = null
   private seq = 0
   onFlow?: (flow: FlowMeta) => void
 
   // ---- Intercept（请求拦截队列：http 明文请求 + CONNECT 隧道请求 + MITM 请求） ----
   interceptEnabled = false
-  mitmEnabled = false
+  /** MITM 默认开启（HTTPS 抓包常开；证书安装入口在设置-网络配置） */
+  mitmEnabled = true
   interceptQueue: { id: number; kind: 'http' | 'connect' | 'mitm'; method: string; url: string; ts: number; req?: IncomingMessage; res?: ServerResponse; target?: URL; client?: Socket; head?: Buffer; resolve?: (allow: boolean) => void }[] = []
   private interceptSeq = 0
   onIntercept?: () => void
@@ -92,6 +98,19 @@ export class ProxyEngine {
     const u = this.upstream
     if (u.type === 'direct') return 'direct'
     return `${u.type}://${u.host}:${u.port}`
+  }
+
+  /** 下游代理配置（host/port/协议；null=关闭直连目标） */
+  setDownstream(ds: Downstream | null): void {
+    this.downstream = ds
+  }
+
+  getDownstream(): Downstream | null {
+    return this.downstream
+  }
+
+  downstreamLabel(): string {
+    return this.downstream ? `downstream:${this.downstream.protocol || 'http'}://${this.downstream.host}:${this.downstream.port}` : ''
   }
 
   /** 探测系统代理（Windows 注册表；无则 null）——浏览器默认走内置代理时保证出网 */
@@ -217,7 +236,9 @@ export class ProxyEngine {
 
   private forwardHttp(req: IncomingMessage, res: ServerResponse, target: URL): void {
     const start = Date.now()
-    const upstreamIsTls = this.upstream.type === 'https'
+    const ds = this.downstream
+    // 下游代理独立通道：明文 HTTP 以绝对 URI 形式发往下游代理（上游链/gateway 不参与）；未设下游走原上游链
+    const upstreamIsTls = !ds && this.upstream.type === 'https'
     const doReq = upstreamIsTls ? httpsRequest : httpRequest
 
     // ponytail: 明文 HTTP 请求体做有限捕获，HTTPS 内容交给浏览器侧（CDP Network / Firefox 代理会话）
@@ -227,14 +248,14 @@ export class ProxyEngine {
       req.on('data', (c) => { bytes += c.length; if (reqBody.length < BODY_CAP) reqBody += c })
     }
 
-    const options = {
+    const options: any = {
       protocol: upstreamIsTls ? 'https:' : 'http:',
-      hostname: target.hostname,
-      port: target.port || (upstreamIsTls ? 443 : 80),
-      path: target.pathname + target.search,
+      hostname: ds ? ds.host : target.hostname,
+      port: ds ? ds.port : target.port || (upstreamIsTls ? 443 : 80),
+      path: ds ? `${target.protocol}//${target.host}${target.pathname}${target.search}` : target.pathname + target.search,
       method: req.method,
-      headers: { ...req.headers },
-      agent: this.upstreamAgent(),
+      headers: req.headers,
+      agent: ds ? undefined : this.upstreamAgent(),
     }
     delete (options.headers as Record<string, string>)['proxy-connection']
     // 内部标记头（WebShell/Repeater）不转发到目标，避免暴露工具特征
@@ -249,7 +270,7 @@ export class ProxyEngine {
       upRes.on('end', () => {
         const rawLines = (arr: string[]) => { const l: string[] = []; for (let i = 0; i + 1 < arr.length; i += 2) l.push(`${arr[i]}: ${arr[i + 1]}`); return l }
         this.emit({
-          ts: start, method: req.method ?? 'GET', url: target.href, status: upRes.statusCode ?? 0, bytes, upstream: this.upstreamLabel(),
+          ts: start, method: req.method ?? 'GET', url: target.href, status: upRes.statusCode ?? 0, bytes, upstream: ds ? this.downstreamLabel() : this.upstreamLabel(),
           self: this.isPenetrateTarget(target.href),
           detail: {
             reqHeaders: req.headers as Record<string, string>, reqBody, reqRawHeaders: rawLines(req.rawHeaders), reqLine: `${req.method ?? 'GET'} ${req.url} HTTP/${req.httpVersion}`,
@@ -261,7 +282,7 @@ export class ProxyEngine {
     up.on('error', (e) => {
       res.writeHead(502, { 'content-type': 'text/plain' })
       res.end(`proxy error: ${e.message}`)
-      this.emit({ ts: start, method: req.method ?? 'GET', url: target.href, status: 502, bytes, upstream: this.upstreamLabel(), error: e.message })
+      this.emit({ ts: start, method: req.method ?? 'GET', url: target.href, status: 502, bytes, upstream: ds ? this.downstreamLabel() : this.upstreamLabel(), error: e.message })
     })
     req.pipe(up)
   }
@@ -302,7 +323,7 @@ export class ProxyEngine {
       const tunnels = new Set<{ close: () => void }>()
       // ponytail: 单布尔标记区分重发器流（并发重发极罕见，串行用户操作足够）；per-connection 标记需改 mitm.ts 回调签名
       let repeaterFlow = false
-      const t = mitmTunnel(client, host, head ?? Buffer.alloc(0), this.upstream, {
+      const t = mitmTunnel(client, host, head ?? Buffer.alloc(0), this.upstream, this.downstream, {
         onRequest: async (info) => {
           // 重发器标记头：转发但流量不进应用流量表
           if (info.headers['x-pentbox-source'] === 'repeater') { repeaterFlow = true; return true }
@@ -323,19 +344,41 @@ export class ProxyEngine {
       return
     }
 
-    this.connectUpstream(host, port)
+    this.connectDownstream(host, port)
       .then((up) => {
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         if (head?.length) up.write(head)
         up.on('data', (c) => (bytes += c.length))
         up.pipe(client)
         client.pipe(up)
-        up.on('close', () => this.emit({ ts: start, method: 'CONNECT', url: `${host}:${port}`, status: 200, bytes, upstream: this.upstreamLabel(), self: this.isPenetrateTarget(`${host}:${port}`) }))
+        up.on('close', () => this.emit({ ts: start, method: 'CONNECT', url: `${host}:${port}`, status: 200, bytes, upstream: this.downstream ? this.downstreamLabel() : this.upstreamLabel(), self: this.isPenetrateTarget(`${host}:${port}`) }))
       })
       .catch((e: Error) => {
         client.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
-        this.emit({ ts: start, method: 'CONNECT', url: `${host}:${port}`, status: 502, bytes: 0, upstream: this.upstreamLabel(), error: e.message })
+        this.emit({ ts: start, method: 'CONNECT', url: `${host}:${port}`, status: 502, bytes: 0, upstream: this.downstream ? this.downstreamLabel() : this.upstreamLabel(), error: e.message })
       })
+  }
+
+  /** 下游代理隧道（类 Burp 上游代理转发）：配置了下游则出口连接统一走下游（HTTP CONNECT / SOCKS5），目标直连/上游链不参与 */
+  private connectDownstream(host: string, port: number): Promise<Socket> {
+    const ds = this.downstream!
+    if (ds.protocol === 'socks5') {
+      return SocksClient.createConnection({
+        proxy: { host: ds.host, port: ds.port, type: 5 },
+        command: 'connect',
+        destination: { host, port },
+      }).then((info) => info.socket)
+    }
+    // http 下游：向下游发 CONNECT 建立隧道（与 Burp Upstream Proxy 行为一致）
+    return new Promise((resolve, reject) => {
+      const req = httpRequest({
+        host: ds.host, port: ds.port, method: 'CONNECT', path: `${host}:${port}`,
+        headers: { host: `${host}:${port}` },
+      })
+      req.once('connect', (res, socket) => resolve(socket))
+      req.once('error', reject)
+      req.end()
+    })
   }
 
   private connectUpstream(host: string, port: number): Promise<Socket> {

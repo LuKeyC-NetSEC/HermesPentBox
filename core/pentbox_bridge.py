@@ -130,52 +130,72 @@ class AgentSession:
             self.tool_events = []
             self.run_id = f"run_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
             self.started_at = time.time()
-
-        def _worker():
-            try:
-                agent = self._ensure_agent()
-
-                def _delta(text):
-                    with self.lock:
-                        self.deltas.append(text or "")
-                        self.output += (text or "")
-
-                def _tool_progress(event_type, tool_name=None, preview=None, args=None):
-                    # tool.started / tool.completed 进度事件（前端显示"正在执行 X"）
-                    try:
-                        with self.lock:
-                            self.tool_events.append({
-                                "type": str(event_type or ""),
-                                "tool": str(tool_name or ""),
-                                "preview": str(preview or "")[:120],
-                            })
-                            if len(self.tool_events) > 200:
-                                del self.tool_events[:50]
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                # 传入工具进度回调 + 已有 delta 回调
-                agent.tool_progress_callback = _tool_progress
-                result = agent.run_conversation(message, stream_callback=_delta)
-                with self.lock:
-                    final = (result or {}).get("final_response") or ""
-                    if final:
-                        self.output = final
-                        self.deltas.append("")
-                    self.finished = True
-            except Exception as e:  # noqa: BLE001
-                _log("chat worker error for", self.session_id, ":", repr(e))
-                _log(traceback.format_exc())
-                with self.lock:
-                    self.error = f"{e}\n{traceback.format_exc()}"
-                    self.finished = True
-            finally:
-                with self.lock:
-                    self.running = False
-
-        self.run_thread = threading.Thread(target=_worker, daemon=True)
-        self.run_thread.start()
+        # 兜底 watchdog：模型 API 卡死/极慢时强制结束 run（避免前端永久"分析中"）
+        if getattr(self, "_watchdog", None):
+            self._watchdog.cancel()
+        self._watchdog = threading.Timer(240, self._force_timeout)
+        self._watchdog.daemon = True
+        self._watchdog.start()
+        t = threading.Thread(target=self._worker, args=(message,), daemon=True)
+        t.start()
         return {"ok": True, "run_id": self.run_id, "session_id": self.session_id, "status": "running"}
+
+    def _force_timeout(self):
+        with self.lock:
+            if not self.running or self.finished:
+                return
+        try:
+            if self.agent is not None:
+                self.agent.interrupt("run timeout")
+        except Exception:  # noqa: BLE001
+            pass
+        with self.lock:
+            if not self.finished:
+                self.error = "run timeout (240s), interrupted"
+                self.finished = True
+                _log("session", self.session_id, "forced timeout")
+
+    def _worker(self, message):
+        try:
+            agent = self._ensure_agent()
+
+            def _delta(text):
+                with self.lock:
+                    self.deltas.append(text or "")
+                    self.output += (text or "")
+
+            def _tool_progress(event_type, tool_name=None, preview=None, args=None):
+                # tool.started / tool.completed 进度事件（前端显示"正在执行 X"）
+                try:
+                    with self.lock:
+                        self.tool_events.append({
+                            "type": str(event_type or ""),
+                            "tool": str(tool_name or ""),
+                            "preview": str(preview or "")[:120],
+                        })
+                        if len(self.tool_events) > 200:
+                            del self.tool_events[:50]
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # 传入工具进度回调 + 已有 delta 回调
+            agent.tool_progress_callback = _tool_progress
+            result = agent.run_conversation(message, stream_callback=_delta)
+            with self.lock:
+                final = (result or {}).get("final_response") or ""
+                if final:
+                    self.output = final
+                    self.deltas.append("")
+                self.finished = True
+        except Exception as e:  # noqa: BLE001
+            _log("chat worker error for", self.session_id, ":", repr(e))
+            _log(traceback.format_exc())
+            with self.lock:
+                self.error = f"chat worker error: {e!r}"
+                self.finished = True
+        finally:
+            with self.lock:
+                self.running = False
 
     def get_output(self, cursor: int = 0) -> dict:
         with self.lock:

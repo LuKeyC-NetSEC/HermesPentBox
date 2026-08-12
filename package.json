@@ -21,6 +21,7 @@
     "chrome-remote-interface": "^0.34.0",
     "http-proxy-agent": "^9.1.0",
     "https-proxy-agent": "^9.1.0",
+    "neo4j-driver": "^6.2.0",
     "node-forge": "^1.4.0",
     "playwright-core": "^1.62.1",
     "socks": "^2.8.9",

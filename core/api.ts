@@ -20,6 +20,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
 import { decodeBody } from './mitm.ts'
+import { Neo4jGraph } from './graph.ts'
 import os from 'node:os'
 import type { FlowMeta, ProxyEngine, Upstream } from './proxy.ts'
 import type { ChromeBrowser } from './browser.ts'
@@ -28,6 +29,94 @@ import type { SshSession } from './ssh.ts'
 import { AgentBridgeClient } from './bridge.ts'
 import zlib from 'node:zlib'
 import { godzillaPhpEncode, godzillaPhpEncodeRaw, godzillaPhpDecode, godzillaPhpDecodeFull, godzillaSerializeParams, godzillaSerializeGzip, godzillaJspEncode, godzillaJspEncodeRaw, godzillaJspDecode, godzillaJspDecodeRaw, godzillaJspEncodeParams, godzillaCshapEncode, godzillaCshapEncodeRaw, godzillaCshapDecode, godzillaCshapDecodeRaw, behinderAesEncode, behinderAesDecode, behinderXorEncode, behinderXorDecode, antSwordPhpEncode, xorCrypt } from './webshell.ts'
+
+// ---------------- HaENet 标签体系（5 组分类 + fixed level + 颜色；Agent 敏感提取按此输出 type，前端按此着色） ----------------
+export type HaeGroup = 'Fingerprint' | 'Maybe Vulnerability' | 'Basic Information' | 'Sensitive Information' | 'Other'
+export interface HaeTag { group: HaeGroup; cn: string; level: 'high' | 'medium' | 'low' | 'info'; color: string }
+/** 标签注册表：type 名（LLM 输出）→ 分组/中文名/固定等级/颜色 */
+export const HAE_TAGS: Record<string, HaeTag> = {
+  // ---- Fingerprint（指纹识别，HaENet 原版） ----
+  'Shiro': { group: 'Fingerprint', cn: 'Shiro 框架指纹', level: 'medium', color: '#66bb6a' },
+  'JSON Web Token': { group: 'Fingerprint', cn: 'JWT 令牌指纹', level: 'medium', color: '#4fc3f7' },
+  'Swagger UI': { group: 'Fingerprint', cn: 'Swagger 接口文档', level: 'medium', color: '#f76b6b' },
+  'Ueditor': { group: 'Fingerprint', cn: 'Ueditor 编辑器指纹', level: 'medium', color: '#66bb6a' },
+  'Druid': { group: 'Fingerprint', cn: 'Druid 监控面板', level: 'medium', color: '#f7a35c' },
+  'PDF.js Viewer': { group: 'Fingerprint', cn: 'PDF.js 查看器', level: 'low', color: '#66bb6a' },
+  'Vite DevMode': { group: 'Fingerprint', cn: 'Vite 开发模式', level: 'high', color: '#f76b6b' },
+  // ---- Maybe Vulnerability（潜在漏洞线索，HaENet 原版） ----
+  'Java Deserialization': { group: 'Maybe Vulnerability', cn: 'Java 反序列化入口', level: 'high', color: '#f7e05c' },
+  'Debug Logic Parameters': { group: 'Maybe Vulnerability', cn: '调试/后门参数', level: 'medium', color: '#80cbc4' },
+  'URL As A Value': { group: 'Maybe Vulnerability', cn: 'URL 作为参数值(SSRF)', level: 'medium', color: '#80cbc4' },
+  'Upload Form': { group: 'Maybe Vulnerability', cn: '文件上传表单', level: 'medium', color: '#f7e05c' },
+  'DoS Parameters': { group: 'Maybe Vulnerability', cn: 'DoS 类分页参数', level: 'low', color: '#80cbc4' },
+  'Passwd File': { group: 'Maybe Vulnerability', cn: '口令文件泄漏', level: 'high', color: '#f76b6b' },
+  'Win.ini File': { group: 'Maybe Vulnerability', cn: 'Windows 配置文件泄漏', level: 'high', color: '#f76b6b' },
+  // ---- Basic Information（基础信息，HaENet 原版） ----
+  'Email': { group: 'Basic Information', cn: '邮箱地址', level: 'low', color: '#ce93d8' },
+  'Chinese IDCard': { group: 'Basic Information', cn: '中国大陆身份证', level: 'high', color: '#ffb74d' },
+  'Chinese Mobile Number': { group: 'Basic Information', cn: '中国大陆手机号', level: 'medium', color: '#80cbc4' },
+  'Internal IP Address': { group: 'Basic Information', cn: '内网 IP 地址', level: 'medium', color: '#80cbc4' },
+  'MAC Address': { group: 'Basic Information', cn: 'MAC 地址', level: 'low', color: '#66bb6a' },
+  // ---- Sensitive Information（敏感信息，HaENet 原版 + 兼容原凭据标签） ----
+  'Cloud Key': { group: 'Sensitive Information', cn: '云厂商 AccessKey', level: 'high', color: '#f7e05c' },
+  'Cloud Access Key': { group: 'Sensitive Information', cn: '云 AccessKey/Secret', level: 'high', color: '#f7e05c' },
+  'Windows File/Dir Path': { group: 'Sensitive Information', cn: 'Windows 路径泄漏', level: 'medium', color: '#66bb6a' },
+  'Password Field': { group: 'Sensitive Information', cn: '密码字段', level: 'high', color: '#f7a35c' },
+  'Username Field': { group: 'Sensitive Information', cn: '用户名/账号字段', level: 'low', color: '#66bb6a' },
+  'WeCom Key': { group: 'Sensitive Information', cn: '企业微信凭证', level: 'high', color: '#66bb6a' },
+  'JDBC Connection': { group: 'Sensitive Information', cn: 'JDBC 数据库连接(明文口令)', level: 'high', color: '#f7e05c' },
+  'Authorization Header': { group: 'Sensitive Information', cn: 'Authorization 认证头', level: 'high', color: '#4fc3f7' },
+  'Sensitive Field': { group: 'Sensitive Information', cn: '敏感字段(key/secret/token)', level: 'medium', color: '#f7e05c' },
+  'Mobile Number Field': { group: 'Sensitive Information', cn: '手机号字段', level: 'low', color: '#66bb6a' },
+  'Userinfo In Link': { group: 'Sensitive Information', cn: 'URL 内嵌用户信息', level: 'medium', color: '#66bb6a' },
+  'User Identity': { group: 'Sensitive Information', cn: '前端身份存储(localStorage)', level: 'medium', color: '#66bb6a' },
+  // ---- 兼容原攻击凭据标签（归入 Sensitive Information 高等级） ----
+  'API Key': { group: 'Sensitive Information', cn: 'API 密钥', level: 'high', color: '#f76b6b' },
+  'Bearer Token': { group: 'Sensitive Information', cn: 'Bearer 令牌', level: 'high', color: '#4fc3f7' },
+  'Password': { group: 'Sensitive Information', cn: '口令/密码', level: 'high', color: '#f7a35c' },
+  'Secret': { group: 'Sensitive Information', cn: '密钥/机密', level: 'high', color: '#f7e05c' },
+  'Token': { group: 'Sensitive Information', cn: '令牌', level: 'high', color: '#4fc3f7' },
+  'Session Cookie': { group: 'Sensitive Information', cn: '会话 Cookie', level: 'high', color: '#b388ff' },
+  'Private Key': { group: 'Sensitive Information', cn: '私钥', level: 'high', color: '#ef5350' },
+  'Authorization': { group: 'Sensitive Information', cn: '认证凭据', level: 'high', color: '#4fc3f7' },
+  // ---- Other（其他，HaENet 原版） ----
+  'Linkfinder': { group: 'Other', cn: '链接发现', level: 'info', color: '#8b98a8' },
+  'Source Map': { group: 'Other', cn: 'Source Map 源码映射', level: 'low', color: '#f48fb1' },
+  'Create Script': { group: 'Other', cn: '动态创建脚本', level: 'low', color: '#66bb6a' },
+  'URL Schemes': { group: 'Other', cn: '自定义 URL 协议', level: 'low', color: '#f7e05c' },
+  'Router Push': { group: 'Other', cn: '前端路由跳转', level: 'info', color: '#ce93d8' },
+  'All URL': { group: 'Other', cn: '链接引用', level: 'info', color: '#8b98a8' },
+  '302 Location': { group: 'Other', cn: '302 重定向地址', level: 'info', color: '#8b98a8' },
+  'OSKeys': { group: 'Other', cn: '系统标识泄漏', level: 'medium', color: '#8b98a8' },
+  // ---- Nday 线索（保留原体系，归 Maybe Vulnerability 高等级） ----
+  'Nday API': { group: 'Maybe Vulnerability', cn: 'Nday 漏洞 API 路径', level: 'high', color: '#ff5252' },
+  'Nday JS': { group: 'Maybe Vulnerability', cn: 'Nday 可疑 JS 引用', level: 'high', color: '#ff7043' },
+  'Nday 组件': { group: 'Maybe Vulnerability', cn: 'Nday 漏洞组件/版本', level: 'high', color: '#ff5252' },
+}
+/** 5 组中文名（prompt 分组说明用） */
+export const HAE_GROUPS: { key: HaeGroup; cn: string }[] = [
+  { key: 'Fingerprint', cn: '指纹识别' },
+  { key: 'Maybe Vulnerability', cn: '潜在漏洞线索' },
+  { key: 'Basic Information', cn: '基础信息' },
+  { key: 'Sensitive Information', cn: '敏感信息' },
+  { key: 'Other', cn: '其他' },
+]
+/** 凭据类标签（写 Cred 节点 + 自动凭据利用意见卡的判定集合） */
+export const HAE_CRED_TAGS = new Set<string>([
+  'API Key', 'Bearer Token', 'Password', 'Secret', 'Token', 'Session Cookie', 'Private Key', 'Authorization',
+  'Cloud Key', 'Cloud Access Key', 'Password Field', 'WeCom Key', 'JDBC Connection', 'Authorization Header',
+])
+/** HAE 漏洞等级色（与前端 AN_LEVEL_COLOR 同源；入图：Vuln/Api/Analysis 节点颜色标识） */
+export const HAE_LEVEL_COLOR: Record<string, string> = { high: '#f76b6b', medium: '#f7a35c', low: '#f7e05c', info: '#8b98a8' }
+/** 渲染 HaENet 标签清单文本（注入分析 prompt） */
+export function haeTagList(): string {
+  const lines: string[] = []
+  for (const g of HAE_GROUPS) {
+    const tags = Object.entries(HAE_TAGS).filter(([, t]) => t.group === g.key)
+    lines.push(`${g.cn}(${g.key})：${tags.map(([k]) => k).join(' / ')}`)
+  }
+  return lines.join('\n')
+}
 
 /** 漏洞记录（Agent CRUD + UI 展示） */
 export interface Vuln {
@@ -83,6 +172,11 @@ interface DigestEntry {
   path: string
   data: string
   persist: boolean
+  /** HaENet 分析标签（模块/组/等级/颜色，随条目写入 Neo4j 图节点） */
+  tag?: string
+  group?: HaeGroup
+  level?: 'high' | 'medium' | 'low' | 'info'
+  color?: string
 }
 
 export class ApiServer {
@@ -108,10 +202,13 @@ export class ApiServer {
   }
 
   async start(): Promise<void> {
+    // Neo4j Agent 情报图（完全替代全局情报 digest）
+    this.graph.connect()
     this.probeHermes()
     setInterval(() => this.probeHermes(), 5000)  // HERMES AGENT 状态实时探测
     this.loadVulns()
     this.loadWebshells()
+    this.loadDownstream()
     void this.ensureHermesProfile()  // 自动确保 hermespentbox 独立档案（含 persona/用户画像）
     setTimeout(() => this.ensureSkills(), 3000)  // 档案就绪后确保内置红队技能库（102 技能）
     this.startAnalyzeLoop()
@@ -172,9 +269,13 @@ export class ApiServer {
 
   // ---------------- Agent 分析队列（流量逐个入队，外部 Agent 消费 /api/analyze/next 并写回结果） ----------------
   private analyzeQueue: number[] = []
-  private analyzeMap = new Map<number, { state: 'queued' | 'analyzing' | 'done'; vuln?: boolean; level?: string; detail?: unknown; url?: string; sensitive?: { type: string; value: string }[]; skipped?: boolean; builtin?: boolean; self?: boolean; penetrate?: boolean }>()
+  private analyzeMap = new Map<number, { state: 'queued' | 'analyzing' | 'done'; vuln?: boolean; level?: string; detail?: unknown; url?: string; sensitive?: { type: string; value: string; level?: string }[]; skipped?: boolean; builtin?: boolean; self?: boolean; penetrate?: boolean; confirmed?: boolean; confLevel?: string }>()
   /** 全局情报 digest：所有槽分析结论/凭据/渗透状态/取消记录结构化汇总（注入每次分析 prompt——子 Agent 共享上下文，防记忆割裂） */
   private analysisDigest: DigestEntry[] = []
+  /** Neo4j Agent 情报图（会话内容共享，替代 digest） */
+  private graph = new Neo4jGraph(process.env.NEO4J_URL || 'bolt://localhost:7687', process.env.NEO4J_USER || 'neo4j', process.env.NEO4J_PASS || 'pentbox123')
+  /** 站点地图→图已同步的 URL 去重（防重复 MERGE 调用；Neo4j 侧幂等，此集仅控调用量） */
+  private graphApiSynced = new Set<string>()
   /** 已推送意见卡的去重 key（无协议 Host+路径+查询 | 渗透方式）：同 URL 同方式不再重复推送；不同方式可再推（与"不同方式可再渗"一致） */
   private advisedKeys = new Set<string>()
   /** 已渗透成功的 URL+渗透方式（渗透成果去重：同 API 同方式不再重复渗透；不同方式可再渗） */
@@ -280,34 +381,36 @@ export class ApiServer {
       onDone: (sid, reply) => onEvent({ type: 'done', reply, sessionId: sid }),
       onError: (msg) => onEvent({ type: 'error', error: msg }),
       onAbort,
-    })
+    }, true)
   }
 
   /** 通用 Agent Bridge 单轮对话（分析/渗透/沟通/主对话共用）：
    * 无会话则新建（persist）；有则续传。返回完整回复文本。 */
-  private bridgeAsk(input: string, sessionId: string | null, opts: { onDelta?: (t: string) => void; onDone?: (sid: string, reply: string) => void; onSid?: (sid: string) => void; onTool?: (ev: { type: string; tool: string; preview: string }) => void; onError?: (msg: string) => void; onAbort?: (stop: () => void) => void } = {}): Promise<string> {
+  private bridgeAsk(input: string, sessionId: string | null, opts: { onDelta?: (t: string) => void; onDone?: (sid: string, reply: string) => void; onSid?: (sid: string) => void; onTool?: (ev: { type: string; tool: string; preview: string }) => void; onError?: (msg: string) => void; onAbort?: (stop: () => void) => void } = {}, mainChat = false): Promise<string> {
     return new Promise((resolve, reject) => {
       this.ensureBridge().then(async () => {
         try {
           if (!this.bridgeReady) return reject(new Error('Agent Bridge 未就绪'))
           // 无会话 → 新建 bridge 会话（persist）
+          // 仅主 Agent 聊天（mainChat）允许回写 chatSessionId——流量分析/渗透的会话不得污染主会话指针
           let sid = sessionId
           if (!sid) {
             sid = `pentbox-chat-${Date.now()}`
-            if (this.chatSessionId === sessionId) this.chatSessionId = sid
+            if (mainChat) this.chatSessionId = sid
           }
           opts.onSid?.(sid)  // 尽早通知会话 id（前端运行中 steer 需要）
           const started = await this.bridge.chat(sid, input, 'hermespentbox')
           if (!started?.ok) return reject(new Error('bridge 对话启动失败'))
           // 会话已在运行（并发/串话）：等待当前 run 完成后自动续发（同 session 串行），避免丢失消息
           if (started.status === 'already_running') {
-            // 轮询上一次 run 直到 done
+            // 轮询上一次 run 直到 done（上限 180s，防止上一 run 卡死导致本消息永久挂起）
             const prevRun = started.run_id
+            const deadline = Date.now() + 180_000
             await new Promise<void>((res) => {
               const iv = setInterval(async () => {
                 try {
                   const o = await this.bridge.getOutput(prevRun, 0, 0)
-                  if (o.done) { clearInterval(iv); res() }
+                  if (o.done || Date.now() > deadline) { clearInterval(iv); res() }
                 } catch { clearInterval(iv); res() }
               }, 300)
             })
@@ -319,7 +422,15 @@ export class ApiServer {
           let cursor = 0
           let eventCursor = 0
           let lastToolCount = 0
-          const finish = (err?: Error) => { if (finished) return; finished = true; err ? reject(err) : resolve(out) }
+          // 整体超时兜底：模型 API 卡死/极慢（如 minimax IndexError+38s latency）时自动中断 run 并失败，
+          // 避免分析槽/前端状态永久"分析中"（broker 端还有 240s watchdog 双保险）
+          const timer = setTimeout(() => {
+            if (!finished) {
+              this.bridge.interrupt(sid, undefined, 'hermespentbox').catch(() => {})
+              finish(new Error(`Agent 响应超时（180s），已自动中断`))
+            }
+          }, 180_000)
+          const finish = (err?: Error) => { if (finished) return; finished = true; clearTimeout(timer); err ? reject(err) : resolve(out) }
           opts.onAbort?.(() => { this.bridge.interrupt(sid, undefined, 'hermespentbox').catch(() => {}); setTimeout(finish, 1500) })
           // 轮询 get_output（100ms 间隔）直到 done；delta 增量 + 工具进度转发
           const pump = async () => {
@@ -368,8 +479,9 @@ export class ApiServer {
     }
     // 错误状态码：404（资源不存在）与 5xx（服务器错误）无 bypass 价值 → 跳过 Agent（done + 跳过 icon）
     // 401/403/407 等 40x 保留（可做 bypass 分析，必须发 Agent）
+    // st===0（连接失败/无响应报文，如 CONNECT 隧道、代理 502 错误）：无响应内容可分析 → 同样跳过
     const st = this.resStatus(detail)
-    if (st === 404 || st >= 500) {
+    if (st === 0 || st === 404 || st >= 500) {
       this.analyzeMap.set(id, { state: 'done', vuln: false, skipped: true, detail })
       return
     }
@@ -389,6 +501,25 @@ export class ApiServer {
     }
     this.analyzeMap.set(id, { state: 'queued', detail, url })
     this.analyzeQueue.push(id)
+    // 站点地图同步到 Neo4j：进入审计的流量（非 builtin/self/404/5xx/渗透）≡ 站点地图可见项 → 写 Host-Api 节点（图上下文供 Agent 直接看到站点地图）
+    if (url && !this.graphApiSynced?.has(url)) {
+      const d = detail as { reqLine?: string } | undefined
+      const line = String(d?.reqLine || '')
+      const m = line.match(/^(\S+)\s+(\S+)/)
+      const host = this.hostOf(url) || url  // 统一无协议 host:port（与分析/凭据/漏洞写入同格式，避免 Host 节点分裂）
+      let path = m ? m[2] : ''
+      // 代理请求行可能是绝对 URI（curl/浏览器走代理：GET http://host/path HTTP/1.1）→ 归一为相对路径
+      if (path.startsWith('http')) { try { const pu = new URL(path); path = pu.pathname + pu.search } catch { /* 保持原样 */ } }
+      if (!path) path = url.replace(/^https?:\/\/[^/]+/i, '') || '/'
+      const method = m ? m[1] : 'GET'
+      // 仅写入成功才标记已同步（失败不标记 → 后续同 URL 流量自动重试；避免 Neo4j 抖动导致站点地图条目永久丢失）
+      this.graph.upsertHostApi(host, path, method)
+        .then(() => {
+          if (this.graphApiSynced.size > 5000) this.graphApiSynced.clear()  // 防无限增长（重启即清，Neo4j 侧 MERGE 幂等）
+          this.graphApiSynced.add(url)
+        })
+        .catch(() => { /* 图写入失败：不标记，下次同 URL 流量再试 */ })
+    }
   }
 
   /** 从报文快照解析响应状态码（resLine 形如 HTTP/1.1 404 Not Found） */
@@ -427,7 +558,23 @@ export class ApiServer {
     /beacons\.gcp\.gvt2\.com/,                   // 域可靠性上传
     /ocsp\.(digicert|comodoca|pki\.goog|usertrust|globalsign)\./,  // OCSP 证书吊销检查
     /crl\.(digicert|comodoca|globalsign)\./,                       // CRL 吊销列表
+    // ---- Firefox/Edge 内置遥测与系统流量（旧实例日志实证样本） ----
+    /\.services\.mozilla\.com\//,                // Firefox 设置同步/地理位置/追踪保护列表（firefox.settings/location/shavar.*）
+    /\.cdn\.mozilla\.net\//,                     // Firefox 设置附件/内容签名/远程配置 CDN
+    /detectportal\.firefox\.com/,                // Firefox 网络连通性探测（captive portal）
+    /firefox-settings\.mozilla-backup\.org/,     // Firefox 设置备份域
+    /mozilla-ohttp\.fastly-edge\.com/,           // Firefox OHTTP 隐私网关
+    /aus5\.mozilla\.org/,                        // Firefox 更新服务器
+    /normandy\.(cdn\.)?mozilla\.(org|net)/,      // Firefox Normandy 实验/特性开关
+    /snippets\.cdn\.mozilla\.net/,               // Firefox 新标签页摘要
+    /accounts\.firefox\.com/,                    // Firefox 账户同步
+    /shavar\.services\.mozilla\.com/,            // Firefox 跟踪保护列表（Safe Browsing 分流）
+    /incoming\.telemetry\.mozilla\.org/,         // Firefox 遥测上报
+    /firefox\.cloud\.mozilla\.com/,              // Firefox 云
   ]
+
+  /** 本机工件/客户端请求头噪音特征：分析出的"敏感项"命中则视为非目标泄漏（脏情报不入图） */
+  private static readonly LOCAL_ARTIFACT_RE = /(C:\\Users\\[^\\"'\s]+|\/Users\/[^\/"'\s]+|windows\/system32|localhost(?::\d+)?|127\.0\.0\.1|Proxy-Connection|Accept-Encoding|Accept-Language|Upgrade-Insecure-Requests|^Sec-Fetch-|Connection\s*:\s*keep-alive|User-Agent\s*:\s*curl)/i
 
   private isBrowserBuiltin(detail?: unknown, url?: string): boolean {
     const s = (typeof detail === 'string' ? detail : JSON.stringify(detail ?? '')) + ' ' + (url ?? '')  // url 参与匹配（detail 无路径时黑名单 URL 规则仍命中）
@@ -531,6 +678,30 @@ export class ApiServer {
   /** 进行中的渗透子 Agent 进程（slot → child，供 /api/penetrate/cancel 杀进程） */
   private penetrateChildren = new Map<number, ReturnType<typeof spawn> | (() => void)>()
 
+  // ---------------- 图变更实时广播（Neo4j 写入 → steer 注入所有运行中的 Agent 会话） ----------------
+  /** 2 秒节流窗口内待广播的图变更摘要（合并多条为一条，防刷屏） */
+  private graphBroadcastBuf: string[] = []
+  private graphBroadcastTimer: ReturnType<typeof setTimeout> | null = null
+  /** 图写入成功后调用：记录变更摘要并节流广播到主 Agent + 全部子 Agent 槽（仅运行中会话接收，空闲自动 rejected） */
+  private broadcastGraphChange(summary: string): void {
+    if (!this.bridgeReady) return
+    this.graphBroadcastBuf.push(summary)
+    if (this.graphBroadcastBuf.length > 8) this.graphBroadcastBuf.shift()  // 单窗口最多 8 条，防上下文刷爆
+    if (this.graphBroadcastTimer) return
+    this.graphBroadcastTimer = setTimeout(() => {
+      this.graphBroadcastTimer = null
+      const batch = this.graphBroadcastBuf.splice(0)
+      if (!batch.length) return
+      const text = `（图实时更新）Neo4j 情报图刚新增以下条目，供你更新认知（无需回复，勿中断当前工作）：\n${batch.join('\n')}`
+      const targets = new Set<string>()
+      if (this.chatSessionId) targets.add(this.chatSessionId)
+      for (const sid of this.analyzeSlots) if (sid) targets.add(sid)
+      for (const sid of targets) {
+        this.bridge.steer(sid, text, 'hermespentbox').catch(() => {})
+      }
+    }, 2000)
+  }
+
   /** 与本地 Hermes 对话（异步 spawn；独立会话——分析 10 槽并行时共享会话会锁冲突导致进程崩溃；回复过滤 CLI 日志） */
   private chatSessionId: string | null = null
   /** 通用 hermes 单轮调用：resume 指定会话（可空=新会话），onSid 回调拿到新会话 id，onSpawn 回调拿到子进程（供取消杀进程），tailLines 控制回复截断行数（VULNDOC 需放宽） */
@@ -555,15 +726,41 @@ export class ApiServer {
       })
     })
   }
-  private hermesChat(message: string): Promise<string> {
-    return this.runHermes(message, this.chatSessionId, (sid) => { this.chatSessionId = sid })
+  /** 应用工具能力引导（注入主聊天）：Agent 可直接主动调用这些 HTTP 接口（执行接口已由应用封装） */
+  private toolsHint(): string {
+    const ws = this.webshells
+    const lines: string[] = [
+      '【应用工具能力】以下接口是工作台提供的 Agent 直连能力，你可主动调用（execute_code 里用 python urllib，或 terminal 用 curl），不必等用户代为操作：',
+      '· 主动查全局情报图（站点地图/漏洞/凭据/WebShell/每接口分析结论，多 Agent 共享）：GET http://localhost:8877/api/graph/query （文本）；加 ?format=json 得结构化 JSON（含 analysis 结论）；加 ?host=192.168.6.133:8080 只看该主机',
+      '· 查看当前流量面板（应用代理实时捕获的 HTTP 流量：方法/URL/状态码/时间）：GET http://localhost:8877/api/flows?limit=30 ；加 &full=1 返回最近请求的完整请求/响应报文',
+      '· 主动记录情报到图（共享给其他 Agent，非破坏性）：POST http://localhost:8877/api/graph/note ，body={"host":"192.168.6.133:8080","path":"/x.php","text":"发现内容","level":"high|medium|low|info"}',
+      '· 登录凭据等敏感信息：同样用 /api/graph/note 记录（text 含 用户名/密码/令牌），level 标 high',
+    ]
+    if (ws.length) {
+      lines.push(`· WebShell 管理（当前 ${ws.length} 个）：命令执行 POST http://localhost:8877/api/webshells/exec ，body={"id":N,"command":"cmd"} → {"ok":true,"output":"..."}（加解密握手已封装，密钥勿自行构造）`)
+      for (const w of ws.slice(0, 10)) lines.push(`   id=${w.id} | ${w.url} | ${w.type || 'custom'}/${w.script || '?'} | ${w.status || 'unknown'} | pass=${w.password ? '***' : '(空)'} key=${w.key ? '***' : '(空)'}`)
+    }
+    lines.push('约束：以上接口仅用于读取情报、记录分析结论与执行命令；删除/覆盖现有数据属破坏性操作，须先征得用户同意。')
+    return lines.join('\n') + '\n\n'
+  }
+
+  /** 子 Agent（流量分析槽）精简工具引导：分析中可主动查/写图（完整工具列表见主聊天 toolsHint） */
+  private static readonly SUB_TOOL_HINT = '【图工具】你可主动调 http://localhost:8877/api/graph/query（?format=json 得结构化，?host= 过滤主机）查全局情报图；发现需共享的情报用 POST /api/graph/note {"host":"..","path":"..","text":"..","level":"..."} 记录（凭据/敏感信息 level 标 high）。仅读取与记录，禁止删改。\n\n'
+
+  private hermesChat(message: string, gctx?: string, hint?: string): Promise<string> {
+    const mid = [gctx, hint].filter(Boolean).join('\n')
+    const input = mid ? `${mid}【用户消息】${message}` : message
+    // 统一走 Agent Bridge 通道（与流式聊天同一命名空间/会话指针），避免 CLI runHermes 的 session_id 污染 chatSessionId
+    return this.bridgeAsk(input, this.chatSessionId, {
+      onDone: (sid) => { this.chatSessionId = sid },
+    }, true)
   }
 
   /** 调本地 Hermes 分析一条流量（Agent Bridge 并行会话，不阻塞主进程）：每槽独立 bridge 会话续传上下文；返回含 slot（提出意见的子 Agent 槽位） */
-  private hermesAnalyze(detail: unknown): Promise<{ vuln: boolean; level: string; sensitive: { type: string; value: string }[]; advice: string; slot: number }> {
+  private async hermesAnalyze(detail: unknown): Promise<{ vuln: boolean; level: string; sensitive: { type: string; value: string; level: string }[]; advice: string; slot: number }> {
     const d = (detail ?? {}) as Record<string, unknown>
-    const digest = this.digestPrompt()
-    const prompt = digest + '分析以下 HTTP 流量（完整请求/响应）：\n1. 判断是否存在可利用的安全漏洞；\n2. 提取流量中的可利用敏感信息，分三类：\n   a) 攻击凭据：API Key / Bearer Token / Access Token / Password / Secret / Session Cookie / Private Key / Cloud Access Key / Authorization 等；\n   b) 敏感个人信息：手机号(type=Phone) / 身份证号(type=ID Card) / 银行卡号(type=Bank Card) / Email 等；\n   c) Nday 线索：疑似存在已知漏洞 CVE 的 API 路径/组件/版本、可疑 JS 引用 → type 用 "Nday API" / "Nday JS" / "Nday 组件"。\n3. 若存在可利用漏洞（vuln=true），输出渗透意见 advice，格式必须为："经 Hermes 分析 <API路径> 可进行 <攻击方式> 渗透，是否进行"（攻击方式用具体手法：SQL 注入/未授权访问/SSRF/暴力破解/越权等）。注意：vuln=true 时 advice 必填，禁止输出空字符串。\n只输出一行 JSON，格式：{"vuln": true或false, "level": "high|medium|low|info", "sensitive": [{"type": "类型", "value": "值"}], "advice": "渗透意见或空"}。无漏洞时 advice 为空字符串。\n\n【请求】\n' +
+    const digest = await this.digestPrompt()
+    const prompt = digest + ApiServer.SUB_TOOL_HINT + '分析以下 HTTP 流量（完整请求/响应）：\n1. 判断是否存在可利用的安全漏洞；\n2. 从报文中提取敏感信息/指纹/线索，type 必须从以下 HaENet 标签清单中精确选择（每个 type 自带固定危害等级；清单外的 type 禁止使用）：\n' + haeTagList() + '\n3. 若存在可利用漏洞（vuln=true），输出渗透意见 advice，格式必须为："经 Hermes 分析 <API路径> 可进行 <攻击方式> 渗透，是否进行"（攻击方式用具体手法：SQL 注入/未授权访问/SSRF/暴力破解/越权等）。注意：vuln=true 时 advice 必填，禁止输出空字符串。\n只输出一行 JSON，格式：{"vuln": true或false, "level": "high|medium|low|info", "sensitive": [{"type": "标签名", "value": "值"}], "advice": "渗透意见或空"}。level 为整体危害等级。无漏洞时 advice 为空字符串。\n\n【请求】\n' +
       `${d.reqLine ?? ''}\n${((d.reqRawHeaders as string[]) ?? []).join('\n')}\n\n${d.reqBody ?? ''}\n\n【响应】\n${d.resLine ?? ''}\n${((d.resRawHeaders as string[]) ?? []).join('\n')}\n\n${String(d.resBody ?? '').slice(0, 4000)}`
     // 负载均衡：选当前最空闲的子 Agent 槽（最少连接算法），而非静态轮转
     // 渗透中的槽 + 已提出渗透意见卡待决策的槽 不接新流量分析（Agent 专注渗透/等待决策；取消/完成/卡片关闭后再恢复分配）
@@ -576,14 +773,28 @@ export class ApiServer {
     }).then((out) => {
       this.slotBusy[slot]--
       const p = this.extractJson(out)
-      const sens: { type: string; value: string }[] = Array.isArray(p?.sensitive) ? p.sensitive.filter((s: unknown) => s && typeof s === 'object' && (s as { value?: unknown }).value != null).map((s) => ({ type: String((s as { type?: unknown }).type ?? 'Secret'), value: String((s as { value?: unknown }).value).slice(0, 200) })) : []
+      const sens: { type: string; value: string; level: string }[] = Array.isArray(p?.sensitive) ? p.sensitive.filter((s: unknown) => s && typeof s === 'object' && (s as { value?: unknown }).value != null).map((s) => {
+        const rawType = String((s as { type?: unknown }).type ?? 'All URL')
+        // HaENet 标签归一：精确命中注册表 → type 用注册表 key；未命中尝试大小写/别名模糊匹配；仍不中 → 保留原样（前端灰显）
+        // 注意：HAE_TAGS[key] 返回 meta 对象（level/group/color），不能当作 type 用
+        const exactKey = Object.prototype.hasOwnProperty.call(HAE_TAGS, rawType.trim()) ? rawType.trim() : null
+        const tag = exactKey || Object.keys(HAE_TAGS).find((k) => k.toLowerCase() === rawType.trim().toLowerCase())
+        const meta = (tag && HAE_TAGS[tag]) || null
+        return { type: tag || rawType.trim(), value: String((s as { value?: unknown }).value).slice(0, 200), level: meta?.level ?? 'info' }
+      }) : []
+      const overall = (p?.level && ['high', 'medium', 'low', 'info'].includes(p.level)) ? p.level : 'info'
+      // 整体等级提升：任一标签等级高于模型输出的 overall 时以标签等级为准（HaENet fixed-level 兜底模型低估）
+      const maxTag = sens.reduce((m, s) => (['high', 'medium', 'low', 'info'].indexOf(s.level) < ['high', 'medium', 'low', 'info'].indexOf(m) ? s.level : m), overall)
       let advice = p && typeof p.advice === 'string' && p.advice ? p.advice.slice(0, 300) : ''
       // 兜底：模型判有漏洞但 advice 空（输出不稳定）→ 用请求路径生成渗透意见（保证意见卡出现）
       if (p?.vuln && !advice) {
         const pm = String(d.reqLine ?? '').match(/\S+\s+(\S+)/)
         advice = `经 Hermes 分析 ${pm ? pm[1] : '目标'} 可进行 安全测试 渗透，是否进行`
       }
-      return { vuln: p ? !!p.vuln : false, level: p?.level ?? 'info', sensitive: sens, advice, slot }
+      // 本机工件/客户端噪音过滤：分析里的"敏感项"若是本机信息或标准请求头，不是目标泄漏 → 剔除（避免脏情报入图）
+      const clean = sens.filter((s) => !ApiServer.LOCAL_ARTIFACT_RE.test(s.value) && !ApiServer.LOCAL_ARTIFACT_RE.test(s.type))
+      if (clean.length !== sens.length) console.log(`[analyze] 过滤本机/客户端噪音敏感项 ${sens.length - clean.length} 条`)
+      return { vuln: p ? !!p.vuln : false, level: maxTag, sensitive: clean, advice, slot }
     }).catch((e) => {
       this.slotBusy[slot]--
       throw e
@@ -625,8 +836,27 @@ export class ApiServer {
     try { return new URL(url).host } catch { return '' }
   }
 
-  /** 写入全局情报（持久条目不淘汰；滚动条目仅保留最近 20 条非持久流水） */
+  /** 写入全局情报（持久条目不淘汰；滚动条目仅保留最近 20 条非持久流水；标签元数据随条目落图） */
   private pushDigest(entry: DigestEntry): void {
+    // 写 Neo4j 情报图（会话内容共享核心）
+    if (this.graph.enabled) {
+      const host = entry.host || ''
+      const path = entry.path || ''
+      if (entry.kind === 'cred') {
+        this.graph.writeCred({ type: entry.data.split(':')[0] || 'unknown', value: entry.data.split(':').slice(1).join(':') || entry.data, host, path, source: 'agent', tag: entry.tag, group: entry.group, level: entry.level, color: entry.color }).catch(() => {})
+        this.broadcastGraphChange(`新凭据 [${entry.tag || entry.data.split(':')[0] || '?'}](${entry.level || 'high'}) ${host}${path}: ${String(entry.data.split(':').slice(1).join(':') || '').slice(0, 60)}`)
+      }
+      else if (entry.kind === 'penetrating' || entry.kind === 'penetrated' || entry.kind === 'cancelled') {
+        const method = (entry.data.match(/渗透（(.+)）/) || [])[1] || ''
+        this.graph.writePenetration({ host, path, method, status: entry.kind === 'penetrating' ? 'penetrating' : entry.kind === 'cancelled' ? 'cancelled' : 'penetrated' }).catch(() => {})
+        this.broadcastGraphChange(`渗透状态 ${entry.kind}: ${host}${path}（${method || '?'}）— ${entry.data.slice(0, 80)}`)
+      }
+      else {
+        this.graph.writeNote({ kind: entry.kind, text: entry.data, host, path, persist: entry.persist, tag: entry.tag, group: entry.group, level: entry.level, color: entry.color }).catch(() => {})
+        this.broadcastGraphChange(`[${entry.tag || entry.kind}](${entry.level || 'info'}) ${host}${path}: ${entry.data.slice(0, 80)}`)
+      }
+    }
+    // 内存降级缓存（Neo4j 不可用时兜底；Neo4j 可用时仅作即时查重辅助）
     this.analysisDigest.push(entry)
     // 滚动条目窗口：持久条目保留，非持久只留最近 20 条
     const roll = this.analysisDigest.filter((e) => !e.persist)
@@ -655,10 +885,15 @@ export class ApiServer {
   /** 移除全局情报条目（按 kind+host+path 精确匹配；进行中渗透/临时标记移除用） */
   private removeDigest(kind: DigestEntry['kind'], host: string, path: string): void {
     this.analysisDigest = this.analysisDigest.filter((e) => !(e.kind === kind && e.host === host && e.path === path))
+    if (this.graph.enabled) this.graph.removePenetration(host, path, '').catch(() => {})
   }
 
-  /** 渲染全局情报注入文本（结构化分类，按目标相关性突出） */
-  private digestPrompt(): string {
+  /** 渲染全局情报注入文本：优先 Neo4j 会话图查询，Neo4j 不可用时降级内存 digest */
+  private async digestPrompt(): Promise<string> {
+    if (this.graph.enabled) {
+      const g = await this.graph.contextPrompt()
+      if (g) return g
+    }
     if (!this.analysisDigest.length) return ''
     const pers = this.analysisDigest.filter((e) => e.persist)
     const roll = this.analysisDigest.filter((e) => !e.persist)
@@ -691,35 +926,47 @@ export class ApiServer {
             const u = st.url || ''
             const host = this.hostOf(u)
             const path = u.replace(/^https?:\/\/[^/]+/i, '') || ''
+            // 整合落图：分析结论挂到与站点地图相同的 Api 节点链上（Host→Api→ANALYZED→Analysis）
+            if (host) {
+              const dm = (st.detail as { reqLine?: string } | undefined)?.reqLine?.match(/^(\S+)/)
+              const sensTxt = (r.sensitive || []).map((s) => `${s.type}:${String(s.value).slice(0, 40)}`).join('; ').slice(0, 400)
+              // 条目颜色 = 最高敏感等级色（HAE fixed level，与前端行染色同源）
+              const lvOrder = ['info', 'low', 'medium', 'high']
+              const maxLv = (r.sensitive || []).reduce((m, s) => (lvOrder.indexOf(s.level ?? 'info') > lvOrder.indexOf(m) ? (s.level ?? 'info') : m), 'info')
+              this.graph.writeAnalysis({ host, path: path || '/', method: dm ? dm[1] : 'GET', level: r.level, vuln: r.vuln, advice: (r.advice || '').slice(0, 200), sens: sensTxt, sensCount: (r.sensitive || []).length, color: HAE_LEVEL_COLOR[maxLv] }).catch(() => {})
+            }
             // 全局情报 digest（结构化分层）：
             // 1) 漏洞/分析结论 → 滚动流水（20 条窗口）
             if (r.vuln || r.advice) {
               this.pushDigest({ kind: 'vuln', host, path, data: `${r.vuln ? `漏洞(${r.level})` : '分析'}:${(r.advice || '').slice(0, 80)}`, persist: false })
             }
-            // 2) 敏感凭据 → 持久情报（全生命周期保留，子 Agent 共享杠杆）+ 自动凭据利用意见卡
-            const credTypes = ['api key', 'bearer', 'token', 'password', 'secret', 'session cookie', 'private key', 'cloud access key', 'authorization', 'session']
+            // 2) 敏感凭据 → 持久情报（全生命周期保留，子 Agent 共享杠杆）+ 自动凭据利用意见卡（HAE_CRED_TAGS 判定凭据类标签）
             for (const s of r.sensitive || []) {
-              const t = String(s.type || '').toLowerCase()
-              const isCred = credTypes.some((c) => t.includes(c))
+              const t = String(s.type || '').trim()
+              const isCred = HAE_CRED_TAGS.has(t)
               const credHost = host || '未知'
+              const tagMeta = HAE_TAGS[t]
               if (isCred) {
-                this.pushDigest({ kind: 'cred', host: credHost, path, data: `${s.type}:${String(s.value).slice(0, 200)}`, persist: true })
+                this.pushDigest({ kind: 'cred', host: credHost, path, data: `${t}:${String(s.value).slice(0, 200)}`, persist: true, tag: t, group: tagMeta?.group, level: (s.level as DigestEntry['level']) || tagMeta?.level || 'high', color: tagMeta?.color })
                 // 凭据自动意见：攻击凭据是最高价值杠杆 → 自动推"凭据利用"意见卡（不打断分析）
                 if (u) {
                   const credKey = `${this.normalizeTargetKey(u)}|凭据利用`
                   if (!this.advisedKeys.has(credKey) && !this.penetratedKeys.has(credKey) && !this.penetratingKeys.has(credKey)) {
-                    this.pushSse({ type: 'analyze-advice', id, advice: `经 Hermes 分析 ${path || u} 可进行 凭据利用 渗透，是否进行`, level: r.level || 'high', slot: r.slot })
+                    this.pushSse({ type: 'analyze-advice', id, advice: `经 Hermes 分析 ${path || u} 可进行 凭据利用 渗透，是否进行`, level: s.level || 'high', slot: r.slot })
                     this.advisedKeys.add(credKey)
                     this.pendingAdviceSlots.add(r.slot)
                   }
                 }
               }
             }
-            // 3) 非凭据敏感信息（手机号/身份证/nday 线索等）→ 滚动流水
+            // 3) 非凭据标签（指纹/基础信息/潜在漏洞/其他）→ 滚动流水（带 HaENet 标签与等级）
             for (const s of r.sensitive || []) {
-              const t = String(s.type || '').toLowerCase()
-              if (!credTypes.some((c) => t.includes(c))) {
-                this.pushDigest({ kind: t.includes('nday') ? 'nday' : 'note', host, path, data: `${s.type}:${String(s.value).slice(0, 60)}`, persist: false })
+              const t = String(s.type || '').trim()
+              if (!HAE_CRED_TAGS.has(t)) {
+                const lv = s.level || 'info'
+                const tagMeta = HAE_TAGS[t]
+                const data = `${t}(${lv}${tagMeta ? '/' + tagMeta.cn : ''}):${String(s.value).slice(0, 60)}`
+                this.pushDigest({ kind: t.includes('Nday') || t.includes('nday') ? 'nday' : 'note', host, path, data, persist: false, tag: t, group: tagMeta?.group, level: (lv as DigestEntry['level']) || tagMeta?.level || 'info', color: tagMeta?.color })
               }
             }
             // 渗透意见 → SSE 推送（前端 Hermes Agent 聊天框渲染意见卡：进行/取消/回复；slot 绑定提出意见的子 Agent，进行渗透由该子 Agent 执行）
@@ -782,6 +1029,23 @@ export class ApiServer {
     } catch { this.vulns = [] }
   }
 
+  /** 下游代理持久化文件（~/.pentbox/downstream.json）：启动恢复，运行时 PUT 更新 */
+  private dsFile = ''
+  private loadDownstream(): void {
+    try {
+      const { homedir } = require('node:os') as typeof import('node:os')
+      const { join } = require('node:path') as typeof import('node:path')
+      const { existsSync, readFileSync } = require('node:fs') as typeof import('node:fs')
+      this.dsFile = join(homedir(), '.pentbox', 'downstream.json')
+      if (existsSync(this.dsFile)) {
+        const d = JSON.parse(readFileSync(this.dsFile, 'utf8')) as { host?: string; port?: number; protocol?: 'http' | 'socks5' }
+        if (d?.host && d.port && Number(d.port) > 0) {
+          this.engine.setDownstream({ host: String(d.host).trim(), port: Number(d.port), protocol: d.protocol === 'socks5' ? 'socks5' : 'http' })
+        }
+      }
+    } catch { /* 无下游配置或读取失败 → 直连 */ }
+  }
+
   private saveVulns(): void {
     try {
       const { writeFileSync, mkdirSync } = require('node:fs') as typeof import('node:fs')
@@ -789,6 +1053,17 @@ export class ApiServer {
       mkdirSync(dirname(this.vulnFile), { recursive: true })
       writeFileSync(this.vulnFile, JSON.stringify(this.vulns, null, 2))
     } catch { /* 落盘失败不阻断 */ }
+  }
+
+  /** 从漏洞 uri 拆分出图用的 host / path（无 uri 或格式非法返回空串，不上图） */
+  private splitVulnUri(uri: string): { host: string; path: string } {
+    if (!uri) return { host: '', path: '' }
+    const m = uri.match(/^(https?:\/\/[^/?#]+)([/?#].*)?$/i)
+    if (!m) return { host: '', path: '' }
+    const host = m[1] || ''
+    const rawPath = m[2] || '/'
+    const path = rawPath.split('?')[0] || '/'
+    return { host, path }
   }
 
   /** 哥斯拉 PhpDynamicPayload 服务端代码（从 assets/payloads/php/payload.php 内嵌，握手时发送） */
@@ -1183,6 +1458,29 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
     }
     try {
       switch (url.pathname) {
+        case '/api/graph/query': {
+          // Agent 主动查图：默认返回图情报文本（与注入格式一致）；?format=json 返回结构化对象；?host= 只看该主机
+          const fmt = url.searchParams.get('format') === 'json' ? 'json' : 'text'
+          if (fmt === 'json') {
+            const data = await this.graph.queryGraph(url.searchParams.get('host') || undefined)
+            this.json(res, 200, { ok: true, hosts: data })
+          } else {
+            const txt = await this.graph.contextPrompt(url.searchParams.get('host') || undefined)
+            this.json(res, 200, { ok: true, text: txt || '（Neo4j 图暂无数据）' })
+          }
+          break
+        }
+        case '/api/graph/note': {
+          // Agent 主动记录情报到图（给其他 Agent 共享；非破坏性）
+          const b = JSON.parse(await this.readBody(req)) as { host?: string; path?: string; text: string; level?: string; tag?: string }
+          if (!b.text) throw new Error('text 缺失')
+          const host = b.host || ''
+          const path = b.path || ''
+          this.graph.writeNote({ kind: 'note', text: String(b.text).slice(0, 400), host, path, persist: true, level: b.level || 'info', tag: b.tag || '' }).catch(() => {})
+          this.broadcastGraphChange(`Agent 记录 [${b.tag || 'note'}](${b.level || 'info'}) ${host}${path}: ${String(b.text).slice(0, 60)}`)
+          this.json(res, 200, { ok: true })
+          break
+        }
         case '/api/status': {
           const u = this.engine.getUpstream()
           // 局域网地址列表（供远程 Hermes 访问本工作台；虚拟网卡可能在前，需按网段匹配）
@@ -1262,8 +1560,11 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             const send = (obj: unknown) => { if (!closed) { try { res.write(`data: ${JSON.stringify(obj)}\n\n`) } catch { /* 客户端已断开 */ } } }
             const stop = (abort: () => void) => { req.on('close', () => { closed = true; try { abort() } catch { /* 已结束 */ } }) }
             try {
+              // 主 Agent 聊天框：注入 Neo4j 图上下文（全局情报/漏洞/凭据/WebShell/渗透状态），与流量分析/渗透通道一致
+              const gctx = await this.digestPrompt()
+              const input = `${gctx ? gctx : ''}${this.toolsHint()}【用户消息】${body.message}`
               // chatViaGateway 的 onEvent 已推送 done/error，这里只需等它完成并结束响应
-              await this.chatViaGateway(body.message, this.chatSessionId, (ev) => send(ev), stop)
+              await this.chatViaGateway(input, this.chatSessionId, (ev) => send(ev), stop)
               // 主 Agent 回流：用户消息中含目标 URL/明确指示 → 写入全局情报（子 Agent 共享，最高优先级）
               const msgUrl = (body.message || '').match(/https?:\/\/[^\s"'）)\]]+/)?.[0]
               const msgKey = (body.message || '').match(/(?:目标|target|渗透|测试)[:：]?\s*([a-zA-Z0-9.\-:]+)/)?.[1]
@@ -1279,7 +1580,7 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             res.end()
             break
           }
-          const reply = await this.hermesChat(body.message)
+          const reply = await this.hermesChat(body.message, await this.digestPrompt(), this.toolsHint())
           this.json(res, 200, { reply, sessionId: this.analyzeSlots[0] })
           break
         }
@@ -1322,7 +1623,10 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             if (!this.deps.firefox) throw new Error('firefox not wired')
             await this.deps.firefox.launch(lopts)
           }
-          this.json(res, 200, { ok: true, engine })
+          // 类 Burp：不忽略证书错误，HTTPS 抓包要求浏览器信任 pentbox CA（未安装则提示，安装后浏览器重试即可）
+          const { isCaTrusted } = await import('../core/mitm.ts')
+          const caTrusted = isCaTrusted()
+          this.json(res, 200, { ok: true, engine, warning: caTrusted ? undefined : 'pentbox CA 未安装到系统证书库：HTTPS 站点将提示证书错误。请到 设置→网络配置→一键安装 CA，然后重试访问。' })
           break
         }
         case '/api/browser/navigate': {
@@ -1532,6 +1836,9 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             const v: Vuln = { id: ++this.vulnSeq, name: b.name ?? '未命名漏洞', level: (['high', 'medium', 'low', 'info'].includes(b.level as string) ? b.level : 'info') as Vuln['level'], cvss: b.cvss ?? '', uri: b.uri ?? '', desc: b.desc ?? '', exploit: b.exploit ?? '', status: (b.status === 'confirmed' || b.status === 'false') ? b.status : 'pending', reqRaw: b.reqRaw ?? '', resRaw: b.resRaw ?? '', ts: Date.now() }
             this.vulns.push(v)
             this.saveVulns()
+            // 漏洞入图（Agent 共享）
+            const { host, path } = this.splitVulnUri(v.uri)
+            if (host && path) { this.graph.writeVuln({ name: v.name, level: v.level, desc: v.desc, host, path, exploit: v.exploit, color: HAE_LEVEL_COLOR[v.level] }); this.broadcastGraphChange(`新漏洞(${v.level}) ${host}${path}: ${v.name}`) }
             this.json(res, 200, { ok: true, id: v.id })
           } else { this.json(res, 405, { error: 'method not allowed' }) }
           break
@@ -1553,10 +1860,19 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             if (b.reqRaw !== undefined) v.reqRaw = b.reqRaw
             if (b.resRaw !== undefined) v.resRaw = b.resRaw
             this.saveVulns()
+            // 漏洞更新同步入图
+            const { host, path } = this.splitVulnUri(v.uri)
+            if (host && path) { this.graph.writeVuln({ name: v.name, level: v.level, desc: v.desc, host, path, exploit: v.exploit, color: HAE_LEVEL_COLOR[v.level] }); this.broadcastGraphChange(`漏洞更新(${v.level}) ${host}${path}: ${v.name}`) }
             this.json(res, 200, { ok: true })
           } else if (req.method === 'DELETE') {
+            const vd = this.vulns.find((x) => x.id === id)
             this.vulns = this.vulns.filter((x) => x.id !== id)
             this.saveVulns()
+            // 漏洞从图移除
+            if (vd) {
+              const { host, path } = this.splitVulnUri(vd.uri)
+              if (host && path) this.graph.removeVuln(host, path, vd.name)
+            }
             this.json(res, 200, { ok: true })
           } else { this.json(res, 405, { error: 'method not allowed' }) }
           break
@@ -1571,6 +1887,9 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             const w = { id: ++this.wsSeq, type: b.type || 'custom', script: b.script || 'php', url: b.url, password: b.password || '', key: b.key || '', status: 'unknown', ts: Date.now(), cryption: b.cryption || '', payload: b.payload || '', encoding: b.encoding || 'UTF-8', headers: b.headers || '', reqLeft: b.reqLeft || '', reqRight: b.reqRight || '', connTimeout: b.connTimeout || 3000, readTimeout: b.readTimeout || 60000, remark: b.remark || '' }
             this.webshells.push(w)
             this.saveWebshells()
+            // WebShell 入图（Agent 共享连接方式）
+            this.graph.writeWebShell(w)
+            this.broadcastGraphChange(`新 WebShell(${w.type}/${w.script}) ${w.url}`)
             this.json(res, 200, { ok: true, id: w.id })
           } else { this.json(res, 405, { error: 'method not allowed' }) }
           break
@@ -1598,10 +1917,16 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             if (b.reqRight !== undefined) w.reqRight = b.reqRight
             if (b.timeout !== undefined) w.timeout = b.timeout
             this.saveWebshells()
+            // 更新同步入图
+            this.graph.writeWebShell(w)
+            this.broadcastGraphChange(`WebShell 更新(${w.type}/${w.script}) ${w.url}`)
             this.json(res, 200, { ok: true })
           } else if (req.method === 'DELETE') {
+            const wd = this.webshells.find((x) => x.id === id)
             this.webshells = this.webshells.filter((x) => x.id !== id)
             this.saveWebshells()
+            // 从图移除
+            if (wd) this.graph.deleteWebShell(wd.url)
             this.json(res, 200, { ok: true })
           } else { this.json(res, 405, { error: 'method not allowed' }) }
           break
@@ -1929,7 +2254,7 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
         }
         // ---------------- 渗透执行（对应子 Agent 执行：resume 提出意见的子 Agent 槽位会话；有成果→解析【VULNDOC】写漏洞库 + SSE 推送主 Agent 汇报） ----------------
         case '/api/penetrate': {
-          const body = JSON.parse(await this.readBody(req)) as { advice?: string; slot?: number; reqRaw?: string; resRaw?: string }
+          const body = JSON.parse(await this.readBody(req)) as { advice?: string; slot?: number; reqRaw?: string; resRaw?: string; id?: number }
           if (!body.advice) throw new Error('advice 缺失')
           const slot = typeof body.slot === 'number' && body.slot >= 0 && body.slot < ApiServer.MAX_PARALLEL ? body.slot : 0
           // 渗透前查重：从原始请求包提取目标（Host+路径）+ advice 提取渗透方式；同 API 同方式已渗透过/正在渗透 → 不重复执行
@@ -1995,6 +2320,14 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             const v: Vuln = { id: ++this.vulnSeq, name: rawName || '子 Agent 渗透发现', level, cvss: '', uri, desc: `${g('漏洞描述')}\n\n修复建议：${g('修复建议')}`.slice(0, 2000), exploit: g('复现步骤'), status: 'pending', reqRaw: cleanRaw((docBody.match(/原始请求包[:：]\s*([\s\S]*?)(?=\n原始响应包[:：]|$)/) || [])[1]?.trim() || body.reqRaw || '').slice(0, 4000), resRaw: cleanRaw((docBody.match(/原始响应包[:：]\s*([\s\S]*?)$/) || [])[1]?.trim() || body.resRaw || '').slice(0, 4000), ts: Date.now() }
             this.vulns.push(v)
             this.saveVulns()
+            // VULNDOC 成果入图（Agent 共享，host/path 从完整 uri 拆分）
+            const { host: vh, path: vp } = this.splitVulnUri(uri)
+            if (vh && vp) { this.graph.writeVuln({ name: v.name, level, desc: v.desc, host: vh, path: vp, exploit: v.exploit, color: HAE_LEVEL_COLOR[level] }); this.graph.confirmAnalysis(vh, vp, level).catch(() => {}); this.broadcastGraphChange(`渗透确认漏洞(${level}) ${vh}${vp}: ${v.name}`) }
+            // 渗透确认 → 对应流量条目标记 confirmed（前端轮询：疑似问号 → 确认 BUG ICON + 确认等级）
+            if (typeof body.id === 'number') {
+              const ast = this.analyzeMap.get(body.id)
+              if (ast) { ast.confirmed = true; ast.confLevel = level }
+            }
             // 渗透成果写入全局情报（子 Agent 共享：后续分析/渗透前可见，避免同 API 同方式重复渗透）
             if (uri) {
               const pm = (body.advice || '').match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
@@ -2013,8 +2346,10 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
               this.removeDigest('penetrating', resHost, resPath)
             }
             this.pushSse({ type: 'vuln-doc', vuln: { id: v.id, name: v.name, level: v.level, desc: v.desc, exploit: v.exploit, ts: v.ts } })
-            // 静默注入主 Agent 会话（仅记录到上下文，主 Agent 记住所有 vuln；不回复不执行）
-            this.runHermes(`（记忆记录，无需回复与执行任何操作）已知漏洞档案：漏洞 ${v.id}：${v.name}（${level}）\n描述：${g('漏洞描述').slice(0, 300)}\n复现：${g('复现步骤').slice(0, 300)}`, this.chatSessionId, (sid) => { this.chatSessionId = sid }).catch(() => { /* 记忆注入失败不影响主流程 */ })
+            // 静默注入主 Agent 会话（走 Bridge 通道，与主会话同一命名空间才算真正注入；mainChat=false 不回写指针；仅当主会话已存在时注入）
+            if (this.chatSessionId) {
+              this.bridgeAsk(`（记忆记录，无需回复与执行任何操作）已知漏洞档案：漏洞 ${v.id}：${v.name}（${level}）\n描述：${g('漏洞描述').slice(0, 300)}\n复现：${g('复现步骤').slice(0, 300)}`, this.chatSessionId, {}, false).catch(() => { /* 记忆注入失败不影响主流程 */ })
+            }
           }
           this.pushSse({ type: 'penetrate-done', slot, reply, vulnDoc: !!docBody })  // 异步完成通知（前端更新任务/沟通窗口）
           }
@@ -2175,6 +2510,21 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             if (!body?.type) throw new Error('missing type')
             this.engine.setUpstream(body)
             this.json(res, 200, { ok: true, upstream: body })
+            break
+          }
+          // ---------------- 下游代理（类 Burp 方案：内置代理抓包/分析后转发给下游；独立于上游链） ----------------
+          if (url.pathname === '/api/downstream') {
+            if (req.method === 'PUT') {
+              const body = JSON.parse(await this.readBody(req)) as { host?: string; port?: number; protocol?: 'http' | 'socks5' }
+              const ds = body && body.host && body.port && Number(body.port) > 0
+                ? { host: String(body.host).trim(), port: Number(body.port), protocol: body.protocol === 'socks5' ? ('socks5' as const) : ('http' as const) }
+                : null
+              this.engine.setDownstream(ds)
+              try { writeFileSync(this.dsFile, JSON.stringify(ds ? { host: ds.host, port: ds.port, protocol: ds.protocol } : {})) } catch { /* 落盘失败不影响运行 */ }
+              this.json(res, 200, { ok: true, downstream: ds })
+            } else {
+              this.json(res, 200, { downstream: this.engine.getDownstream() })
+            }
             break
           }
           if (url.pathname === '/api/proxy/stop' && req.method === 'POST') {
