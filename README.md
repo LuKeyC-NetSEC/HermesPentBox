@@ -1,51 +1,51 @@
 # HermesPentBox
 
-> **AI 驱动的本地渗透测试工作台** · AI-Powered Local Pentest Workbench
+> **AI-Powered Local Pentest Workbench** · 中文文档见 [README_cn.md](README_cn.md)
 
-[完整功能文档](README_cn.md) · 仅限**授权测试**使用（SRC / 众测 / 自建靶场）。
+For **authorized** testing only (SRC / bug bounty / self-hosted labs). You are responsible for having legal authorization for every target.
 
-一体化桌面工作台：内置 MITM 代理抓包 → 子 Agent 蜂群自动分析 → 意见卡 → 单点渗透验证，全程本地运行，与 Hermes Agent 通过自研 Bridge 零配置协作。
+An all-in-one desktop workbench: built-in MITM proxy captures traffic → a swarm of sub-agents analyzes it → advice cards → one-click single-endpoint penetration verification. Runs fully local, integrating with the Hermes agent through a self-built Bridge with zero configuration.
 
 ---
 
 ## Features
 
-| 领域 | 能力 |
+| Area | Capability |
 |---|---|
-| **流量与分析** | HTTP/HTTPS MITM 抓包（8899）、WebSocket 帧捕获、站点地图（Neo4j 同步） |
-| **Agent 蜂群** | 10 个并行子 Agent 自动审计流量：漏洞判定 / 敏感信息提取（HaENet 标签）/ Nday 线索 |
-| **渗透执行** | 意见卡一键「进行渗透」，严格单 API 作用域；成果自动生成 VULNDOC 写入漏洞库 |
-| **情报共享** | Neo4j 会话图（Host/Api/Vuln/Cred/Shell）跨 Agent 共享，同目标去重防重复渗透 |
-| **WebShell 管理** | 全类型生成/连接/虚拟终端/文件管理/Suo5 正向代理（Godzilla·Behinder·AntSword·Custom） |
-| **代理链** | 上游代理 + 类 Burp 下游代理（HTTP/SOCKS5，IP/端口自定义，重启保留） |
-| **浏览器控制** | Chrome CDP / Firefox 一键接管，流量自动汇入面板；类 Burp CA 证书信任方案 |
-| **Repeater / 终端 / SSH** | HTTP/HTTPS/WS 多标签重发器、xterm 虚拟终端、SSH 会话 |
+| **Traffic & Analysis** | HTTP/HTTPS MITM capture (8899), WebSocket frame capture, site map synced to Neo4j |
+| **Agent Swarm** | 10 parallel sub-agents auto-audit traffic: vuln detection / sensitive-info extraction (HaENet tags) / Nday hints |
+| **Penetration** | Advice card one-click "进行渗透", strictly single-API scope; results auto-written as VULNDOC into the vuln library |
+| **Shared Intelligence** | Neo4j session graph (Host/Api/Vuln/Cred/Shell) shared across agents, same-target dedup prevents repeated attacks |
+| **WebShell Manager** | Full-type generate/connect/virtual terminal/file manager/Suo5 forward proxy (Godzilla·Behinder·AntSword·Custom) |
+| **Proxy Chain** | Upstream proxy + Burp-style downstream proxy (HTTP/SOCKS5, custom IP/port, persists across restarts) |
+| **Browser Control** | One-click Chrome CDP / Firefox takeover, traffic auto-merged into panel; Burp-style CA trust flow |
+| **Repeater / Terminal / SSH** | HTTP/HTTPS/WS multi-tab repeater, xterm virtual terminal, SSH sessions |
 
 ## Quick Start
 
 ```bash
 npm install
-npm start          # build + launch（首次自动启动代理/Bridge/CA 生成）
+npm start          # build + launch (first run auto-starts proxy/Bridge/CA generation)
 ```
 
-- 主 API：`8877` · 代理：`8899` · Terminal WS：`8878` · Agent Bridge：`28766`
-- 前置：Node.js 24 + Hermes CLI（已配置模型）
+- Main API: `8877` · Proxy: `8899` · Terminal WS: `8878` · Agent Bridge: `28766`
+- Requirements: Node.js 24 + Hermes CLI (with a configured model)
 
 ## Architecture
 
 ```
-Browser (Chrome/Firefox) ──► MITM Proxy (8899) ──► 流量面板 / 站点地图(Neo4j)
-                                   │ 分析队列（10 子 Agent，负载均衡）
+Browser (Chrome/Firefox) ──► MITM Proxy (8899) ──► Traffic panel / Site map (Neo4j)
+                                   │ analysis queue (10 sub-agents, load-balanced)
                                    ▼
-                          意见卡(SSE) ──「进行渗透」──► Agent Bridge (28766)
-                                   │                        │
-                                   ▼                        ▼
-                          漏洞库 (VULNDOC)              Hermes AIAgent
+                          Advice card (SSE) ──「进行渗透」──► Agent Bridge (28766)
+                                   │                              │
+                                   ▼                              ▼
+                          Vulnerability library (VULNDOC)    Hermes AIAgent
 ```
 
 ## Stack
 
-Electron · Node.js · Neo4j · esbuild · xterm.js · hermes-agent (AIAgent) · Godzilla/Behinder 协议库
+Electron · Node.js · Neo4j · esbuild · xterm.js · hermes-agent (AIAgent) · Godzilla/Behinder protocol libs
 
 ## License
 
