@@ -41,9 +41,9 @@ export class SshSession {
       this.client.exec(command, (err, stream) => {
         if (err) return reject(err)
         let stdout = '', stderr = ''
-        stream.on('close', (code) => resolve({ code, stdout, stderr }))
-        stream.on('data', (d) => (stdout += d.toString()))
-        stream.stderr.on('data', (d) => (stderr += d.toString()))
+        stream.on('close', (code: number | null) => resolve({ code, stdout, stderr }))
+        stream.on('data', (d: Buffer) => (stdout += d.toString()))
+        stream.stderr.on('data', (d: Buffer) => (stderr += d.toString()))
         if (opts.timeout) setTimeout(() => stream.close(), opts.timeout)
       })
     })

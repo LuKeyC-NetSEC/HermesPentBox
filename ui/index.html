@@ -99,6 +99,10 @@
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
     Launch Browser
   </button>
+  <button id="btnProjectMgr" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:3px 14px;font-size:12px;border-radius:4px;display:flex;align-items:center;gap:6px">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+    项目管理
+  </button>
 </header>
 <div style="flex:1;display:flex;flex-direction:row;min-height:0">
 <nav>
@@ -537,7 +541,7 @@
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
           <span style="width:58px;font-size:12px;color:#8b98a8;text-align:right;flex-shrink:0">类型</span>
           <select id="wsType" style="flex:1;background:#1c222c;border:1px solid #262c36;color:#d8e0ea;font-size:12px;padding:5px 8px">
-            <option value="godzilla">哥斯拉 Godzilla</option><option value="behinder">冰蝎 Behinder</option><option value="antsword">蚁剑 AntSword</option><option value="custom">自定义</option>
+            <option value="godzilla">哥斯拉 Godzilla</option><option value="behinder">冰蝎 Behinder</option><option value="antsword">蚁剑 AntSword</option>
           </select>
         </div>
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
@@ -636,7 +640,7 @@
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
           <span style="width:58px;font-size:12px;color:#8b98a8;text-align:right;flex-shrink:0">类型</span>
           <select id="wsGenType" style="flex:1;background:#1c222c;border:1px solid #262c36;color:#d8e0ea;font-size:12px;padding:5px 8px">
-            <option value="godzilla">哥斯拉 Godzilla</option><option value="behinder">冰蝎 Behinder</option><option value="antsword">蚁剑 AntSword</option><option value="custom">自定义</option>
+            <option value="godzilla">哥斯拉 Godzilla</option><option value="behinder">冰蝎 Behinder</option><option value="antsword">蚁剑 AntSword</option>
           </select>
         </div>
         <div id="wsGenPayloadRow" style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
@@ -666,8 +670,15 @@
           <span style="width:58px;font-size:12px;color:#8b98a8;text-align:right;flex-shrink:0">密钥</span>
           <input id="wsGenKey" placeholder="3c6e0b8a9c15224a" value="3c6e0b8a9c15224a" style="flex:1;background:#1c222c;border:1px solid #262c36;color:#d8e0ea;font-size:12px;padding:5px 8px">
         </div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span style="width:58px;font-size:12px;color:#8b98a8;text-align:right;flex-shrink:0">免杀</span>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#d8e0ea;cursor:pointer">
+            <input id="wsGenEvasion" type="checkbox" checked style="accent-color:#4fc3f7">
+            Agent 免杀
+          </label>
+        </div>
         <div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:8px">
-          <button id="btnWsGenRun" style="background:#3a2d1e;border:1px solid #2c3542;color:#f7a35c;cursor:pointer;padding:5px 20px;font-size:12px">生成</button>
+          <button id="btnWsGenRun" style="background:#3a2d1e;border:1px solid #2c3542;color:#f7a35c;cursor:pointer;padding:5px 20px;font-size:12px;min-width:96px;display:inline-flex;align-items:center;justify-content:center;gap:6px">生成</button>
         </div>
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
           <span style="width:58px;font-size:12px;color:#8b98a8;text-align:right;flex-shrink:0">Shell</span>
@@ -689,6 +700,31 @@
     </div>
   </div>
   <!-- 全局自定义提示弹窗（替代 window.alert：非阻塞，避免 alert 阻塞渲染进程导致页面假死） -->
+  <!-- 项目管理弹窗（类 Burp 项目文件：新建/打开/保存，切换前自动保存当前项目） -->
+  <div id="projModal" style="display:none;position:fixed;inset:0;z-index:98;background:rgba(0,0,0,.6);align-items:center;justify-content:center">
+    <div style="width:660px;max-width:94vw;max-height:90vh;background:#14181e;border:1px solid #2c3542;display:flex;flex-direction:column;box-shadow:0 8px 24px rgba(0,0,0,.6)">
+      <div style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #262c36">
+        <span style="font-size:13px;color:#4fc3f7;flex:1">项目管理</span>
+        <button id="btnProjClose" style="background:none;border:none;color:#8b98a8;cursor:pointer;font-size:14px">✕</button>
+      </div>
+      <div style="flex:1;overflow:auto;padding:10px 14px;display:flex;flex-direction:column;gap:10px;min-height:0">
+        <div style="background:#171b22;border:1px solid #262c36;border-radius:6px;padding:10px">
+          <div style="font-size:12px;color:#4fc3f7;margin-bottom:6px">当前项目</div>
+          <div id="projCurrent" style="font-size:12px;color:#d8e0ea;word-break:break-all;line-height:1.6;white-space:pre-wrap"></div>
+        </div>
+        <div style="background:#171b22;border:1px solid #262c36;border-radius:6px;padding:10px;flex:1;min-height:0;display:flex;flex-direction:column">
+          <div style="font-size:12px;color:#4fc3f7;margin-bottom:6px">项目列表（点击选中）</div>
+          <div id="projList" style="flex:1;overflow:auto;min-height:140px;border:1px solid #262c36;background:#111418"></div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;padding:10px 14px;border-top:1px solid #262c36">
+        <button id="btnProjSaveAs" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:5px 16px;font-size:12px;border-radius:4px">另存为</button>
+        <button id="btnProjSave" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:5px 16px;font-size:12px;border-radius:4px">保存项目</button>
+        <button id="btnProjOpen" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:5px 16px;font-size:12px;border-radius:4px">打开选中</button>
+        <button id="btnProjNew" style="background:#3a2d1e;border:1px solid #2c3542;color:#f7a35c;cursor:pointer;padding:5px 16px;font-size:12px;border-radius:4px">新建项目</button>
+      </div>
+    </div>
+  </div>
   <!-- 全局 toast 提示（底部居中，自动消失） -->
   <div id="globalToast" style="display:none;position:fixed;bottom:26px;left:50%;transform:translateX(-50%);background:#1e3a5f;color:#d8e0ea;padding:8px 20px;border-radius:4px;font-size:13px;z-index:200;border:1px solid #2c3542;box-shadow:0 4px 12px rgba(0,0,0,.4)"></div>
   <div id="globalModal" style="display:none;position:fixed;inset:0;z-index:150;background:rgba(0,0,0,.5);align-items:center;justify-content:center">

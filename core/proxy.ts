@@ -29,6 +29,8 @@ export interface FlowMeta {
   bytes: number
   upstream: string
   error?: string
+  /** 拦截来源类型（拦截丢弃记录用） */
+  kind?: 'http' | 'connect' | 'mitm'
   /** 应用自身流量（WebShell/Repeater 经内部转发）：仍记录流量，但跳过 Agent 审计 */
   self?: boolean
   /** MITM 全量报文（请求/响应头+体）——不随列表/SSE 传输，走 /api/flows/:id/detail */
@@ -72,7 +74,7 @@ export class ProxyEngine {
 
   async start(port: number, host = '127.0.0.1'): Promise<void> {
     this.server = createServer((req, res) => this.handleHttp(req, res))
-    this.server.on('connect', (req, client, head) => this.handleConnect(req, client, head))
+    this.server.on('connect', (req, client: Socket, head: Buffer) => this.handleConnect(req, client, head))
     this.server.on('error', (e) => console.error('[proxy] server error:', e))
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
@@ -133,6 +135,11 @@ export class ProxyEngine {
 
   private emit(f: Omit<FlowMeta, 'id'>): void {
     this.onFlow?.({ id: ++this.seq, ...f })
+  }
+
+  /** 会话恢复：从持久化记录恢复流量序号（新流量 id 与历史连续，避免重启后 id 回绕/重复） */
+  restoreSeq(n: number): void {
+    if (Number.isInteger(n) && n > 0) this.seq = n
   }
 
   /** 应用内部转发（WebShell / Repeater）：直连目标（走上游链），流量正常记录但标记 self（跳过 Agent 审计）；不产生任何特征头 */
@@ -287,16 +294,16 @@ export class ProxyEngine {
     req.pipe(up)
   }
 
-  private upstreamAgent(): SocksProxyAgent | HttpProxyAgent | undefined {
+  private upstreamAgent(): SocksProxyAgent | HttpProxyAgent<string> | undefined {
     const u = this.upstream
     if (u.type === 'direct') return undefined
     if (u.type === 'socks4' || u.type === 'socks5' || u.type === 'socks5h') {
       return new SocksProxyAgent({
         hostname: u.host, port: u.port, username: u.username, password: u.password,
         type: u.type === 'socks4' ? 4 : 5,
-      })
+      } as any)  // 第三方类型定义过严（port/type 期望 string），运行时正确
     }
-    return new HttpProxyAgent({ hostname: u.host, port: u.port, protocol: u.type, username: u.username, password: u.password })
+    return new HttpProxyAgent<string>({ hostname: u.host, port: u.port, protocol: u.type, username: u.username, password: u.password } as any)
   }
 
   // ---------------- CONNECT（HTTPS / 任意 TCP 隧道） ----------------

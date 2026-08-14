@@ -2,14 +2,17 @@
  * Neo4j Agent 情报图：完全替代原"全局情报 digest"文本摘要。
  * 结构化存储会话/目标/接口/漏洞/凭据/渗透状态，供主 Agent 与子 Agent 跨会话共享上下文。
  *
+ * 项目隔离：所有节点带 project 属性（唯一键含 project），图数据按项目管理——
+ * 切换项目时 setProject 切换数据域，不同项目的情报互不可见（类 Burp 项目文件语义）。
+ *
  * Schema:
- *   (:Host {url})
- *   (:Api {host, path, method})
- *   (:Vuln {name, level, desc, host, path, exploit})
- *   (:Cred {type, value, host, path, source})
- *   (:WebShell {id, type, script, url, password, key, cryption, payload, encoding, remark, ts})
- *   (:Note {kind, text, host, path, agent, persist, ts})
- *   (:Penetration {host, path, method, status, slot, ts})
+ *   (:Host {url, project})
+ *   (:Api {host, path, project})
+ *   (:Vuln {name, level, desc, host, path, project})
+ *   (:Cred {type, value, host, path, project})
+ *   (:WebShell {id, type, script, url, password, key, cryption, payload, encoding, remark, ts, project})
+ *   (:Note {kind, text, host, path, agent, persist, ts, project})
+ *   (:Penetration {host, path, method, status, slot, ts, project})
  * 关系:
  *   (Host)-[:HAS_API]->(Api)
  *   (Api)-[:HAS_VULN]->(Vuln)
@@ -29,6 +32,8 @@ export interface AnalysisData { host: string; path: string; method: string; leve
 export class Neo4jGraph {
   private driver: ReturnType<typeof neo4j.driver> | null = null
   private enabledFlag = false
+  /** 当前项目域（图数据隔离维度）：切换项目时由 ApiServer 调用 setProject 切换 */
+  private project = 'default'
 
   constructor(
     private url = 'bolt://localhost:7687',
@@ -37,6 +42,12 @@ export class Neo4jGraph {
   ) {}
 
   get enabled(): boolean { return this.enabledFlag && !!this.driver }
+  /** 当前项目域 key */
+  get projectKey(): string { return this.project }
+  /** 切换项目域（图数据隔离；调用后所有读写按新项目过滤） */
+  setProject(p: string): void {
+    this.project = (p && p.trim()) || 'default'
+  }
 
   connect(): void {
     try {
@@ -49,6 +60,14 @@ export class Neo4jGraph {
     if (this.driver) { try { await this.driver.close() } catch { /* */ } }
     this.driver = null
     this.enabledFlag = false
+  }
+
+  /** 旧数据迁移：升级前写入的节点无 project 属性，统一归入 default 项目（与默认项目 key 一致） */
+  async migrateLegacyNodes(): Promise<void> {
+    if (!this.enabled) return
+    for (const label of ['Host', 'Api', 'Vuln', 'Cred', 'WebShell', 'Note', 'Penetration', 'Analysis']) {
+      await this.run(`MATCH (n:${label}) WHERE n.project IS NULL SET n.project='default'`)
+    }
   }
 
   private async run(query: string, params?: Record<string, unknown>): Promise<void> {
@@ -65,13 +84,13 @@ export class Neo4jGraph {
 
   // ---------------- 写入 ----------------
 
-  /** 目标/接口（Api 唯一键 = host+path：站点地图/漏洞/凭据/分析全挂同一节点，method 仅作属性更新） */
+  /** 目标/接口（Api 唯一键 = host+path+project：站点地图/漏洞/凭据/分析全挂同一节点，method 仅作属性更新） */
   async upsertHostApi(host: string, path: string, method = 'GET'): Promise<void> {
     await this.run(
-      `MERGE (h:Host {url:$host})
-       MERGE (h)-[:HAS_API]->(a:Api {host:$host, path:$path})
+      `MERGE (h:Host {url:$host, project:$project})
+       MERGE (h)-[:HAS_API]->(a:Api {host:$host, path:$path, project:$project})
        SET a.method=$method, a.lastSeen=timestamp()`,
-      { host, path, method },
+      { host, path, method, project: this.project },
     )
   }
 
@@ -79,121 +98,121 @@ export class Neo4jGraph {
    * Api.color = 该条目最高敏感等级色（HAE）；Analysis.vuln=true 未渗透确认 = 疑似漏洞（前端问号 ICON 语义） */
   async writeAnalysis(a: AnalysisData): Promise<void> {
     await this.run(
-      `MERGE (h:Host {url:$host})
-       MERGE (h)-[:HAS_API]->(a:Api {host:$host, path:$path})
+      `MERGE (h:Host {url:$host, project:$project})
+       MERGE (h)-[:HAS_API]->(a:Api {host:$host, path:$path, project:$project})
        SET a.method=$method, a.lastSeen=timestamp(), a.color=$color
-       MERGE (a)-[:ANALYZED]->(an:Analysis {host:$host, path:$path})
+       MERGE (a)-[:ANALYZED]->(an:Analysis {host:$host, path:$path, project:$project})
        SET an.level=$level, an.vuln=$vuln, an.confirmed=$confirmed, an.advice=$advice, an.sens=$sens, an.sensCount=$sensCount, an.ts=timestamp()`,
-      { host: a.host, path: a.path, method: a.method || 'GET', level: a.level || 'info', vuln: a.vuln === true, confirmed: a.confirmed === true, advice: a.advice || '', sens: a.sens || '', sensCount: a.sensCount || 0, color: a.color || '' },
+      { host: a.host, path: a.path, method: a.method || 'GET', level: a.level || 'info', vuln: a.vuln === true, confirmed: a.confirmed === true, advice: a.advice || '', sens: a.sens || '', sensCount: a.sensCount || 0, color: a.color || '', project: this.project },
     )
   }
 
   /** 渗透确认 → Analysis 节点标记 confirmed（疑似漏洞 → 已确认；配合 Vuln 节点双标识，Agent 图查询可见确认状态） */
   async confirmAnalysis(host: string, path: string, level: string): Promise<void> {
     await this.run(
-      `MATCH (a:Api {host:$host, path:$path})-[:ANALYZED]->(an:Analysis {host:$host, path:$path})
+      `MATCH (a:Api {host:$host, path:$path, project:$project})-[:ANALYZED]->(an:Analysis {host:$host, path:$path, project:$project})
        SET an.confirmed=true, an.level=$level`,
-      { host, path, level },
+      { host, path, level, project: this.project },
     )
   }
 
   /** 漏洞 */
   async writeVuln(v: VulnData): Promise<void> {
     await this.run(
-      `MERGE (h:Host {url:$host})
-       MERGE (h)-[:HAS_API]->(a:Api {host:$host, path:$path})
-       MERGE (a)-[:HAS_VULN]->(vn:Vuln {host:$host, path:$path, name:$name})
+      `MERGE (h:Host {url:$host, project:$project})
+       MERGE (h)-[:HAS_API]->(a:Api {host:$host, path:$path, project:$project})
+       MERGE (a)-[:HAS_VULN]->(vn:Vuln {host:$host, path:$path, name:$name, project:$project})
        SET vn.level=$level, vn.desc=$desc, vn.exploit=$exploit, vn.color=$color, vn.ts=timestamp()`,
-      { host: v.host, path: v.path, name: v.name || '未命名漏洞', level: v.level || 'info', desc: v.desc || '', exploit: v.exploit || '', color: v.color || '' },
+      { host: v.host, path: v.path, name: v.name || '未命名漏洞', level: v.level || 'info', desc: v.desc || '', exploit: v.exploit || '', color: v.color || '', project: this.project },
     )
   }
 
   /** 凭据（HaENet 标签元数据随节点写入：tag/group/level/color） */
   async writeCred(c: CredData): Promise<void> {
     await this.run(
-      `MERGE (h:Host {url:$host})
-       MERGE (h)-[:HAS_CRED]->(cr:Cred {type:$type, value:$value, host:$host, path:$path})
+      `MERGE (h:Host {url:$host, project:$project})
+       MERGE (h)-[:HAS_CRED]->(cr:Cred {type:$type, value:$value, host:$host, path:$path, project:$project})
        SET cr.source=$source, cr.tag=$tag, cr.group=$group, cr.level=$level, cr.color=$color, cr.ts=timestamp()`,
-      { host: c.host, path: c.path, type: c.type, value: c.value, source: c.source || '', tag: c.tag || '', group: c.group || '', level: c.level || '', color: c.color || '' },
+      { host: c.host, path: c.path, type: c.type, value: c.value, source: c.source || '', tag: c.tag || '', group: c.group || '', level: c.level || '', color: c.color || '', project: this.project },
     )
   }
 
-  /** WebShell（挂 Host 节点，按 url 唯一；密码/密钥完整入库供 Agent 复用） */
+  /** WebShell（挂 Host 节点，按 url+project 唯一；密码/密钥完整入库供 Agent 复用） */
   async writeWebShell(ws: WebShellData): Promise<void> {
     // host 统一无协议格式（host:port，与其他写入一致，避免 Host 节点分裂）
     let host = ''
     try { host = new URL(ws.url).host } catch { host = ws.url.match(/^[a-zA-Z0-9.\-]+(?::\d+)?/)?.[0] || ws.url }
     await this.run(
-      `MERGE (h:Host {url:$host})
-       MERGE (h)-[:HAS_SHELL]->(sh:WebShell {url:$url})
+      `MERGE (h:Host {url:$host, project:$project})
+       MERGE (h)-[:HAS_SHELL]->(sh:WebShell {url:$url, project:$project})
        SET sh.id=$id, sh.type=$type, sh.script=$script, sh.password=$password, sh.key=$key,
            sh.cryption=$cryption, sh.payload=$payload, sh.encoding=$encoding, sh.remark=$remark,
            sh.status=$status, sh.ts=$ts`,
-      { host, url: ws.url, id: ws.id, type: ws.type || 'custom', script: ws.script || 'php', password: ws.password || '', key: ws.key || '', cryption: ws.cryption || '', payload: ws.payload || '', encoding: ws.encoding || 'UTF-8', remark: ws.remark || '', status: ws.status || 'unknown', ts: ws.ts },
+      { host, url: ws.url, id: ws.id, type: ws.type || 'custom', script: ws.script || 'php', password: ws.password || '', key: ws.key || '', cryption: ws.cryption || '', payload: ws.payload || '', encoding: ws.encoding || 'UTF-8', remark: ws.remark || '', status: ws.status || 'unknown', ts: ws.ts, project: this.project },
     )
   }
 
   /** 删除 WebShell */
   async deleteWebShell(url: string): Promise<void> {
     await this.run(
-      `MATCH (sh:WebShell {url:$url}) DETACH DELETE sh`,
-      { url },
+      `MATCH (sh:WebShell {url:$url, project:$project}) DETACH DELETE sh`,
+      { url, project: this.project },
     )
   }
 
   /** 笔记/Nday/备注（HaENet 标签元数据随节点写入：tag/group/level/color） */
   async writeNote(n: NoteData): Promise<void> {
     await this.run(
-      `MERGE (h:Host {url:$host})
-       MERGE (h)-[:HAS_NOTE]->(nt:Note {kind:$kind, host:$host, path:$path, text:$text})
+      `MERGE (h:Host {url:$host, project:$project})
+       MERGE (h)-[:HAS_NOTE]->(nt:Note {kind:$kind, host:$host, path:$path, text:$text, project:$project})
        SET nt.agent=$agent, nt.persist=$persist, nt.tag=$tag, nt.group=$group, nt.level=$level, nt.color=$color, nt.ts=timestamp()`,
-      { host: n.host, path: n.path, kind: n.kind, text: n.text, agent: n.agent || '', persist: n.persist === true, tag: n.tag || '', group: n.group || '', level: n.level || '', color: n.color || '' },
+      { host: n.host, path: n.path, kind: n.kind, text: n.text, agent: n.agent || '', persist: n.persist === true, tag: n.tag || '', group: n.group || '', level: n.level || '', color: n.color || '', project: this.project },
     )
   }
 
-  /** 渗透状态（进行中/已完成/已取消），同 Host+path+method 唯一 */
+  /** 渗透状态（进行中/已完成/已取消），同 Host+path+method+project 唯一 */
   async writePenetration(p: PenData): Promise<void> {
     await this.run(
-      `MERGE (h:Host {url:$host})
-       MERGE (h)-[:HAS_API]->(a:Api {host:$host, path:$path})
-       MERGE (a)-[:PENETRATED]->(pe:Penetration {host:$host, path:$path, method:$method})
+      `MERGE (h:Host {url:$host, project:$project})
+       MERGE (h)-[:HAS_API]->(a:Api {host:$host, path:$path, project:$project})
+       MERGE (a)-[:PENETRATED]->(pe:Penetration {host:$host, path:$path, method:$method, project:$project})
        SET pe.status=$status, pe.slot=$slot, pe.detail=$detail, pe.ts=timestamp()`,
-      { host: p.host, path: p.path, method: p.method, status: p.status, slot: p.slot || 0, detail: p.detail || '' },
+      { host: p.host, path: p.path, method: p.method, status: p.status, slot: p.slot || 0, detail: p.detail || '', project: this.project },
     )
   }
 
   /** 移除渗透状态（进行中取消/清除） */
   async removePenetration(host: string, path: string, method: string): Promise<void> {
     await this.run(
-      `MATCH (pe:Penetration {host:$host, path:$path, method:$method}) DETACH DELETE pe`,
-      { host, path, method },
+      `MATCH (pe:Penetration {host:$host, path:$path, method:$method, project:$project}) DETACH DELETE pe`,
+      { host, path, method, project: this.project },
     )
   }
 
-  /** 删除漏洞（按 host+path+name 定位） */
+  /** 删除漏洞（按 host+path+name+project 定位） */
   async removeVuln(host: string, path: string, name: string): Promise<void> {
     await this.run(
-      `MATCH (v:Vuln {host:$host, path:$path, name:$name}) DETACH DELETE v`,
-      { host, path, name },
+      `MATCH (v:Vuln {host:$host, path:$path, name:$name, project:$project}) DETACH DELETE v`,
+      { host, path, name, project: this.project },
     )
   }
 
   // ---------------- 查重 ----------------
 
-  /** 该目标+方式是否已渗透过 */
+  /** 该目标+方式是否已渗透过（当前项目域内查重） */
   async isPenetrated(host: string, path: string, method: string): Promise<boolean> {
     const rows = await this.read(
-      `MATCH (pe:Penetration {host:$host, path:$path, method:$method, status:'penetrated'}) RETURN count(pe) AS c`,
-      { host, path, method },
+      `MATCH (pe:Penetration {host:$host, path:$path, method:$method, status:'penetrated', project:$project}) RETURN count(pe) AS c`,
+      { host, path, method, project: this.project },
     )
     return rows[0]?.get('c')?.toNumber?.() > 0 || false
   }
 
-  /** 该目标+方式是否正在渗透 */
+  /** 该目标+方式是否正在渗透（当前项目域内查重） */
   async isPenetrating(host: string, path: string, method: string): Promise<boolean> {
     const rows = await this.read(
-      `MATCH (pe:Penetration {host:$host, path:$path, method:$method, status:'penetrating'}) RETURN count(pe) AS c`,
-      { host, path, method },
+      `MATCH (pe:Penetration {host:$host, path:$path, method:$method, status:'penetrating', project:$project}) RETURN count(pe) AS c`,
+      { host, path, method, project: this.project },
     )
     return rows[0]?.get('c')?.toNumber?.() > 0 || false
   }
@@ -201,7 +220,7 @@ export class Neo4jGraph {
   // ---------------- 上下文 ----------------
 
   /** 按目标生成全局情报上下文（供分析/渗透 prompt 注入） */
-  /** 结构化图查询（/api/graph/query?format=json 用）：按 Host 分组返回情报对象，供 Agent 主动查图后按需分析 */
+  /** 结构化图查询（/api/graph/query?format=json 用）：按 Host 分组返回情报对象，供 Agent 主动查图后按需分析（当前项目域） */
   async queryGraph(host?: string): Promise<{
     host: string
     apis: { path: string; method?: string; analysis?: { level?: string; vuln?: boolean; advice?: string } }[]
@@ -214,7 +233,7 @@ export class Neo4jGraph {
     if (!this.enabled) return []
     try {
       const rows = await this.read(
-        `MATCH (h:Host${host ? ' {url:$host}' : ''})
+        `MATCH (h:Host {project:$project${host ? ', url:$host' : ''}})
          OPTIONAL MATCH (h)-[:HAS_API]->(a:Api)
          OPTIONAL MATCH (a)-[:HAS_VULN]->(v:Vuln)
          OPTIONAL MATCH (a)-[:ANALYZED]->(an:Analysis)
@@ -230,7 +249,7 @@ export class Neo4jGraph {
                 collect(DISTINCT {kind:nt.kind, text:nt.text, path:nt.path}) AS notes,
                 collect(DISTINCT {path:pe.path, method:pe.method, status:pe.status}) AS pens
          ORDER BY h.url LIMIT 50`,
-        { host: host || '' },
+        { project: this.project, host: host || '' },
       )
       return rows.map((r) => ({
         host: String(r.get('host') || ''),
@@ -248,7 +267,7 @@ export class Neo4jGraph {
     if (!this.enabled) return ''
     try {
       const rows = await this.read(
-        `MATCH (h:Host${host ? ' {url:$host}' : ''})
+        `MATCH (h:Host {project:$project${host ? ', url:$host' : ''}})
          OPTIONAL MATCH (h)-[:HAS_API]->(a:Api)
          OPTIONAL MATCH (a)-[:HAS_VULN]->(v:Vuln)
          OPTIONAL MATCH (a)-[:ANALYZED]->(an:Analysis)
@@ -263,7 +282,7 @@ export class Neo4jGraph {
                 collect(DISTINCT {kind:nt.kind, text:nt.text, path:nt.path, tag:nt.tag, level:nt.level}) AS notes,
                 collect(DISTINCT {path:pe.path, method:pe.method, status:pe.status}) AS pens
          ORDER BY h.url LIMIT 50`,
-        { host: host || '' },
+        { project: this.project, host: host || '' },
       )
       if (!rows.length) return ''
       const out: string[] = []
@@ -271,9 +290,9 @@ export class Neo4jGraph {
         const h = String(r.get('host') || '')
         const apis = (r.get('apis') || []).filter((x: unknown) => x && (x as { path?: string }).path) as { path: string; method?: string; aColor?: string; anLevel?: string; anVuln?: boolean; anConfirmed?: boolean; anAdvice?: string }[]
         const vulns = (r.get('vulns') || []).filter((x: unknown) => x && (x as { name?: string }).name) as { name: string; level?: string; path?: string; color?: string }[]
-        const creds = (r.get('creds') || []).filter((x: unknown) => x && (x as { value?: string }).value) as { type?: string; value: string; path?: string }[]
+        const creds = (r.get('creds') || []).filter((x: unknown) => x && (x as { value?: string }).value) as { type?: string; value: string; path?: string; tag?: string; level?: string }[]
         const shells = (r.get('shells') || []).filter((x: unknown) => x && (x as { url?: string }).url) as { id?: number; url: string; type?: string; script?: string; status?: string; password?: string; key?: string; cryption?: string }[]
-        const notes = (r.get('notes') || []).filter((x: unknown) => x && (x as { text?: string }).text) as { kind?: string; text: string; path?: string }[]
+        const notes = (r.get('notes') || []).filter((x: unknown) => x && (x as { text?: string }).text) as { kind?: string; text: string; path?: string; tag?: string; level?: string }[]
         const pens = (r.get('pens') || []).filter((x: unknown) => x && (x as { status?: string }).status) as { path?: string; method?: string; status?: string }[]
         if (!apis.length && !vulns.length && !creds.length && !shells.length && !notes.length && !pens.length) continue
         const lines: string[] = [`【目标】${h}`]

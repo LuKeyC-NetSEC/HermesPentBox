@@ -8,8 +8,9 @@ import { createServer, request } from 'node:http'
 import { createServer as createNetServer, connect } from 'node:net'
 import { spawn } from 'node:child_process'
 import { ProxyEngine } from './proxy.ts'
+import type { FlowMeta } from './proxy.ts'
 
-const flows: ReturnType<ProxyEngine['emit']>[] = []
+const flows: FlowMeta[] = []
 const record = [] as any[]
 
 function listen(srv: any, port: number): Promise<void> {

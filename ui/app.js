@@ -105,7 +105,31 @@ function clearAiSel() {
   document.querySelectorAll('#flowTable tr.sel').forEach((tr) => tr.classList.remove('sel'))
 }
 document.getElementById('aiSelClear').onclick = clearAiSel
-function addAiMsg(role, text) {
+// 主对话历史持久化（随项目快照：addAiMsg 记录 + 节流同步到后端；启动/打开项目时恢复）
+const chatLog = []  // {role, text, ts}（上限 500 条）
+let chatRestoring = false
+let chatSyncTimer = null
+function scheduleChatSync() {
+  if (chatSyncTimer) return
+  chatSyncTimer = setTimeout(() => {
+    chatSyncTimer = null
+    fetch(`${API}/api/chat/history`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ messages: chatLog }) }).catch(() => { /* 同步失败下次再试 */ })
+  }, 800)
+}
+// 从后端恢复当前项目的聊天历史（清空重渲染）
+async function loadChatHistory() {
+  try {
+    const r = await fetch(`${API}/api/chat/history`).then((x) => x.json())
+    const items = Array.isArray(r.items) ? r.items : []
+    aiMsgs.innerHTML = ''
+    chatLog.length = 0
+    chatRestoring = true
+    try { for (const m of items) addAiMsg(m.role === 'user' ? 'user' : 'ai', m.text) } finally { chatRestoring = false }
+    chatLog.push(...items.map((m) => ({ role: m.role === 'user' ? 'user' : 'ai', text: String(m.text), ts: m.ts || Date.now() })))
+  } catch { /* 历史加载失败不影响聊天 */ }
+}
+// 渲染消息气泡；persist=false 的消息（临时占位/操作状态/卡片相关）不写入持久化历史
+function addAiMsg(role, text, persist = true) {
   const div = document.createElement('div')
   div.dataset.role = role
   div.style.cssText = role === 'user'
@@ -114,6 +138,12 @@ function addAiMsg(role, text) {
   div.textContent = text
   aiMsgs.appendChild(div)
   aiMsgs.scrollTop = aiMsgs.scrollHeight
+  // 记录历史并节流同步（恢复渲染跳过；persist=false 不记录）
+  if (!chatRestoring && persist) {
+    chatLog.push({ role: role === 'user' ? 'user' : 'ai', text: String(text), ts: Date.now() })
+    if (chatLog.length > 500) chatLog.splice(0, chatLog.length - 500)
+    scheduleChatSync()
+  }
   return div
 }
 // 测量 AI 消息气泡一行可容纳的等宽字符数（气泡 max-width 85% 容器 + padding，而非整个窗口）
@@ -158,9 +188,9 @@ function refreshAiSendBtn() {
         try {
           const r = await fetch(`${API}/api/chat/steer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, sessionId: aiChatSid }) }).then((x) => x.json())
           // 复刻官方语义：仅运行中 accepted；空闲 rejected（提示而非静默）
-          if (r.accepted) addAiMsg('ai', `↪ 已向运行中的 Agent 注入引导：${text}`)
-          else addAiMsg('ai', `（当前 Agent 无活跃运行，引导未接受${r.reason ? `：${r.reason}` : ''}）`)
-        } catch (e) { addAiMsg('ai', `（引导失败：${e.message}）`) }
+          if (r.accepted) addAiMsg('ai', `↪ 已向运行中的 Agent 注入引导：${text}`, false)
+          else addAiMsg('ai', `（当前 Agent 无活跃运行，引导未接受${r.reason ? `：${r.reason}` : ''}）`, false)
+        } catch (e) { addAiMsg('ai', `（引导失败：${e.message}）`, false) }
       }
     } else {
       aiSendBtn.textContent = 'Stop'
@@ -192,10 +222,10 @@ async function aiSend() {
     if (msg && !selN && !selVulnIds.size) {
       aiInput.value = ''
       refreshAiSendBtn()  // 输入框清空后按钮回到 Stop
-      const hint = addAiMsg('ai', `⏳ 已排队待发送：${msg.slice(0, 40)}`)
+      const hint = addAiMsg('ai', `⏳ 已排队待发送：${msg.slice(0, 40)}`, false)
       aiQueue.push({ text: msg, el: hint })
     } else {
-      addAiMsg('ai', '（Agent 正在工作中，请稍候再发送）')
+      addAiMsg('ai', '（Agent 正在工作中，请稍候再发送）', false)
     }
     return
   }
@@ -208,13 +238,13 @@ async function aiSend() {
     const penMsg = `${msg}\n\n（回复渗透意见：${aiReplyRef}）`
     const penSlot = aiReplyRefSlot
     aiReplyRef = ''
-    const think = addAiMsg('ai', '思考中…')
+    const think = addAiMsg('ai', '思考中…', false)
     setAiSendBtn(true)
     aiSendBtn.onclick = async () => {
       try { await fetch(`${API}/api/penetrate/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ slot: penSlot }) }) } catch { /* 已结束 */ }
       pendingSubRuns.delete(penSlot)
       think.remove()
-      addAiMsg('ai', '✕ 已停止与子 Agent 沟通')
+      addAiMsg('ai', '✕ 已停止与子 Agent 沟通', false)
       aiBusy = false
       setAiSendBtn(false)
       aiSendBtn.onclick = aiSend
@@ -358,7 +388,7 @@ async function aiSend() {
   } catch (e) {
     // 用户 Stop：保留已生成内容；否则报通信失败
     if (aborted) { if (outEl) outEl.textContent = acc || '（已停止）'; else think.textContent = acc || '（已停止）' }
-    else { think.remove(); addAiMsg('ai', '（与 Hermes 通信失败）') }
+    else { think.remove(); addAiMsg('ai', '（与 Hermes 通信失败）', false) }
   } finally {
     clearInterval(thinkTimer)
     aiBusy = false
@@ -804,7 +834,11 @@ function renderFdMarks(side, flowId) {
 // ---- 详情窗格渲染（搜索/标记高亮） ----
 function renderFdPane(side, query, markVal) {
   const pre = document.getElementById(side === 'req' ? 'fdReq' : 'fdRes')
-  const raw = window.__fdRaw[side]
+  let raw = window.__fdRaw[side]
+  // 大报文截断渲染：MB 级 body 全量转义+高亮+innerHTML 会卡死 UI；仅截断渲染，完整数据仍在 __fdRaw（发送/复制走完整）
+  const MAX = 256 * 1024
+  let truncated = false
+  if (raw.length > MAX) { raw = raw.slice(0, MAX); truncated = true }
   let html = esc(raw)
   let n = 0
   if (markVal) {
@@ -818,6 +852,7 @@ function renderFdPane(side, query, markVal) {
   } else {
     document.getElementById(side === 'req' ? 'fdReqCount' : 'fdResCount').textContent = ''
   }
+  if (truncated) html += `\n\n……（报文过大已截断显示前 ${Math.round(MAX / 1024)}KB，完整数据仍用于发送/复制）`
   pre.innerHTML = html
 }
 document.getElementById('fdReqSearch').addEventListener('input', (e) => renderFdPane('req', e.target.value.trim()))
@@ -1854,7 +1889,7 @@ document.getElementById('btnWsPing').onclick = async () => {
   wsItems = j.items || []
   loadWsList()
 }
-// ---- WebShell 生成（类型决定生成逻辑：哥斯拉=Payload+加密；冰蝎=脚本；蚁剑/自定义=脚本） ----
+// ---- WebShell 生成（类型决定生成逻辑：哥斯拉=Payload+加密；冰蝎=脚本；蚁剑=脚本） ----
 const wsGenModal = document.getElementById('wsGenModal')
 // 哥斯拉 payload → 支持加密（参考 getAllCryption）
 const WSGEN_PAYLOAD_CRYPTIONS = {
@@ -1883,11 +1918,11 @@ function applyWsGenType() {
   const cRow = document.getElementById('wsGenCryptionRow')
   const kRow = document.getElementById('wsGenKeyRow')
   // 哥斯拉：显示 Payload + 加密 + 密钥（脚本由 payload 决定）
-  // 冰蝎/蚁剑/自定义：显示脚本（+加密），密钥仅哥斯拉需要（冰蝎密钥=md5(密码)前16 由后端自动计算）
+  // 冰蝎/蚁剑：显示脚本（+加密），密钥仅哥斯拉需要（冰蝎密钥=md5(密码)前16 由后端自动计算）
   pRow.style.display = type === 'godzilla' ? 'flex' : 'none'
   sRow.style.display = type === 'godzilla' ? 'none' : 'flex'
   kRow.style.display = type === 'godzilla' ? 'flex' : 'none'
-  // 加密：哥斯拉=payload联动；冰蝎=按脚本（AES / PHP XOR）；蚁剑/自定义=隐藏
+  // 加密：哥斯拉=payload联动；冰蝎=按脚本（AES / PHP XOR）；蚁剑=隐藏
   cRow.style.display = (type === 'godzilla' || type === 'behinder') ? 'flex' : 'none'
   const crySel = document.getElementById('wsGenCryption')
   if (type === 'godzilla') {
@@ -1909,7 +1944,7 @@ function applyWsGenPayload() {
 document.getElementById('wsGenPayload').addEventListener('change', applyWsGenPayload)
 document.getElementById('wsGenType').addEventListener('change', applyWsGenType)
 document.getElementById('btnWsGen').onclick = () => { applyWsGenType(); wsGenModal.style.display = 'flex' }
-// 存活校验：测试所有 WebShell 连接（逐个走原版哥斯拉 test 协议 / 其他类型 echo 校验）
+// ---- WebShell 存活校验：测试所有 WebShell 连接（逐个走原版哥斯拉 test 协议 / 其他类型 echo 校验） ----
 document.getElementById('btnWsAlive').onclick = async () => {
   const btn = document.getElementById('btnWsAlive')
   const old = btn.textContent
@@ -1926,6 +1961,7 @@ document.getElementById('btnWsAlive').onclick = async () => {
 }
 document.getElementById('btnWsGenClose').onclick = () => { wsGenModal.style.display = 'none' }
 document.getElementById('btnWsGenRun').onclick = async () => {
+  const btn = document.getElementById('btnWsGenRun')
   const type = document.getElementById('wsGenType').value
   const body = {
     type,
@@ -1934,10 +1970,15 @@ document.getElementById('btnWsGenRun').onclick = async () => {
     cryption: document.getElementById('wsGenCryption').value,
     password: document.getElementById('wsGenPass').value.trim(),
     key: document.getElementById('wsGenKey').value.trim(),
+    evasion: document.getElementById('wsGenEvasion').checked,
   }
   const out = document.getElementById('wsGenOut')
   const note = document.getElementById('wsGenNote')
   if (!body.password) { showMsg('密码必填'); return }
+  // 加载中：按钮换成 spinner（Agent 免杀异步耗时，需给用户反馈）
+  const oldHtml = btn.innerHTML
+  btn.disabled = true
+  btn.innerHTML = '<span class="an-spinner"></span>生成中…'
   try {
     const r = await fetch(`${API}/api/webshells/generate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((x) => x.json())
     if (r.error) { out.value = r.error; note.textContent = '生成失败'; return }
@@ -1945,6 +1986,7 @@ document.getElementById('btnWsGenRun').onclick = async () => {
     note.textContent = r.note || ''
     out.dataset.code = r.code
   } catch (e) { out.value = '生成失败: ' + e.message; note.textContent = '' }
+  finally { btn.disabled = false; btn.innerHTML = oldHtml }
 }
 document.getElementById('btnWsGenCopy').onclick = async () => {
   const out = document.getElementById('wsGenOut')
@@ -2020,7 +2062,7 @@ function addFlowRow(f) {
     document.getElementById('ctxDelSel').style.display = selFlowIds.size ? 'block' : 'none'
   }
   flowsBody.prepend(tr)
-  while (flowsBody.children.length > 500) flowsBody.lastChild.remove()
+  while (flowsBody.children.length > 300) flowsBody.lastChild.remove()  // 上限 300 行：DOM 节点过多会拖慢滑动与 repaint
 }
 // 列宽拖拽（宽度存 localStorage，用户可自定义）
 function initFlowResizers(sel = '#flowHeadTable', key = 'flowCols') {
@@ -2065,6 +2107,14 @@ async function loadFlows() {
 }
 loadFlows()
 const es = new EventSource(`${API}/api/events`)
+// SSE 流量批量渲染缓冲：100ms 内到达的流量合并一次 prepend，避免高频 DOM 操作拖慢滑动/repaint
+let flowBuf = []
+let flowBufTimer = null
+function flushFlowBuf() {
+  flowBufTimer = null
+  const items = flowBuf; flowBuf = []
+  for (let i = items.length - 1; i >= 0; i--) addFlowRow(items[i])  // 倒序 prepend，保持最新在前
+}
 es.onmessage = (e) => {
   const f = JSON.parse(e.data)
   if (f.type === 'analyze-advice') { renderAdviceCard(f); return }  // 子 Agent 渗透意见 → 聊天框意见卡
@@ -2107,7 +2157,7 @@ es.onmessage = (e) => {
     }
     return
   }
-  if (f.method) addFlowRow(f)
+  if (f.method) { flowBuf.push(f); if (!flowBufTimer) flowBufTimer = setTimeout(flushFlowBuf, 100) }
 }
 // ---- 子 Agent 渗透成果（vulndoc）：写入漏洞库完成 → 聊天框简述卡片（高危 目标：XXX 名称 / 已同步记忆 / 点击查看漏洞列表详情） ----
 function renderVulnDocCard(v) {
@@ -2179,7 +2229,7 @@ function renderAdviceCard(a) {
     const t = { id: Date.now(), label, slot: a.slot ?? 0, status: 'running', advice: a.advice }
     aiTasks.set(t.id, t)
     renderAiTasks()
-    const think = addAiMsg('ai', '子 Agent 渗透执行中…')
+    const think = addAiMsg('ai', '子 Agent 渗透执行中…', false)
     try {
       // 携带该流量原始请求/响应包（模型 VULNDOC 未输出时后端兜底写入漏洞库，方便用户复制复测）
       const det = a.id ? await fetch(`${API}/api/flows/${a.id}/detail`).then((x) => x.json()).catch(() => null) : null
@@ -2207,12 +2257,17 @@ function renderAdviceCard(a) {
       renderAiTasks()
     } catch (e) {
       think.remove()
-      addAiMsg('ai', `（渗透执行失败：${e.message}）`)
+      addAiMsg('ai', `（渗透执行失败：${e.message}）`, false)
       t.status = 'cancelled'
       renderAiTasks()
     }
   }
-  cancel.onclick = () => { closeCard('✕ 已取消渗透'); resumeSlot() }
+  cancel.onclick = () => {
+    closeCard('✕ 已取消渗透')
+    resumeSlot()
+    // 取消后卡片 4s 自动淡出（防止大量取消卡堆积刷屏）
+    setTimeout(() => { wrap.style.transition = 'opacity .5s'; wrap.style.opacity = '0'; setTimeout(() => wrap.remove(), 600) }, 4000)
+  }
   reply.onclick = () => { closeCard('↩ 已选中该子 Agent，输入内容将直接与它沟通'); aiReplyRef = a.advice; aiReplyRefSlot = a.slot ?? 0; aiInput.value = ''; aiInput.placeholder = '回复该子 Agent…'; aiInput.focus() }
 }
 let aiReplyRef = ''        // 回复引用（点回复 ICON 后设置；不点则空 = 正常与主 Agent 对话）
@@ -2720,3 +2775,93 @@ document.getElementById('btnSsh').onclick = () => {
   }
 }
 term.onData((data) => { if (ws && ws.readyState === 1 && shellReady) ws.send(JSON.stringify({ type: 'input', data })) })
+
+// ---- 项目管理（类 Burp 项目文件：新建/打开/保存，切换前后端自动保存当前项目） ----
+const projModal = document.getElementById('projModal')
+let projSelPath = null
+// 已保存项目列表（前端 localStorage 记录：保存对话框返回的路径即来源，支持保存到任意位置）
+let savedProjects = []
+try { savedProjects = JSON.parse(localStorage.getItem('pentbox.projects') || '[]') } catch { savedProjects = [] }
+function upsertSavedProject(name, path) {
+  savedProjects = savedProjects.filter((p) => p.path !== path)
+  savedProjects.unshift({ name, path, savedAt: Date.now() })
+  try { localStorage.setItem('pentbox.projects', JSON.stringify(savedProjects)) } catch { /* 存储失败不影响 */ }
+}
+document.getElementById('btnProjectMgr').onclick = async () => { projModal.style.display = 'flex'; await loadProjList() }
+document.getElementById('btnProjClose').onclick = () => { projModal.style.display = 'none' }
+projModal.addEventListener('click', (e) => { if (e.target === projModal) projModal.style.display = 'none' })
+async function loadProjList() {
+  try {
+    const info = await fetch(`${API}/api/session/info`).then((r) => r.json())
+    document.getElementById('projCurrent').textContent = info.path
+      ? `${info.path}\n流量 ${info.flows} · 报文 ${info.details} · 情报 ${info.digest}${info.savedAt ? ' · 上次保存 ' + new Date(info.savedAt).toLocaleString() : ''}`
+      : '（未保存的新项目）'
+    // 合并：后端（默认项目 + 项目目录扫描）+ 前端已保存记录（任意路径保存的项目）
+    const merged = new Map()
+    for (const p of (info.projects || [])) merged.set(p.path, { name: p.name, path: p.path, size: p.size, mtime: p.mtime })
+    for (const p of savedProjects) {
+      if (!merged.has(p.path)) merged.set(p.path, { name: p.name, path: p.path, size: null, mtime: p.savedAt, frontOnly: true })
+      else merged.set(p.path, { ...merged.get(p.path), name: p.name })  // 用保存时的名称（用户自定义文件名）
+    }
+    const list = document.getElementById('projList')
+    list.innerHTML = ''
+    for (const p of merged.values()) {
+      const sz = p.size == null ? '—' : p.size > 1048576 ? (p.size / 1048576).toFixed(1) + ' MB' : p.size > 1024 ? Math.round(p.size / 1024) + ' KB' : p.size + ' B'
+      const mt = p.mtime ? new Date(p.mtime).toLocaleString() : '—'
+      const row = document.createElement('div')
+      row.style.cssText = 'padding:6px 10px;border-bottom:1px solid #1e242e;cursor:pointer;display:flex;gap:10px;align-items:baseline;font-size:12px'
+      row.innerHTML = `<span style="color:#4fc3f7;width:130px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis">${esc(p.name)}</span><span style="color:#8b98a8;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.path)}</span><span style="color:#8b98a8;width:64px;text-align:right;flex-shrink:0">${sz}</span><span style="color:#5c6b7a;width:130px;text-align:right;flex-shrink:0">${mt}</span>`
+      if (p.path === info.path) row.style.background = '#1e3a5f'
+      row.onclick = () => { for (const x of list.children) x.style.background = ''; row.style.background = '#1e3a5f'; projSelPath = p.path }
+      list.appendChild(row)
+    }
+    if (!merged.size) list.innerHTML = '<div style="padding:12px;color:#5c6b7a;font-size:12px">暂无项目文件（点「新建项目」创建后保存）</div>'
+  } catch (e) { showMsg('项目管理加载失败: ' + e.message) }
+}
+// 保存项目：直接保存到当前项目文件（未命名项目落默认项目文件），不弹对话框
+document.getElementById('btnProjSave').onclick = async () => {
+  try {
+    const r = await fetch(`${API}/api/session/save`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then((x) => x.json())
+    if (r.error) throw new Error(r.error)
+    showMsg(`项目已保存到当前项目文件\n${r.path}`)
+    await loadProjList()
+  } catch (e) { showMsg('保存失败: ' + e.message) }
+}
+// 另存为项目：弹系统保存对话框选择路径/自定义文件名 → 保存并绑定为新当前项目
+document.getElementById('btnProjSaveAs').onclick = async () => {
+  try {
+    const info = await fetch(`${API}/api/session/info`).then((r) => r.json())
+    const path = await window.pentbox?.saveProjectDialog(info.path || undefined)
+    if (!path) return  // 用户取消
+    const r = await fetch(`${API}/api/session/save`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path }) }).then((x) => x.json())
+    if (r.error) throw new Error(r.error)
+    const name = path.split(/[\\/]/).pop().replace(/\.hpbs$/i, '') || '未命名项目'
+    upsertSavedProject(name, path)  // 记录到已保存项目列表（名称 + 路径）
+    showMsg(`项目已另存为\n${r.path}`)
+    await loadProjList()
+  } catch (e) { showMsg('另存为失败: ' + e.message) }
+}
+document.getElementById('btnProjOpen').onclick = async () => {
+  if (!projSelPath) { showMsg('请先在列表中选择要打开的项目'); return }
+  try {
+    const r = await fetch(`${API}/api/session/open`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: projSelPath }) }).then((x) => x.json())
+    if (r.error) throw new Error(r.error)
+    showMsg(`已打开项目（流量 ${r.flows} · 报文 ${r.details}）\n${r.path}`)
+    await loadProjList()
+    loadFlows()
+    loadChatHistory()  // 切换为该项目的主对话历史
+  } catch (e) { showMsg('打开失败: ' + e.message) }
+}
+document.getElementById('btnProjNew').onclick = async () => {
+  try {
+    const r = await fetch(`${API}/api/session/new`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then((x) => x.json())
+    if (r.error) throw new Error(r.error)
+    showMsg('已新建项目（未命名，点「保存项目」选择路径保存）\n当前工作区已清空，旧项目已自动保存')
+    await loadProjList()
+    loadFlows()
+    loadChatHistory()  // 新建项目 → 清空聊天历史
+  } catch (e) { showMsg('新建失败: ' + e.message) }
+}
+
+// 启动时恢复当前项目的聊天历史（Hermes Agent 对话框持久化）
+loadChatHistory()

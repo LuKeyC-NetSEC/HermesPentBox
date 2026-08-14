@@ -20,6 +20,8 @@ export interface MitmCallbacks {
   onRequest?: (info: { id: number; method: string; url: string; headers: Record<string, string>; body: string }) => Promise<boolean> | boolean
   onFlow?: (f: {
     ts: number; method: string; url: string; status: number; bytes: number; upstream: string
+    /** 渗透目标流量标记（代理层 setPenetrateTarget 命中） */
+    self?: boolean
     detail?: {
       reqHeaders: Record<string, string>; reqBody: string; resHeaders: Record<string, string>; resBody: string
       /** 原始头行（保留大小写/顺序/重复头，如 Set-Cookie 每行一条） */
@@ -105,12 +107,14 @@ export function installCa(): { ok: boolean; error?: string } {
 
 /** MITM 上游转发代理（直连/HTTP/SOCKS 与代理引擎同链）；本地地址与 direct 返回 undefined 走直连 */
 function upstreamAgent(up: Upstream): HttpsProxyAgent<string> | SocksProxyAgent | undefined {
-  // 本地/内网地址不走上游（v2ray 等不转发 localhost）
-  if (/^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/.test(up.host)) return undefined
-  if (up.type === 'http') return new HttpsProxyAgent(`http://${up.host}:${up.port}`)
+  // 本地/内网地址不走上游（v2ray 等不转发 localhost）；direct 无 host/port
+  const host = 'host' in up ? up.host : ''
+  const port = 'port' in up ? up.port : 0
+  if (/^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$/.test(host)) return undefined
+  if (up.type === 'http') return new HttpsProxyAgent(`http://${host}:${port}`)
   if (up.type === 'socks4' || up.type === 'socks5' || up.type === 'socks5h') {
     const auth = up.username ? `${up.username}:${up.password ?? ''}@` : ''
-    return new SocksProxyAgent(`${up.type === 'socks5h' ? 'socks5h' : up.type}://${auth}${up.host}:${up.port}`)
+    return new SocksProxyAgent(`${up.type === 'socks5h' ? 'socks5h' : up.type}://${auth}${host}:${port}`)
   }
   return undefined
 }
@@ -182,7 +186,7 @@ function signForHost(host: string): { key: string; cert: string } {
     { name: 'extKeyUsage', serverAuth: true },
     { name: 'subjectAltName', altNames },
   ])
-  cert.sign(caKey!, forge.md.sha256.create())
+  cert.sign(caKey! as forge.pki.rsa.PrivateKey, forge.md.sha256.create())
   const out = { key: forge.pki.privateKeyToPem(keys.privateKey), cert: forge.pki.certificateToPem(cert) + caPemCert }
   certCache.set(host, out)
   return out
@@ -247,16 +251,16 @@ export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream:
     }
     const start = Date.now()
     const ds = downstream
-    const opts = {
+    const opts: any = {
       hostname: target.hostname,
-      port: target.port || 443,
+      port: Number(target.port || 443),
       path: target.pathname + target.search,
       method: req.method,
       headers: { ...req.headers } as Record<string, string>,
       rejectUnauthorized: false,
       // 类 Burp：设置了下游代理则出口经下游（CONNECT 隧道内做 TLS 二次握手），否则走原上游链
       agent: ds ? undefined : upstreamAgent(upstream),
-      ...(ds ? { createConnection: () => connectViaDownstream(ds, target.hostname, target.port || 443) } : {}),
+      ...(ds ? { createConnection: () => connectViaDownstream(ds, target.hostname, Number(target.port || 443)) } : {}),
     }
     delete opts.headers['proxy-connection']
     // 内部标记头（WebShell/Repeater）不转发到目标，避免暴露工具特征
@@ -290,8 +294,8 @@ export function mitmTunnel(client: Socket, host: string, head: Buffer, upstream:
       res.writeHead(502, { 'content-type': 'text/plain' })
       res.end(`mitm error: ${e.message}`)
       cb.onFlow?.({
-        ts: start, method: req.method ?? 'GET', url: flowUrl, status: 502, bytes: 0, upstream: ds ? `downstream:${ds.protocol || 'http'}://${ds.host}:${ds.port}` : upstream.type === 'direct' ? 'direct' : `${upstream.type}://${upstream.host}:${upstream.port}`,
-        detail: { reqHeaders: req.headers as Record<string, string>, reqBody: decodeBody(Buffer.concat(reqChunks), (req.headers['content-encoding'] as string) || undefined), resHeaders: {}, resBody: '' },
+        ts: start, method: req.method ?? 'GET', url: flowUrl, status: 502, bytes: 0, upstream: ds ? `downstream:${ds.protocol || 'http'}://${ds.host}:${ds.port}` : upstream.type === 'direct' ? 'direct' : `${upstream.type}://${'host' in upstream ? upstream.host : ''}:${'port' in upstream ? upstream.port : 0}`,
+        detail: { reqHeaders: req.headers as Record<string, string>, reqBody: decodeBody(Buffer.concat(reqChunks), (req.headers['content-encoding'] as string) || undefined), resHeaders: {}, resBody: '', reqRawHeaders: [], resRawHeaders: [], reqLine: `${req.method ?? 'GET'} ${target.pathname + target.search} HTTP/${req.httpVersion}`, resLine: 'HTTP/1.1 502 Bad Gateway' },
       })
     })
     req.pipe(up)
