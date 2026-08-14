@@ -40,5 +40,31 @@
     "@types/ws": "^8.18.1",
     "electron": "^43.3.0",
     "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.hermes.pentbox",
+    "productName": "HermesPentBox",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**",
+      "electron/**",
+      "ui/**",
+      "core/**",
+      "assets/**",
+      "tools/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }
