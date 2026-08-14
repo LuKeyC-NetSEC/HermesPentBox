@@ -18,6 +18,16 @@ AI-powered local pentest workbench. Browser traffic flows through a built-in MIT
 - **Projects** — Burp-style binary snapshot files, auto-save every 10s, per-project isolation
 - **Operation log** — terminal-style panel recording all agent actions
 
+## Pentest Modes
+
+Three modes switch from the header; all penetrations pass the approval officer regardless of mode.
+
+| Mode | Workflow |
+|---|---|
+| **Auto** | No traffic analysis, sub-agents not involved. Input `/pentest {domain}` → main agent runs full pentest (recon → verification → VULNDOC → WebShell sync) → approver audits |
+| **Passive** | Traffic → sub-agents analyze + advice cards → smart approval auto-penetrates / manual approval user decides → point-to-point verification (prove the vuln exists, no deep exploitation) |
+| **Funnel** | Click target features in browser to gather traffic → sub-agents pure audit (no advice cards) → `/pentest {domain}` main agent compound pentest with global intel |
+
 ## Quick Start
 
 ```bash
