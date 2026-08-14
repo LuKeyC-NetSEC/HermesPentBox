@@ -23,3 +23,5 @@ Thumbs.db
 
 # hermes local
 .hermes/
+core/__pycache__/
+__pycache__/

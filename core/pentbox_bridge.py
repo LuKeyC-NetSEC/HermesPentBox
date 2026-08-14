@@ -276,19 +276,24 @@ class AgentSession:
 
 
 class PentboxBridge:
-    def __init__(self, hermes_home: str, port: int, analyzer_home: str = ""):
+    def __init__(self, hermes_home: str, port: int, analyzer_home: str = "", approver_home: str = ""):
         self.hermes_home = hermes_home
         self.analyzer_home = analyzer_home or os.path.join(
             os.path.dirname(os.path.dirname(hermes_home)), "hermespentbox-analyzer"
+        )
+        self.approver_home = approver_home or os.path.join(
+            os.path.dirname(os.path.dirname(hermes_home)), "hermespentbox-approver"
         )
         self.port = port
         self.sessions: dict[tuple[str, str], AgentSession] = {}
         self.sessions_lock = threading.Lock()
 
     def _home_for(self, profile: str) -> str:
-        """profile → 档案目录：hermespentbox-analyzer 用独立审计员档案，其余用主档案"""
+        """profile → 档案目录：hermespentbox-analyzer 用审计员档案，hermespentbox-approver 用审批官档案，其余用主档案"""
         if profile == "hermespentbox-analyzer":
             return self.analyzer_home
+        if profile == "hermespentbox-approver":
+            return self.approver_home
         return self.hermes_home
 
     def _get_session(self, session_id: str, hermes_home: str) -> AgentSession:
@@ -405,6 +410,7 @@ def main():
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--hermes-home", default="")
     parser.add_argument("--analyzer-home", default="")
+    parser.add_argument("--approver-home", default="")
     args = parser.parse_args()
 
     home = args.hermes_home or os.environ.get("HERMES_HOME", "")
@@ -417,7 +423,12 @@ def main():
     if agent_root and agent_root not in sys.path:
         sys.path.insert(0, agent_root)
 
-    bridge = PentboxBridge(home, args.port, args.analyzer_home or os.environ.get("PENTBOX_ANALYZER_HOME", ""))
+    bridge = PentboxBridge(
+        home,
+        args.port,
+        args.analyzer_home or os.environ.get("PENTBOX_ANALYZER_HOME", ""),
+        args.approver_home or os.environ.get("PENTBOX_APPROVER_HOME", ""),
+    )
     bridge.serve()
 
 

@@ -82,6 +82,9 @@
   .settings-card .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .settings-card .row label { width: 70px; color: #8b98a8; font-size: 12px; text-align: right; }
   .settings-card .row input, .settings-card .row select { flex: 1; background: #1c222c; border: 1px solid #2c3542; color: #d7dde4; padding: 5px 8px; border-radius: 4px; }
+  #roleEditModal .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }  /* 弹窗行 flex 布局（.settings-card 规则不覆盖弹窗） */
+  #roleEditModal .row input, #roleEditModal .row select { flex: 1; background: #1c222c; border: 1px solid #2c3542; color: #d7dde4; padding: 5px 8px; border-radius: 4px; }  /* 角色编辑弹窗输入框与设置面板一致 */
+  #roleEditModal .row label { width: 70px; color: #8b98a8; font-size: 12px; text-align: right; }  /* 标签 70px 右对齐，输入框起点统一 */
   .settings-card .row button { flex: 0 0 auto; background: #1e3a5f; border: 1px solid #2c3542; color: #4fc3f7; cursor: pointer; padding: 5px 12px; border-radius: 4px; font-size: 12px; }
   .settings-card .row button:hover { background: #28507f; }
   .hint { color: #8b98a8; font-size: 11px; margin-left: 6px; }
@@ -93,8 +96,14 @@
 </style>
 </head>
 <body>
-<header>
+<header style="position:relative">
   <h1 id="appTitle">HermesPentBox</h1>
+  <!-- 渗透模式三段式开关（居中）：全自动 / 被动 / 漏斗 -->
+  <div id="pentestModeSwitch" style="position:absolute;left:50%;transform:translateX(-50%);display:flex;border:1.5px solid #5f6f86;border-radius:8px;overflow:hidden;background:#1c222c" title="渗透模式：全自动=Agent 负责全部渗透流程；被动=子 Agent 分析+意见卡，主 Agent 等用户沟通；漏斗=子 Agent 纯审计，主 Agent 复合式全自动渗透">
+    <button data-pentest-mode="auto" style="border:none;background:transparent;color:#8b98a8;cursor:pointer;padding:3px 14px;font-size:11px">全自动</button>
+    <button data-pentest-mode="passive" style="border:none;background:transparent;color:#8b98a8;cursor:pointer;padding:3px 14px;font-size:11px">被动</button>
+    <button data-pentest-mode="funnel" style="border:none;background:transparent;color:#8b98a8;cursor:pointer;padding:3px 14px;font-size:11px">漏斗</button>
+  </div>
   <button id="btnLaunchBrowser" style="margin-left:auto;background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:3px 14px;font-size:12px;border-radius:4px;display:flex;align-items:center;gap:6px">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
     Launch Browser
@@ -122,6 +131,9 @@
   <button data-panel="term">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
   </button>
+  <button data-panel="logs">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>
+  </button>
   <div style="margin-top:auto;display:flex;flex-direction:column;gap:4px">
     <button data-panel="settings">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -147,7 +159,16 @@
     <button id="aiSelClear" style="background:none;border:none;color:#8b98a8;cursor:pointer;font-size:11px">✕ 清除</button>
   </div>
   <div style="padding:8px;border-top:1px solid #262c36;display:flex;gap:6px">
-    <input id="aiChatInput" placeholder="Ask Hermes..." style="flex:1;background:#111418;border:1px solid #2c3542;color:#d7dde4;padding:6px 8px;border-radius:4px;font-size:12px;outline:none">
+    <div style="position:relative;flex:1">
+      <div id="aiCmdHint" style="display:none;position:absolute;bottom:100%;left:0;right:0;margin-bottom:4px;background:#1a2027;border:1px solid #3a4556;border-radius:6px;overflow:hidden;z-index:30">
+        <div style="padding:6px 10px;font-size:11px;color:#5c6b7a;border-bottom:1px solid #262c36">命令（点击使用）：</div>
+        <button id="aiCmdPentest" style="display:flex;width:100%;align-items:center;gap:8px;background:none;border:none;color:#d7dde4;cursor:pointer;padding:8px 10px;font-size:12px;text-align:left">
+          <span style="color:#4fc3f7;font-family:'Cascadia Code',Consolas,monospace">/pentest &lt;domain&gt;</span>
+          <span style="margin-left:auto;font-size:10px;color:#5cd67a">全自动渗透目标域</span>
+        </button>
+      </div>
+      <input id="aiChatInput" placeholder="Ask Hermes..." style="width:100%;background:#111418;border:1px solid #2c3542;color:#d7dde4;padding:6px 8px;border-radius:4px;font-size:12px;outline:none">
+    </div>
     <button id="aiChatSend" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:4px 12px;border-radius:4px;font-size:12px">Send</button>
   </div>
 </div>
@@ -260,7 +281,6 @@
     <div style="width:25%;min-width:0;display:flex;flex-direction:column;border-right:1px solid #262c36">
       <div style="display:flex;align-items:center;padding:8px 10px;gap:6px">
         <button id="btnVulnNew" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:3px 10px;font-size:12px">+ 新建漏洞</button>
-        <span style="font-size:11px;color:#66788a;flex:1">Agent 可经 /api/vulns 增删改查</span>
       </div>
       <div id="vulnList" style="flex:1;overflow:auto"></div>
     </div>
@@ -286,7 +306,7 @@
     </div>
     <div style="flex:1;min-width:0;min-height:0;display:flex;flex-direction:column">
       <div id="wsNoSel" style="flex:1;display:flex;align-items:center;justify-content:center;color:#66788a;font-size:16px;font-weight:bold">请添加并选择 WebShell 会话</div>
-      <div id="wsDetail" style="flex:1;min-width:0;min-height:0;display:none;flex-direction:column">
+      <div id="wsDetail" style="flex:1;min-width:0;min-height:0;display:none;flex-direction:column;position:relative">
       <div style="display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid #262c36">
         <span id="wsCurTitle" style="font-size:12px;color:#8b98a8;flex:1">选择左侧 WebShell</span>
         <button id="btnWsPing" style="background:#1e3a2a;border:1px solid #2c3542;color:#5cd67a;cursor:pointer;padding:4px 14px;font-size:12px">Ping</button>
@@ -356,6 +376,11 @@
           </div>
         </div>
       </div>
+      <!-- 掉线覆盖层：虚拟终端/文件管理/正向代理区域统一显示 -->
+      <div id="wsDeadOverlay" style="display:none;position:absolute;inset:0;background:rgba(10,12,16,.93);z-index:20;align-items:center;justify-content:center;flex-direction:column;gap:10px">
+        <span style="color:#f76b6b;font-size:18px;font-weight:700">WebShell 已掉线</span>
+        <span style="color:#8b98a8;font-size:12px">点击「Ping」重试存活探测，或点击「删除」移除该会话</span>
+      </div>
       </div>
     </div>
   </section>
@@ -387,12 +412,23 @@
     </div>
     <div id="term"></div>
   </section>
+  <!-- 操作日志（终端风格面板：Agent 渗透/流量分析/WebShell 操作实时刷屏） -->
+  <section class="panel" id="panel-logs">
+    <div style="display:flex;align-items:center;gap:10px;padding:5px 12px;background:#0c1016;border-bottom:1px solid #1e242e;flex-shrink:0">
+      <span style="color:#5cd67a;font-size:12px;font-weight:600;font-family:'Cascadia Code',Consolas,monospace">&gt;_ 操作日志</span>
+      <div style="margin-left:auto;display:flex;gap:6px">
+        <button id="btnLogPause" style="background:#1c222c;border:1px solid #2c3542;color:#8b98a8;cursor:pointer;padding:2px 12px;font-size:11px;border-radius:3px">暂停</button>
+        <button id="btnLogClear" style="background:#1c222c;border:1px solid #2c3542;color:#8b98a8;cursor:pointer;padding:2px 12px;font-size:11px;border-radius:3px">清屏</button>
+      </div>
+    </div>
+    <div id="logTerminal" style="flex:1;overflow:auto;background:#080b10;color:#c8d6e5;font:12px/1.6 'Cascadia Code',Consolas,monospace;padding:8px 14px;min-height:0"></div>
+  </section>
   <section class="panel" id="panel-settings">
     <div class="settings-grid">
       <div class="settings-col">
         <div class="settings-block-title">网络配置</div>
         <div class="settings-card">
-          <div class="row"><label>HTTPS 抓包证书</label>
+          <div class="row"><label>CA 证书</label>
             <button id="btnMitmCa">获取 CA 证书</button><button id="btnMitmInstall">一键安装 CA</button><span id="mitmState" class="hint"></span></div>
         </div>
         <div class="settings-card">
@@ -430,29 +466,30 @@
           <div class="row"><button id="btnTestLocal">验证本地 Hermes 访问</button><span id="hermesState" class="hint"></span></div>
         </div>
         <div class="settings-card">
-          <h3>LLM 模型管理</h3>
-          <p class="desc">管理多套 LLM 配置（端点/Key/模型/思考深度）。「设为默认」后 AI 助手任务使用该模型；「测试直连」验证端点/Key/模型可用（纯 HTTP）。「查看本地 Hermes 配置」直接读取本机 hermes 的 config.yaml 模型段（只读展示）。</p>
-          <div class="row"><select id="llmList" size="4" style="flex:2;background:#1c222c;border:1px solid #2c3542;color:#d7dde4">
-            <option value="">（无 LLM 配置）</option>
-          </select>
-            <div style="flex:1;display:flex;flex-direction:column;gap:4px">
-              <button id="btnLlmApply">设为默认</button>
-              <button id="btnLlmDelete">删除</button>
-              <button id="btnLlmTest">测试直连</button>
-              <button id="btnLocalHermes">查看本地 Hermes 配置</button>
-            </div></div>
-          <div class="row"><label>名称</label><input type="text" id="llmName" placeholder="如 DeepSeek 官方" style="flex:2"></div>
-          <div class="row"><label>API 端点</label><input type="text" id="llmBase" placeholder="https://api.deepseek.com/v1" style="flex:2"></div>
-          <div class="row"><label>Provider</label><input type="text" id="llmProvider" placeholder="deepseek / minimax（留空自动从端点推断）" style="flex:2"></div>
-          <div class="row"><label>API Key</label><input type="password" id="llmKey" placeholder="sk-..." style="flex:2"></div>
-          <div class="row"><label>模型名称</label><input type="text" id="llmModel" placeholder="deepseek-v4-flash" style="flex:2" list="modelList">
-            <datalist id="modelList"></datalist></div>
-          <div class="row"><label>思考深度</label><select id="llmReasoning" style="flex:2">
-            <option value="">默认</option><option value="none">none</option><option value="low">low</option>
-            <option value="medium">medium</option><option value="high">high</option>
-            <option value="xhigh">xhigh</option>
-          </select></div>
-          <div class="row"><button id="btnLlmSave">新增/保存</button><span id="llmState" class="hint"></span></div>
+          <h3>Agent 管理</h3>
+          <div id="roleCards" style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px">
+            <!-- 三角色卡片（JS 渲染）：第一行 执行官/审计员，第二行 审批官 -->
+          </div>
+          <div class="row"><span id="roleOpState" class="hint" style="flex:1"></span></div>
+        </div>
+        <!-- 角色模型编辑弹窗 -->
+        <div id="roleEditModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;align-items:center;justify-content:center">
+          <div style="background:#151a21;border:1px solid #2c3542;border-radius:8px;padding:18px 20px;width:380px;display:flex;flex-direction:column;gap:10px">
+            <div style="font-size:13px;font-weight:600;color:#d7dde4">编辑 <span id="roleEditTitle">角色</span> 模型配置</div>
+            <div class="row"><label style="width:70px">Provider</label><input type="text" id="roleEditProvider" placeholder="deepseek / minimax" style="flex:1"></div>
+            <div class="row"><label style="width:70px">API 端点</label><input type="text" id="roleEditBase" placeholder="https://api.deepseek.com/v1" style="flex:1"></div>
+            <div class="row"><label style="width:70px">API Key</label><input type="password" id="roleEditKey" placeholder="sk-..." style="flex:1"></div>
+            <div class="row"><label style="width:70px">模型</label><input type="text" id="roleEditModel" placeholder="deepseek-v4-flash" style="flex:1"></div>
+            <div class="row"><label style="width:70px">思考深度</label><select id="roleEditReasoning" style="flex:1">
+              <option value="">默认</option><option value="none">none</option><option value="low">low</option>
+              <option value="medium">medium</option><option value="high">high</option>
+              <option value="xhigh">xhigh</option>
+            </select></div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:4px">
+              <button id="btnRoleEditCancel" style="background:#1c222c;border:1px solid #2c3542;color:#8b98a8;cursor:pointer;padding:4px 16px;font-size:12px;border-radius:3px">取消</button>
+              <button id="btnRoleEditSave" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:4px 16px;font-size:12px;border-radius:3px">保存</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -733,12 +770,13 @@
       <div style="text-align:right;margin-top:16px"><button id="globalModalOk" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:5px 20px;font-size:12px;border-radius:4px">确定</button></div>
     </div>
   </div>
+<footer style="display:flex;align-items:center;gap:12px;padding:3px 14px 6px;background:#171b22;border-top:1px solid #262c36">
+  <span style="color:#5b6b7d;font-size:10px;letter-spacing:1px">@2026 HERMES OFFENSIVE STSETEN</span>
+  <button id="btnApprovalMode" style="margin-left:auto;background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:1px 10px;font-size:10px;border-radius:3px" title="渗透审批模式：智能=Agent 审批渗透意见与流量；手动=仅审计流量，不自动发送意见卡">渗透审批: 智能</button>
+  <span id="hermesAgent" style="font-size:11px;color:#5b6b7d">HERMES AGENT: <span id="hermesState" style="font-weight:700">ACTIVE</span></span>
+</footer>
 <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
 <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
 <script src="app.js"></script>
-<footer style="display:flex;align-items:center;gap:12px;padding:3px 14px 6px;background:#171b22;border-top:1px solid #262c36">
-  <span style="color:#5b6b7d;font-size:10px;letter-spacing:1px">@2026 HERMES OFFENSIVE STSETEN</span>
-  <span id="hermesAgent" style="margin-left:auto;font-size:11px;color:#5b6b7d">HERMES AGENT: <span id="hermesState" style="font-weight:700">ACTIVE</span></span>
-</footer>
 </body>
 </html>

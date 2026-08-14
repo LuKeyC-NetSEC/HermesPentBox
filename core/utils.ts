@@ -115,3 +115,5 @@ export function isPentboxOwnTraffic(detail?: unknown): boolean {
   const s = typeof detail === 'string' ? detail : JSON.stringify(detail ?? '')
   return /x-pentbox-source[":]?\s*["']?(webshell|repeater)/i.test(s)
 }
+
+// 规则层已移除（用户决定：纯 Agent 审批——破坏性判断全部交给审批官 Agent）

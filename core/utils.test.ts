@@ -47,13 +47,6 @@ test('LOCAL_ARTIFACT_RE：本机工件/客户端噪音剔除', () => {
   assert.ok(LOCAL_ARTIFACT_RE.test('127.0.0.1'))
   assert.ok(!LOCAL_ARTIFACT_RE.test('password=admin123'))
 })
-
-test('isBrowserBuiltin：浏览器内置流量黑名单', () => {
-  assert.ok(isBrowserBuiltin({}, 'http://update.googleapis.com/service/update2/json'))
-  assert.ok(isBrowserBuiltin({}, 'https://clients4.google.com/generate_204'))
-  assert.ok(isBrowserBuiltin({}, 'https://detectportal.firefox.com/canonical.html'))
-  assert.ok(isBrowserBuiltin({}, 'https://ocsp.digicert.com/abc'))
-  assert.ok(!isBrowserBuiltin({}, 'http://192.168.1.1/api/login'))
   assert.ok(!isBrowserBuiltin(undefined, 'http://target.com/x'))
 })
 

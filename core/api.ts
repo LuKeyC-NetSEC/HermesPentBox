@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { connect } from 'node:net'
-import { SOUL_PERSONA, SOUL_ANALYZER, USER_PROFILE } from './persona.ts'
+import { SOUL_PERSONA, SOUL_ANALYZER, SOUL_APPROVER, USER_PROFILE } from './persona.ts'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import v8 from 'node:v8'
@@ -100,6 +100,21 @@ interface DigestEntry {
 
 export class ApiServer {
   private server?: Server
+  /** 渗透审批模式：smart=Agent 审批渗透意见与渗透流量（自动意见卡 + 执行前审批）；manual=仅审计渗透流量，不自动发送意见卡（用户自主把关，规则硬拦截仍生效） */
+  private approvalMode: 'smart' | 'manual' = 'smart'
+  /** 渗透模式（三段式）：auto=全自动（Agent 负责全部渗透流程，意见卡自动渗透 + /pentest 全自动）；passive=被动（子 Agent 分析+意见卡，主 Agent 等用户沟通）；funnel=漏斗（子 Agent 纯流量审计不发意见卡，/pentest 全自动渗透+全局情报复合式渗透） */
+  private pentestMode: 'auto' | 'passive' | 'funnel' = 'passive'
+  /** 操作日志环形缓冲（终端日志面板：Agent 渗透/流量分析/WebShell 等关键操作；cap 2000 条） */
+  private logBuf: { seq: number; ts: number; level: 'info' | 'ok' | 'warn' | 'err'; msg: string }[] = []
+  private static readonly LOG_CAP = 2000
+  private logSeq = 0
+  /** 记录操作日志（缓冲 + SSE 实时推送 → 终端日志面板；seq 单调递增作增量游标） */
+  private log(level: 'info' | 'ok' | 'warn' | 'err', msg: string): void {
+    const entry = { seq: ++this.logSeq, ts: Date.now(), level, msg: String(msg).slice(0, 500) }
+    this.logBuf.push(entry)
+    if (this.logBuf.length > ApiServer.LOG_CAP) this.logBuf.splice(0, this.logBuf.length - ApiServer.LOG_CAP)
+    this.pushSse({ type: 'log', ...entry })
+  }
   private flows: FlowMeta[] = []
   private flowDetails = new Map<number, { reqHeaders: Record<string, string>; reqBody: string; resHeaders: Record<string, string>; resBody: string; reqRawHeaders: string[]; resRawHeaders: string[]; reqLine: string; resLine: string }>()
   private wsFlows: { ts: number; direction: 'sent' | 'received'; payload: string; length: number }[] = []
@@ -126,6 +141,11 @@ export class ApiServer {
   async start(): Promise<void> {
     // Neo4j Agent 情报图（完全替代全局情报 digest）
     this.graph.connect()
+    // 渗透审批模式（全局偏好，config.bin 持久化；默认智能）
+    this.approvalMode = ApiServer.readConfig().approvalMode === 'manual' ? 'manual' : 'smart'
+    // 渗透模式（三段式：全自动/被动/漏斗；全局偏好，config.bin 持久化；默认被动）
+    const cfgMode = ApiServer.readConfig().pentestMode
+    this.pentestMode = cfgMode === 'auto' || cfgMode === 'funnel' ? cfgMode : 'passive'
     this.probeHermes()
     setInterval(() => this.probeHermes(), 5000)  // HERMES AGENT 状态实时探测
     this.graph.setProject(this.projectKeyOf())  // Neo4j 图按项目域隔离（默认项目 → default）
@@ -134,6 +154,7 @@ export class ApiServer {
     this.sessionTimer = setInterval(() => this.queueSessionSave(), ApiServer.SESSION_AUTOSAVE_MS)  // Burp auto-save：定时异步快照
     void this.ensureHermesProfile()  // 自动确保 hermespentbox 独立档案（含 persona/用户画像；技能库在档案就绪后同步复制）
     void this.ensureAnalyzerProfile()  // 自动确保 hermespentbox-analyzer 审计员档案（流量分析子 Agent 专用）
+    void this.ensureApproverProfile()  // 自动确保 hermespentbox-approver 审批官档案（渗透审批 Agent 专用）
     this.startAnalyzeLoop()
     this.server = createServer((req, res) => void this.handle(req, res))
     await new Promise<void>((resolve, reject) => {
@@ -250,7 +271,7 @@ export class ApiServer {
     if (!found) { console.warn('[pentbox] pentbox_bridge.py 未找到，steer/对话桥接不可用'); return false }
     console.log('[pentbox] 启动 Agent Bridge broker…', found)
     this.bridgeProc = spawn(py, [found, '--port', String(this.bridgePort), '--hermes-home', this.hermesHome], {
-      env: { ...process.env, HERMES_HOME: this.hermesHome, PENTBOX_ANALYZER_HOME: this.analyzerHome, HERMES_AGENT_ROOT: join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent'), PENTBOX_BRIDGE_LOG: join(process.cwd(), 'core', 'pentbox_bridge.log') }, cwd: this.agentCwd, detached: true, stdio: 'ignore', windowsHide: true,
+      env: { ...process.env, HERMES_HOME: this.hermesHome, PENTBOX_ANALYZER_HOME: this.analyzerHome, PENTBOX_APPROVER_HOME: this.approverHome, HERMES_AGENT_ROOT: join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent'), PENTBOX_BRIDGE_LOG: join(process.cwd(), 'core', 'pentbox_bridge.log') }, cwd: this.agentCwd, detached: true, stdio: 'ignore', windowsHide: true,
     })
     this.bridgeProc.on('exit', () => { this.bridgeProc = null; this.bridgeReady = false })
     this.bridgeProc.unref()
@@ -320,6 +341,118 @@ export class ApiServer {
         }, 1000)
       })
     })
+  }
+
+  /** Agent 角色 → 档案映射（LLM 模型按角色独立管理：每个角色用自己档案的 config.yaml + .env） */
+  private agentRoles(): { role: string; cn: string; profile: string; home: string; desc: string }[] {
+    return [
+      { role: 'executor', cn: '执行官', profile: 'hermespentbox', home: this.hermesHome, desc: '主 Agent 对话 / 渗透执行' },
+      { role: 'analyzer', cn: '审计员', profile: 'hermespentbox-analyzer', home: this.analyzerHome, desc: '流量分析（10 槽并行）' },
+      { role: 'approver', cn: '审批官', profile: 'hermespentbox-approver', home: this.approverHome, desc: '渗透审批' },
+    ]
+  }
+
+  /** 读角色档案 config.yaml 的 model 段 + .env 的 <PROVIDER>_API_KEY（返回原始 key，展示层自行脱敏） */
+  private readRoleModel(home: string): { default: string; provider: string; base_url: string; api_key: string } | null {
+    try {
+      const cfgPath = join(home, 'config.yaml')
+      if (!existsSync(cfgPath)) return null
+      const text = readFileSync(cfgPath, 'utf8')
+      // 行解析 model 段（JS 正则无 \Z；档案 config 可能只有 model 段，段匹配会失败）
+      const lines = text.split(/\r?\n/)
+      let inModel = false
+      const seg: string[] = []
+      for (const l of lines) {
+        if (/^model:/.test(l)) { inModel = true; continue }
+        if (inModel && /^\S/.test(l)) break
+        if (inModel) seg.push(l)
+      }
+      const get = (k: string) => {
+        const line = seg.find((l) => l.trim().startsWith(`${k}:`))
+        if (!line) return ''
+        return line.split(':').slice(1).join(':').trim().replace(/^['"]|['"]$/g, '')
+      }
+      let apiKey = ''
+      try {
+        const envText = readFileSync(join(home, '.env'), 'utf8')
+        const keyName = `${get('provider').toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`
+        apiKey = envText.match(new RegExp(`^${keyName}=(.*)$`, 'm'))?.[1] ?? ''
+      } catch { /* 无 .env */ }
+      return { default: get('default'), provider: get('provider'), base_url: get('base_url'), api_key: apiKey, reasoning: get('reasoning') }
+    } catch (e) {
+      console.warn('[pentbox] 读取角色模型失败:', String(e).slice(0, 100))
+      return null
+    }
+  }
+
+  /** 应用模型到指定角色档案（hermes config set + .env 端点/key；HOME 覆盖到目标档案） */
+  private async applyModelToRole(home: string, body: { model: string; provider?: string; baseUrl?: string; apiKey?: string; reasoning?: string }): Promise<void> {
+    const provider = body.provider === 'minimax' ? 'minimax-cn' : body.provider  // Hermes 官方 provider 名（minimax-cn）
+    const env = { ...this.hermesEnv, HERMES_HOME: home }  // config set 写到目标角色档案
+    const cfg = (k: string, v: string) => new Promise<void>((resolve) => {
+      const child = spawn(this.hermesCli, ['config', 'set', k, v], { env, cwd: this.agentCwd, windowsHide: true })
+      child.on('close', () => resolve())
+    })
+    await cfg('model.default', body.model)
+    if (provider) await cfg('model.provider', provider)
+    if (body.reasoning) await cfg('model.reasoning', body.reasoning)
+    if (body.baseUrl) {
+      // 端点写 .env 的 OPENAI_BASE_URL（Hermes OpenAI 兼容约定；config.yaml 的 model.base_url 会与内置端点冲突）
+      const envPath = join(home, '.env')
+      let envText = existsSync(envPath) ? readFileSync(envPath, 'utf8') : ''
+      const re = /^OPENAI_BASE_URL=.*$/m
+      envText = re.test(envText) ? envText.replace(re, `OPENAI_BASE_URL=${body.baseUrl}`) : envText.trimEnd() + `\nOPENAI_BASE_URL=${body.baseUrl}\n`
+      writeFileSync(envPath, envText)
+    }
+    if (body.apiKey && provider) {
+      // 真实 key 写档案 .env（config set 对 key 值脱敏，必须走 <PROVIDER>_API_KEY 环境变量）
+      const keyName = `${provider.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`
+      const envPath = join(home, '.env')
+      let envText = existsSync(envPath) ? readFileSync(envPath, 'utf8') : ''
+      const re = new RegExp(`^${keyName}=.*$`, 'm')
+      envText = re.test(envText) ? envText.replace(re, `${keyName}=${body.apiKey}`) : envText.trimEnd() + `\n${keyName}=${body.apiKey}\n`
+      writeFileSync(envPath, envText)
+    }
+    // 清理 config.yaml 的 api_key/base_url 残留（key 与端点都走 .env；config set 写入的 key 会被脱敏成假值导致 401）
+    const cfgPath = join(home, 'config.yaml')
+    if (existsSync(cfgPath)) {
+      const text = readFileSync(cfgPath, 'utf8')
+      const clean = text.split(/\r?\n/).filter((l) => !/^\s*(api_key|base_url):/.test(l)).join('\n')
+      if (clean !== text) writeFileSync(cfgPath, clean)
+    }
+  }
+
+  /** 工具调用级审批（纯 Agent）：Agent/外部发起的 WebShell 命令/文件操作前过审批官；
+   * 用户手动操作（请求带 x-pentbox-user 标记头）免审直接执行 */
+  private async approveCommand(tool: string, target: string, command: string): Promise<{ allowed: boolean; reason: string }> {
+    try {
+      const prompt = `你是渗透操作审批官。审批以下工具调用是否安全合规（只判断，不执行任何操作）：\n【工具】${tool}\n【目标】${target || '(未知)'}\n【命令/操作】${String(command || '').slice(0, 1000)}\n\n重要：目标由用户指定并负责授权——不要以目标为保留域名/知名机构/内网公网/未知来源/范围外等任何理由拒绝；你只判断命令本身是否破坏性/不可逆（删除文件 rm -rf、删库/清空数据、格式化、写裸设备、fork bomb、关机重启、勒索加密、数据外泄管道 curl|nc 外传等）。常规只读/运维命令（ls/cat/whoami/id/pwd/netstat/ps/ifconfig/echo 等）与常规渗透验证命令一律批准。\n只输出一行 JSON：{"allowed": true或false, "reason": "简要理由"}`
+      const out = await this.bridgeAsk(prompt, null, {}, false, 'hermespentbox-approver')
+      const j = extractJson(out)
+      const allowed = j?.allowed === true || String(j?.allowed).toLowerCase() === 'true'
+      const reason = String(j?.reason || '').slice(0, 200)
+      this.log(allowed ? 'info' : 'warn', `[审批] ${allowed ? '✓ 批准' : '⛔ 拒绝'} ${tool} 命令: ${String(command || '').slice(0, 60)}${reason ? ' — ' + reason : ''}`)
+      return { allowed, reason: reason || (allowed ? '审批通过' : '审批 Agent 判定为破坏性操作') }
+    } catch (e) {
+      this.log('err', `[审批] ${tool} 命令审批失败（保守拒绝）: ${String((e as Error).message).slice(0, 100)}`)
+      return { allowed: false, reason: '审批 Agent 不可用，保守拒绝执行' }
+    }
+  }
+
+  /** 渗透审批（纯 Agent 语义判断）：审批官档案（hermespentbox-approver）独立灵魂配置判断是否安全合规；失败保守拒绝（安全优先） */
+  private async approvePenetration(targetKey: string, method: string, reqRaw: string, advice: string): Promise<{ allowed: boolean; reason: string }> {
+    try {
+      const prompt = `你是渗透操作审批官。审批以下渗透任务是否安全合规（只判断，不执行任何操作）：\n【目标】${targetKey || '(未知)'}\n【方式】${method || '(未知)'}\n【原始请求包】${(reqRaw || '').slice(0, 1500)}\n【任务描述】${(advice || '').slice(0, 500)}\n\n重要：目标由用户指定并负责授权——不要以目标为保留域名/知名机构/内网公网/未知来源/范围外等任何理由拒绝；你只判断操作本身是否破坏性/不可逆（删库/清空数据/删文件/格式化/勒索/数据外泄管道等）。只读验证与注入验证一律批准。\n只输出一行 JSON：{"allowed": true或false, "reason": "简要理由"}`
+      const out = await this.bridgeAsk(prompt, null, {}, false, 'hermespentbox-approver')
+      const j = extractJson(out)
+      const allowed = j?.allowed === true || String(j?.allowed).toLowerCase() === 'true'
+      const reason = String(j?.reason || '').slice(0, 200)
+      this.log(allowed ? 'info' : 'warn', `[审批] ${allowed ? '✓ 批准' : '⛔ 拒绝'} ${targetKey} · ${method}${reason ? ' — ' + reason : ''}`)
+      return { allowed, reason: reason || (allowed ? '审批通过' : '审批 Agent 判定为破坏性/越界操作') }
+    } catch (e) {
+      this.log('err', `[审批] Agent 审批失败（保守拒绝）: ${String((e as Error).message).slice(0, 100)}`)
+      return { allowed: false, reason: '审批 Agent 不可用，保守拒绝执行（安全优先）' }
+    }
   }
 
   /** 渗透经本地 Agent Bridge 执行（与主对话/分析同通道，会话可 steer；取消 = bridge interrupt） */
@@ -460,6 +593,11 @@ export class ApiServer {
       this.analyzeMap.set(id, { state: 'done', vuln: false, skipped: true, penetrate: true, detail, url })
       return
     }
+    // 全自动模式：无流量分析（子 Agent 不参与）——纯 /pentest {domain} 指令驱动主 Agent 渗透；流量照常捕获展示但不送子 Agent
+    if (this.pentestMode === 'auto') {
+      this.analyzeMap.set(id, { state: 'done', vuln: false, skipped: true, autoSkip: true, detail, url })
+      return
+    }
     this.analyzeMap.set(id, { state: 'queued', detail, url })
     this.analyzeQueue.push(id)
     // 站点地图同步到 Neo4j：进入审计的流量（非 builtin/self/404/5xx/渗透）≡ 站点地图可见项 → 写 Host-Api 节点（图上下文供 Agent 直接看到站点地图）
@@ -515,6 +653,9 @@ export class ApiServer {
   /** 流量分析子 Agent 独立档案（hermespentbox-analyzer）：审计员 persona + 用户画像 + 红队技能库，与主档案的「猎隼」角色分离 */
   private analyzerHome = join(homedir(), 'AppData', 'Local', 'hermes', 'profiles', 'hermespentbox-analyzer')
 
+  /** 渗透审批 Agent 独立档案（hermespentbox-approver）：审批官 persona（只判断安全合规，禁止破坏性操作） */
+  private approverHome = join(homedir(), 'AppData', 'Local', 'hermes', 'profiles', 'hermespentbox-approver')
+
   /** 确保独立档案存在：无 hermespentbox 档案则自动创建（clone 配置保留模型）并写入猎隼 persona + 用户画像 */
   private async ensureHermesProfile(): Promise<void> {
     try {
@@ -552,6 +693,26 @@ export class ApiServer {
       console.log('[pentbox] hermespentbox-analyzer 档案创建完成（审计员 SOUL + user.md + 技能库）')
     } catch (e) {
       console.error('[pentbox] 审计员档案创建失败:', String(e).slice(0, 200))
+    }
+  }
+
+  /** 确保渗透审批官档案（hermespentbox-approver）存在：审批官 persona + 用户画像 + 红队技能库（审批判断需识别渗透手法） */
+  private async ensureApproverProfile(): Promise<void> {
+    try {
+      if (existsSync(join(this.approverHome, 'SOUL.md'))) { this.ensureSkills(this.approverHome); return }  // 已就绪，兜底补技能库
+      console.log('[pentbox] hermespentbox-approver 档案不存在，自动创建…')
+      await new Promise<void>((resolve) => {
+        const child = spawn(this.hermesCli, ['profile', 'create', 'hermespentbox-approver', '--clone'], { env: this.hermesEnv, cwd: this.agentCwd, windowsHide: true })
+        child.on('close', () => resolve())
+      })
+      mkdirSync(this.approverHome, { recursive: true })
+      writeFileSync(join(this.approverHome, 'SOUL.md'), SOUL_APPROVER)
+      mkdirSync(join(this.approverHome, 'memories'), { recursive: true })
+      writeFileSync(join(this.approverHome, 'memories', 'user.md'), USER_PROFILE)
+      this.ensureSkills(this.approverHome)  // 档案就绪后立即复制技能库
+      console.log('[pentbox] hermespentbox-approver 档案创建完成（审批官 SOUL + user.md + 技能库）')
+    } catch (e) {
+      console.error('[pentbox] 审批官档案创建失败:', String(e).slice(0, 200))
     }
   }
 
@@ -669,14 +830,14 @@ export class ApiServer {
     ]
     if (ws.length) {
       lines.push(`· WebShell 管理（当前 ${ws.length} 个）：命令执行 POST http://localhost:8877/api/webshells/exec ，body={"id":N,"command":"cmd"} → {"ok":true,"output":"..."}（加解密握手已封装，密钥勿自行构造）`)
-      for (const w of ws.slice(0, 10)) lines.push(`   id=${w.id} | ${w.url} | ${w.type || 'custom'}/${w.script || '?'} | ${w.status || 'unknown'} | pass=${w.password ? '***' : '(空)'} key=${w.key ? '***' : '(空)'}`)
+      for (const w of ws.slice(0, 10)) lines.push(`   id=${w.id} | ${w.url} | ${w.type || 'behinder'}/${w.script || '?'} | ${w.status || 'unknown'} | pass=${w.password ? '***' : '(空)'} key=${w.key ? '***' : '(空)'}`)
     }
     lines.push('约束：以上接口仅用于读取情报、记录分析结论与执行命令；删除/覆盖现有数据属破坏性操作，须先征得用户同意。')
     return lines.join('\n') + '\n\n'
   }
 
   /** 子 Agent（流量分析槽）精简工具引导：分析中可主动查/写图（完整工具列表见主聊天 toolsHint） */
-  private static readonly SUB_TOOL_HINT = '【图工具】你可主动调 http://localhost:8877/api/graph/query（?format=json 得结构化，?host= 过滤主机）查全局情报图；发现需共享的情报用 POST /api/graph/note {"host":"..","path":"..","text":"..","level":"..."} 记录（凭据/敏感信息 level 标 high）。若上传了 WebShell，必须 POST /api/webshells 同步到应用（body={"type":"godzilla|behinder|antSword|custom","script":"php|jsp|asp|aspx","url":"..","password":"..","key":"..","cryption":"xor|aes|custom"}，同步后自动入图）。仅读取与记录，禁止删改。\n\n'
+  private static readonly SUB_TOOL_HINT = '【图工具】你可主动调 http://localhost:8877/api/graph/query（?format=json 得结构化，?host= 过滤主机）查全局情报图；发现需共享的情报用 POST /api/graph/note {"host":"..","path":"..","text":"..","level":"..."} 记录（凭据/敏感信息 level 标 high）。若上传了 WebShell，必须 POST /api/webshells 同步到应用（body={"type":"godzilla|behinder|antSword","script":"php|jsp|asp|aspx","url":"..","password":"..","key":"..","cryption":"xor|aes"}，同步后自动入图）。仅读取与记录，禁止删改。\n\n'
 
   private hermesChat(message: string, gctx?: string, hint?: string): Promise<string> {
     const mid = [gctx, hint].filter(Boolean).join('\n')
@@ -759,7 +920,9 @@ ${out}`
   private async hermesAnalyze(detail: unknown): Promise<{ vuln: boolean; level: string; sensitive: { type: string; value: string; level: string }[]; advice: string; slot: number }> {
     const d = (detail ?? {}) as Record<string, unknown>
     const digest = await this.digestPrompt()
-    const prompt = digest + ApiServer.SUB_TOOL_HINT + '分析以下 HTTP 流量（完整请求/响应）：\n1. 判断是否存在可利用的安全漏洞；\n2. 从报文中提取敏感信息/指纹/线索，type 必须从以下 HaENet 标签清单中精确选择（每个 type 自带固定危害等级；清单外的 type 禁止使用）：\n' + haeTagList() + '\n3. 若存在可利用漏洞（vuln=true），输出渗透意见 advice，格式必须为："经 Hermes 分析 <API路径> 可进行 <攻击方式> 渗透，是否进行"（攻击方式用具体手法：SQL 注入/未授权访问/SSRF/暴力破解/越权等）。注意：vuln=true 时 advice 必填，禁止输出空字符串。\n4. 结合【全局情报】去重：若情报中该 Host+完整路径+渗透方式已标记为已渗透过/正在渗透/已确认漏洞，则不要重复建议同一渗透（vuln 判定参考已有结论），改分析该流量的新增风险面；同目标的其他接口不受影响，正常分析。\n只输出一行 JSON，格式：{"vuln": true或false, "level": "high|medium|low|info", "sensitive": [{"type": "标签名", "value": "值"}], "advice": "渗透意见或空"}。level 为整体危害等级。无漏洞时 advice 为空字符串。\n\n【请求】\n' +
+    // 被动模式：点到为止——只需证明漏洞存在性，不深入利用分析
+    const depthNote = this.pentestMode === 'passive' ? '\n（被动模式：点到为止——只需判断并证明漏洞存在性即可（注入点/未授权/敏感信息可读），不要给出完整利用链、不要深入利用分析）' : ''
+    const prompt = digest + ApiServer.SUB_TOOL_HINT + depthNote + '分析以下 HTTP 流量（完整请求/响应）：\n1. 判断是否存在可利用的安全漏洞；\n2. 从报文中提取敏感信息/指纹/线索，type 必须从以下 HaENet 标签清单中精确选择（每个 type 自带固定危害等级；清单外的 type 禁止使用）：\n' + haeTagList() + '\n3. 若存在可利用漏洞（vuln=true），输出渗透意见 advice，格式必须为："经 Hermes 分析 <完整URL（协议+Host+完整路径+参数）> 可进行 <攻击方式> 渗透（<具体验证方式>），是否进行"。要求：攻击方式用具体手法（SQL 注入/未授权访问/SSRF/暴力破解/越权等）；具体验证方式必须写明用什么请求/payload 验证、预期证据（如"用 UNION SELECT 1,2 验证注入点存在"、"直接 GET 接口返回敏感数据"），并说明属只读验证不修改数据——审批官将依据这些信息做安全判断，信息不足会被拒绝。注意：vuln=true 时 advice 必填，禁止输出空字符串。\n4. 结合【全局情报】去重：若情报中该 Host+完整路径+渗透方式已标记为已渗透过/正在渗透/已确认漏洞，则不要重复建议同一渗透（vuln 判定参考已有结论），改分析该流量的新增风险面；同目标的其他接口不受影响，正常分析。\n只输出一行 JSON，格式：{"vuln": true或false, "level": "high|medium|low|info", "sensitive": [{"type": "标签名", "value": "值"}], "advice": "渗透意见或空"}。level 为整体危害等级。无漏洞时 advice 为空字符串。\n\n【请求】\n' +
       `${d.reqLine ?? ''}\n${((d.reqRawHeaders as string[]) ?? []).join('\n')}\n\n${d.reqBody ?? ''}\n\n【响应】\n${d.resLine ?? ''}\n${((d.resRawHeaders as string[]) ?? []).join('\n')}\n\n${String(d.resBody ?? '').slice(0, 4000)}`
     // 负载均衡：选当前最空闲的子 Agent 槽（最少连接算法），而非静态轮转
     // 渗透中的槽 + 已提出渗透意见卡待决策的槽 不接新流量分析（Agent 专注渗透/等待决策；取消/完成/卡片关闭后再恢复分配）
@@ -955,6 +1118,11 @@ ${out}`
     const u = st.url || ''
     const host = this.hostOf(u)
     const path = u.replace(/^https?:\/\/[^/]+/i, '') || ''
+    // 操作日志：分析完成（仅记录有结论的流量——漏洞/意见/敏感项；纯噪音不刷屏）
+    if (r.vuln || r.advice || (r.sensitive || []).length > 0) {
+      const tags = (r.sensitive || []).slice(0, 5).map((s) => s.type).join(', ')
+      this.log(r.vuln ? 'warn' : 'info', `[分析] ${host}${path} → ${r.vuln ? `疑似漏洞(${r.level})` : '无漏洞'}${r.advice ? ` · 建议:${(r.advice.match(/可进行\s*(.+?)\s*渗透/)?.[1] || '').slice(0, 20)}` : ''}${tags ? ` · 标签:${tags}` : ''}`)
+    }
     // 整合落图：分析结论挂到与站点地图相同的 Api 节点链上（Host→Api→ANALYZED→Analysis）
     if (host) {
       const dm = (st.detail as { reqLine?: string } | undefined)?.reqLine?.match(/^(\S+)/)
@@ -978,11 +1146,12 @@ ${out}`
       const tagMeta = HAE_TAGS[t]
       if (isCred) {
         this.pushDigest({ kind: 'cred', host: credHost, path, data: `${t}:${String(s.value).slice(0, 200)}`, persist: true, tag: t, group: tagMeta?.group, level: (s.level as DigestEntry['level']) || tagMeta?.level || 'high', color: tagMeta?.color })
-        // 凭据自动意见：攻击凭据是最高价值杠杆 → 自动推"凭据利用"意见卡（不打断分析）；静态资源不推（字段名≠真凭据，防误报刷屏）
-        if (u && !STATIC_RESOURCE_RE.test(u)) {
+        // 凭据自动意见：攻击凭据是最高价值杠杆 → 自动推"凭据利用"意见卡（不打断分析）；静态资源不推（字段名≠真凭据，防误报刷屏）；漏斗模式纯审计不发卡（被动/全自动均发卡，是否自动渗透由前端按审批开关决定）
+        if (this.pentestMode !== 'funnel' && u && !STATIC_RESOURCE_RE.test(u)) {
           const credKey = `${normalizeTargetKey(u)}|凭据利用`
           if (!this.advisedKeys.has(credKey) && !this.penetratedKeys.has(credKey) && !this.penetratingKeys.has(credKey)) {
-            this.pushSse({ type: 'analyze-advice', id, advice: `经 Hermes 分析 ${path || u} 可进行 凭据利用 渗透，是否进行`, level: s.level || 'high', slot: r.slot })
+            // 凭据卡带完整 URL（供渗透审批定位目标）+ 说明凭据利用属只读验证（审批官可判定为安全）
+            this.pushSse({ type: 'analyze-advice', id, url: u, advice: `经 Hermes 分析 ${u} 可进行 凭据利用 渗透（使用已捕获凭据做只读登录/接口访问验证，不修改任何数据），是否进行`, level: s.level || 'high', slot: r.slot })
             this.advisedKeys.add(credKey)
             this.pendingAdviceSlots.set(r.slot, Date.now())
           }
@@ -1002,13 +1171,14 @@ ${out}`
     // 渗透意见 → SSE 推送（前端 Hermes Agent 聊天框渲染意见卡：进行/取消/回复；slot 绑定提出意见的子 Agent，进行渗透由该子 Agent 执行）
     // 发卡去重（统一 key：normalizeTargetKey 规范化 Host+完整路径+查询 | 方式）：
     // 同 URL 同方式已推送过（advisedKeys）/ 已渗透过（penetratedKeys）/ 正在渗透（penetratingKeys）→ 不再推送；不同方式可再推
-    if (r.advice) {
+    // 漏斗模式：子 Agent 纯流量审计，不发送渗透意见卡（主 Agent 全自动渗透由 /pentest 指令驱动）；被动/全自动均发卡——是否自动渗透由前端按智能审批开关决定
+    if (this.pentestMode !== 'funnel' && r.advice) {
       const pm = r.advice.match(/可进行\s*(.+?)\s*渗透/)?.[1] || ''
       // 静态资源不推意见卡（防误报刷屏；凭据/分析结论仍入 digest）
       const isStatic = u ? STATIC_RESOURCE_RE.test(u) : false
       const key = u && !isStatic ? `${normalizeTargetKey(u)}|${pm}` : ''
       if (key && !this.advisedKeys.has(key) && !this.penetratedKeys.has(key) && !this.penetratingKeys.has(key)) {
-        this.pushSse({ type: 'analyze-advice', id, advice: r.advice, level: r.level, slot: r.slot })
+        this.pushSse({ type: 'analyze-advice', id, url: u, advice: r.advice, level: r.level, slot: r.slot })
         this.advisedKeys.add(key)
         this.pendingAdviceSlots.set(r.slot, Date.now())  // 提出卡片 → 暂停该槽流量分析（等用户决策渗透/取消/超时自动恢复）
       }
@@ -1095,6 +1265,7 @@ ${out}`
       chatSessionId: this.chatSessionId,     // 主 Agent bridge 会话续传（broker 独立进程，重启后可续传上下文）
       analyzeSlots: this.analyzeSlots,       // 10 个子 Agent 槽会话续传
       chatHistory: this.chatHistory,         // 主对话历史（Hermes Agent 聊天框，项目级）
+      logBuf: this.logBuf.slice(-ApiServer.LOG_CAP),  // 操作日志（终端面板；项目级，随快照持久化）
     }
   }
 
@@ -1222,6 +1393,11 @@ ${out}`
     }
     // 主对话历史（随项目恢复）
     if (Array.isArray(s.chatHistory)) this.chatHistory = (s.chatHistory as { role: 'user' | 'ai'; text: string; ts: number }[]).slice(-ApiServer.CHAT_HISTORY_CAP)
+    // 操作日志（随项目恢复；seq 继续单调递增）
+    if (Array.isArray(s.logBuf)) {
+      this.logBuf = (s.logBuf as { seq: number; ts: number; level: 'info' | 'ok' | 'warn' | 'err'; msg: string }[]).slice(-ApiServer.LOG_CAP)
+      this.logSeq = this.logBuf.reduce((m, x) => Math.max(m, x.seq), 0)
+    }
     // 上游：仅显式配置过才恢复（覆盖系统代理默认）
     if (s.upstream && (s.upstream as Upstream).type) { this.engine.setUpstream(s.upstream as Upstream); this.upstreamPersisted = s.upstreamPersisted === true }
     // 下游代理（随项目恢复；快照无下游 → 直连，防止切换项目残留旧项目配置）
@@ -1277,6 +1453,7 @@ ${out}`
     this.chatSessionId = null  // Agent 会话指针随项目隔离（切换项目后新建干净会话）
     this.analyzeSlots = new Array(ApiServer.MAX_PARALLEL).fill(null)
     this.chatHistory = []  // 主对话历史随项目隔离（打开项目后由快照恢复）
+    this.logBuf = []       // 操作日志随项目隔离（打开项目后由快照恢复）
     this.invalidateDigestCache()
     this.engine.restoreSeq(0)
     this.engine.clearAllPenetrateTargets()
@@ -1580,7 +1757,7 @@ ${out}`
           } else if (req.method === "POST") {
             const b = JSON.parse(await this.readBody(req));
             if (!b.url) throw new Error("url \u7F3A\u5931");
-            const w = { id: ++this.wsSeq, type: b.type || "custom", script: b.script || "php", url: b.url, password: b.password || "", key: b.key || "", status: "unknown", ts: Date.now(), cryption: b.cryption || "", payload: b.payload || "", encoding: b.encoding || "UTF-8", headers: b.headers || "", reqLeft: b.reqLeft || "", reqRight: b.reqRight || "", connTimeout: b.connTimeout || 3e3, readTimeout: b.readTimeout || 6e4, remark: b.remark || "" };
+            const w = { id: ++this.wsSeq, type: b.type === 'godzilla' || b.type === 'behinder' || b.type === 'antsword' ? b.type : 'behinder', script: b.script || "php", url: b.url, password: b.password || "", key: b.key || "", status: "unknown", ts: Date.now(), cryption: b.cryption || "", payload: b.payload || "", encoding: b.encoding || "UTF-8", headers: b.headers || "", reqLeft: b.reqLeft || "", reqRight: b.reqRight || "", connTimeout: b.connTimeout || 3e3, readTimeout: b.readTimeout || 6e4, remark: b.remark || "" };
             this.webshells.push(w);
             this.saveWebshells();
             this.graph.writeWebShell(w);
@@ -1676,7 +1853,14 @@ ${out}`
           if (!w) throw new Error("webshell \u4E0D\u5B58\u5728");
           let pms;
           if (b.action === "list") pms = { methodName: "getFile", dirName: b.dir || "/" };
-          else if (b.action === "delete") pms = { methodName: "deleteFile", fileName: b.file || "" };
+          else if (b.action === "delete") {
+            // 文件删除属不可逆操作：Agent/外部调用（无用户标记）过审批官；用户手动操作免审
+            if (!req.headers['x-pentbox-user']) {
+              const ap = await this.approveCommand('WebShell 文件删除', w.url, `delete ${b.file || ''}`)
+              if (!ap.allowed) { this.json(res, 200, { ok: false, error: `文件删除被审批拦截：${ap.reason}` }); break }
+            }
+            pms = { methodName: "deleteFile", fileName: b.file || "" };
+          }
           else if (b.action === "read") pms = { methodName: w.script === "php" ? "readFileContent" : "readFile", fileName: b.file || "" };
           else if (b.action === "write") pms = { methodName: "uploadFile", fileName: b.file || "", fileValue: Buffer.from(b.content || "", "base64") };
           else throw new Error("\u672A\u77E5\u64CD\u4F5C");
@@ -1708,6 +1892,7 @@ ${out}`
           const autoType = w.script === "jsp" || w.script === "jspx" ? "jsp" : w.script === "aspx" || w.script === "asp" ? "aspx" : "php";
           const ext = b.type === "jsp" ? "jsp" : b.type === "aspx" ? "aspx" : (b.type || autoType) === "jsp" ? "jsp" : (b.type || autoType) === "aspx" ? "aspx" : "php";
           const fn = (b.name || "suo5").replace(/[\\/]/g, "") + "." + ext;
+          this.log("info", `[WebShell] Suo5 正向代理部署 → ${b.url}（脚本 ${fn}）`);
           const scriptPath = join(process.cwd(), "tools", "suo5", fn);
           if (!existsSync(scriptPath)) throw new Error("\u670D\u52A1\u7AEF\u811A\u672C\u7F3A\u5931: " + scriptPath);
           const script = readFileSync(scriptPath);
@@ -1738,7 +1923,7 @@ ${out}`
           this.wsClient.clearCookies(b.url);
           const w = {
             id: 0,
-            type: (b.type || "custom").toLowerCase(),
+            type: (b.type === 'godzilla' || b.type === 'behinder' || b.type === 'antsword' ? b.type : 'behinder').toLowerCase(),
             script: (b.script || "php").toLowerCase(),
             url: b.url,
             password: b.password || "",
@@ -1758,6 +1943,12 @@ ${out}`
           const w = this.webshells.find((x) => x.id === b.id);
           if (!w) throw new Error("webshell \u4E0D\u5B58\u5728");
           if (!b.command) throw new Error("command \u7F3A\u5931");
+          // 工具调用级审批：Agent/外部调用（无 x-pentbox-user 标记）过审批官；用户手动输入（带标记）免审
+          if (!req.headers['x-pentbox-user']) {
+            const ap = await this.approveCommand('WebShell', w.url, b.command)
+            if (!ap.allowed) { this.json(res, 200, { ok: false, error: `工具调用被审批拦截：${ap.reason}` }); break }
+          }
+          this.log("info", `[WebShell] 执行命令: ${b.command.slice(0, 60)} @ ${w.url}`);
           try {
             const out = await this.wsClient.execShell(w, b.command);
             this.json(res, 200, { ok: true, output: out });
@@ -1872,6 +2063,7 @@ ${out}`
             }
           }
           this.json(res, 200, { ok: true, code, script: outScript, payload, note: `${type === "godzilla" ? payload + " \xB7 " : ""}${mode}${b.evasion ? " \xB7 \u514D\u6740" : ""}` });
+          this.log("ok", `[WebShell] 生成 ${type}/${outScript}${b.evasion ? "（Agent 免杀）" : ""} · 模式 ${mode}`);
           break;
         }
     }
@@ -1889,6 +2081,25 @@ ${out}`
       if (url.pathname.startsWith('/api/webshells')) return await this.handleWebshells(req, res, url)
       if (url.pathname.startsWith('/api/upstream') || url.pathname.startsWith('/api/downstream') || url.pathname.startsWith('/api/listen') || url.pathname.startsWith('/api/session') || url.pathname.startsWith('/api/proxy/stop')) return await this.handleConfig(req, res, url)
       switch (url.pathname) {
+        case '/api/approval/mode': {
+          // 渗透审批模式：smart=Agent 审批渗透意见与流量；manual=仅审计流量不自动发卡（用户自主把关）
+          if (req.method === 'PUT') {
+            const b = JSON.parse(await this.readBody(req)) as { mode?: string }
+            this.approvalMode = b.mode === 'manual' ? 'manual' : 'smart'
+            ApiServer.writeConfig({ approvalMode: this.approvalMode })
+            this.log('info', `[审批] 审批模式切换: ${this.approvalMode === 'smart' ? '智能（Agent 审批渗透意见与流量）' : '手动（仅审计流量，不自动发意见卡）'}`)
+          }
+          this.json(res, 200, { mode: this.approvalMode })
+          break
+        }
+        case '/api/logs': {
+          // 终端日志面板：增量拉取（after=上一条 seq；环形缓冲尾部兜底）
+          const after = Number(url.searchParams.get('after')) || 0
+          const limit = Math.min(Number(url.searchParams.get('limit')) || 300, 1000)
+          const items = after > 0 ? this.logBuf.filter((x) => x.seq > after) : this.logBuf.slice(-limit)
+          this.json(res, 200, { items, seq: this.logSeq })
+          break
+        }
         case '/api/graph/query': {
           // Agent 主动查图：默认返回图情报文本（与注入格式一致）；?format=json 返回结构化对象；?host= 只看该主机
           const fmt = url.searchParams.get('format') === 'json' ? 'json' : 'text'
@@ -2291,6 +2502,7 @@ ${out}`
             const v: Vuln = { id: ++this.vulnSeq, name: b.name ?? '未命名漏洞', level: (['high', 'medium', 'low', 'info'].includes(b.level as string) ? b.level : 'info') as Vuln['level'], cvss: b.cvss ?? '', uri: b.uri ?? '', desc: b.desc ?? '', exploit: b.exploit ?? '', status: (b.status === 'confirmed' || b.status === 'false') ? b.status : 'pending', reqRaw: b.reqRaw ?? '', resRaw: b.resRaw ?? '', ts: Date.now() }
             this.vulns.push(v)
             this.saveVulns()
+            this.log('ok', `[漏洞] 新增 ${v.name}(${v.level}) ${v.uri || '(无 URI)'}`)
             // 漏洞入图（Agent 共享）
             const { host, path } = this.splitVulnUri(v.uri)
             if (host && path) { this.graph.writeVuln({ name: v.name, level: v.level, desc: v.desc, host, path, exploit: v.exploit, color: HAE_LEVEL_COLOR[v.level] }); this.invalidateDigestCache(); this.broadcastGraphChange(`新漏洞(${v.level}) ${host}${path}: ${v.name}`) }
@@ -2315,6 +2527,7 @@ ${out}`
             if (b.reqRaw !== undefined) v.reqRaw = b.reqRaw
             if (b.resRaw !== undefined) v.resRaw = b.resRaw
             this.saveVulns()
+            this.log(b.status === 'confirmed' ? 'ok' : 'info', `[漏洞] 更新 #${v.id} ${v.name}${b.status ? ` → ${b.status === 'false' ? '误报' : b.status === 'confirmed' ? '已确认' : '待验证'}` : ''} ${v.uri || ''}`)
             // 漏洞更新同步入图
             const { host, path } = this.splitVulnUri(v.uri)
             if (host && path) { this.graph.writeVuln({ name: v.name, level: v.level, desc: v.desc, host, path, exploit: v.exploit, color: HAE_LEVEL_COLOR[v.level] }); this.invalidateDigestCache(); this.broadcastGraphChange(`漏洞更新(${v.level}) ${host}${path}: ${v.name}`) }
@@ -2323,6 +2536,7 @@ ${out}`
             const vd = this.vulns.find((x) => x.id === id)
             this.vulns = this.vulns.filter((x) => x.id !== id)
             this.saveVulns()
+            this.log('warn', `[漏洞] 删除 #${id} ${vd?.name || ''} ${vd?.uri || ''}`)
             // 漏洞从图移除
             if (vd) {
               const { host, path } = this.splitVulnUri(vd.uri)
@@ -2417,11 +2631,134 @@ ${out}`
           this.json(res, 200, { path: cfgPath, model: { default: get('default'), provider: get('provider'), base_url: get('base_url'), api_key: apiKey } })
           break
         }
+        // ---------------- 角色模型管理（以角色为角度：执行官/审计员/审批官 各自独立的模型配置，写各自档案 config.yaml + .env） ----------------
+        case '/api/roles/model': {
+          if (req.method === 'POST') {
+            const b = JSON.parse(await this.readBody(req)) as { role?: string; model?: string; provider?: string; baseUrl?: string; apiKey?: string; reasoning?: string }
+            const r = this.agentRoles().find((x) => x.role === b.role)
+            if (!r) throw new Error(`未知角色: ${b.role}`)
+            if (!b.model) throw new Error('model 缺失')
+            await this.applyModelToRole(r.home, { model: b.model, provider: b.provider, baseUrl: b.baseUrl, apiKey: b.apiKey, reasoning: b.reasoning })
+            // Agent 管理持久化：三角色模型配置同步写入全局配置（config.bin）——应用侧持久副本（hermes 档案 config.yaml/.env 为运行时配置）
+            const agentModels: Record<string, { model: string; provider: string; baseUrl: string; apiKey: string; reasoning: string }> = {}
+            for (const rr of this.agentRoles()) {
+              const m = this.readRoleModel(rr.home)
+              agentModels[rr.role] = { model: m?.default || '', provider: m?.provider || '', baseUrl: m?.base_url || '', apiKey: m?.api_key || '', reasoning: m?.reasoning || '' }
+            }
+            ApiServer.writeConfig({ agentModels })
+            this.log('info', `[模型] ${r.cn}（${r.profile}）模型已更新: ${b.model}${b.provider ? ' · ' + b.provider : ''}${b.reasoning ? ' · 推理 ' + b.reasoning : ''}（已写入持久化）`)
+            this.json(res, 200, { ok: true, role: r.role, model: b.model })
+          } else {
+            const roles = this.agentRoles().map((r) => {
+              const m = this.readRoleModel(r.home)
+              return { role: r.role, cn: r.cn, profile: r.profile, desc: r.desc, model: m ? { ...m, api_key: m.api_key ? (m.api_key.length > 12 ? m.api_key.slice(0, 7) + '...' + m.api_key.slice(-4) : '***') : '' } : null }
+            })
+            this.json(res, 200, { roles })
+          }
+          break
+        }
+        // 测试指定角色的模型直连（读角色档案配置 + .env 原始 key）
+        case '/api/roles/model/test': {
+          const b = JSON.parse(await this.readBody(req)) as { role?: string }
+          const r = this.agentRoles().find((x) => x.role === b.role)
+          if (!r) throw new Error(`未知角色: ${b.role}`)
+          const m = this.readRoleModel(r.home)
+          if (!m?.default) throw new Error(`角色「${r.cn}」未配置模型`)
+          const baseUrl = m.base_url || (m.provider === 'minimax-cn' ? 'https://api.minimaxi.com/v1' : m.provider === 'deepseek' ? 'https://api.deepseek.com/v1' : '')
+          if (!baseUrl) throw new Error(`角色「${r.cn}」端点未配置（provider: ${m.provider || '未配置'}）`)
+          const rr = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', authorization: `Bearer ${m.api_key}` },
+            body: JSON.stringify({ model: m.default, messages: [{ role: 'user', content: 'ping' }], max_tokens: 4 }),
+            signal: AbortSignal.timeout(15000),
+          })
+          const j = await rr.json().catch(() => ({}))
+          if (!rr.ok) throw new Error(j.error?.message ?? j.error ?? `HTTP ${rr.status}`)
+          this.json(res, 200, { ok: true, role: r.role, model: j.model ?? m.default })
+          break
+        }
+        // 拉取指定角色的可用模型列表（调 {baseUrl}/models，Bearer key 鉴权；供前端角色卡片展示与切换）
+        case '/api/roles/model/list': {
+          const b = JSON.parse(await this.readBody(req)) as { role?: string }
+          const r = this.agentRoles().find((x) => x.role === b.role)
+          if (!r) throw new Error(`未知角色: ${b.role}`)
+          const m = this.readRoleModel(r.home)
+          if (!m?.api_key) throw new Error(`角色「${r.cn}」未配置 API Key`)
+          const baseUrl = m.base_url || (m.provider === 'minimax-cn' ? 'https://api.minimaxi.com/v1' : m.provider === 'deepseek' ? 'https://api.deepseek.com/v1' : '')
+          if (!baseUrl) throw new Error(`角色「${r.cn}」端点未配置`)
+          const rr = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
+            headers: { authorization: `Bearer ${m.api_key}` },
+            signal: AbortSignal.timeout(15000),
+          })
+          const j = await rr.json().catch(() => ({}))
+          if (!rr.ok) throw new Error(j.error?.message ?? j.error ?? `HTTP ${rr.status}`)
+          const ids = Array.isArray(j.data) ? j.data.map((x: { id?: string }) => x.id ?? '').filter(Boolean) : []
+          this.json(res, 200, { ok: true, role: r.role, models: ids, current: m.default })
+          break
+        }
+        // 重置指定角色的模型配置（清空 model 段 + .env key/端点；回到未配置状态）
+        case '/api/pentest/mode': {
+          // 渗透模式三段式：auto=全自动 / passive=被动（默认） / funnel=漏斗
+          if (req.method === 'PUT') {
+            const b = JSON.parse(await this.readBody(req)) as { mode?: string }
+            this.pentestMode = b.mode === 'auto' || b.mode === 'funnel' ? b.mode : 'passive'
+            ApiServer.writeConfig({ pentestMode: this.pentestMode })
+            const label = this.pentestMode === 'auto' ? '全自动（Agent 负责全部渗透流程）' : this.pentestMode === 'funnel' ? '漏斗（子 Agent 纯审计，主 Agent 复合式全自动渗透）' : '被动（子 Agent 分析+意见卡，主 Agent 等用户沟通）'
+            this.log('info', `[模式] 渗透模式切换: ${label}`)
+          }
+          this.json(res, 200, { mode: this.pentestMode })
+          break
+        }
+        // 全自动渗透（/pentest {domain} 指令入口）：主 Agent 全自动执行完整渗透 + 全局情报复合（全自动/漏斗模式可用）
+        case '/api/pentest/auto': {
+          const b = JSON.parse(await this.readBody(req)) as { domain?: string }
+          const domain = String(b.domain || '').trim().replace(/^https?:\/\//, '').replace(/\/+$/, '')
+          if (!domain) throw new Error('domain 缺失')
+          if (this.pentestMode === 'passive') throw new Error('被动模式不执行全自动渗透（请切换到 全自动/漏斗 模式）')
+          const modeLabel = this.pentestMode === 'auto' ? '全自动' : '漏斗'
+          // 所有模式统一过审批官审计（规则层 + 审批 Agent）：全自动渗透任务亦须审批
+          const approve = await this.approvePenetration(domain, '全自动渗透', '', `对 ${domain} 执行${modeLabel}渗透（结合全局情报复合式验证）`)
+          if (!approve.allowed) {
+            this.log('warn', `[渗透] 🚀 ${modeLabel}渗透被审批拦截: ${domain} — ${approve.reason}`)
+            this.json(res, 200, { started: false, blocked: true, reason: approve.reason, reply: `渗透被审批拦截：${approve.reason}` })
+            break
+          }
+          this.log('info', `[渗透] 🚀 ${modeLabel}渗透启动: ${domain}`)
+          this.json(res, 200, { started: true, mode: this.pentestMode, domain })
+          ;(async () => {
+            try {
+              const digest = await this.digestPrompt()
+              const task = `${digest}\n\n（${modeLabel}渗透任务，授权范围内）对目标 ${domain} 执行完整渗透流程：\n1. 站点侦察：DNS/端口/Web 指纹/常见路径/JS 分析\n2. 结合【全局情报】中该主机的已有发现（API/漏洞/凭据/WebShell/渗透状态）复合式利用\n3. 逐个接口验证可利用漏洞，最终输出【VULNDOC】结构化漏洞文档（标题/危害等级/漏洞描述/复现步骤/修复建议/漏洞目标/漏洞路由/原始请求包/原始响应包，格式与子 Agent 一致）\n4. 若渗透过程中上传了 WebShell，立即用 POST http://localhost:8877/api/webshells 同步（body={"type":"godzilla|behinder|antSword","script":"php|jsp|asp|aspx","url":"完整 shell 地址","password":"连接密码","key":"密钥","cryption":"xor|aes"}）\n严格要求：只针对目标 ${domain} 及其子域；禁止破坏性/不可逆操作（删库/清空数据/删文件/格式化/勒索）；禁止输出 JSON 代码，全部文字描述；验证充分后立即结束。`
+              const reply = await this.runViaGateway(task, this.chatSessionId || null, () => { /* 主会话执行 */ })
+              const parsed = parseVulndoc(reply, '', '')
+              if (parsed) {
+                const v: Vuln = { id: ++this.vulnSeq, name: parsed.name, level: parsed.level, cvss: '', uri: parsed.uri, desc: parsed.desc, exploit: parsed.exploit, status: 'pending', reqRaw: parsed.reqRaw, resRaw: parsed.resRaw, ts: Date.now() }
+                this.vulns.push(v)
+                this.saveVulns()
+                this.log('ok', `[渗透] 🚀 ${modeLabel}渗透成果: ${v.name}(${v.level}) ${v.uri}`)
+                this.pushSse({ type: 'vuln-doc', vuln: { id: v.id, name: v.name, level: v.level, desc: v.desc, exploit: v.exploit, ts: v.ts } })
+              } else {
+                this.log('info', `[渗透] 🚀 ${modeLabel}渗透完成（无 VULNDOC 成果）: ${domain}`)
+              }
+              this.pushSse({ type: 'pentest-auto-done', domain, reply })
+            } catch (e) {
+              this.log('err', `[渗透] 🚀 ${modeLabel}渗透失败: ${String((e as Error).message).slice(0, 150)}`)
+              this.pushSse({ type: 'pentest-auto-done', domain, reply: `（${modeLabel}渗透失败：${(e as Error).message}）` })
+            }
+          })()
+          break
+        }
+        // 全自动模式意见卡 → 主 Agent 全自动渗透单目标（区别于漏斗的 /pentest domain 级：意见驱动、接口级、主 Agent 会话执行完整渗透）
         // ---------------- 渗透执行（对应子 Agent 执行：resume 提出意见的子 Agent 槽位会话；有成果→解析【VULNDOC】写漏洞库 + SSE 推送主 Agent 汇报） ----------------
         case '/api/penetrate': {
           const body = JSON.parse(await this.readBody(req)) as { advice?: string; slot?: number; reqRaw?: string; resRaw?: string; id?: number }
           if (!body.advice) throw new Error('advice 缺失')
           const slot = typeof body.slot === 'number' && body.slot >= 0 && body.slot < ApiServer.MAX_PARALLEL ? body.slot : 0
+          // 补全请求包：自动渗透（未显式传 reqRaw）时从流量详情拼接（id 为流量 id）——审批官需要完整报文判断
+          if (!body.reqRaw && typeof body.id === 'number') {
+            const d = this.analyzeMap.get(body.id)?.detail as { reqLine?: string; reqRawHeaders?: string[]; reqBody?: string } | undefined
+            if (d) body.reqRaw = `${d.reqLine || ''}\n${(d.reqRawHeaders || []).join('\n')}\n\n${d.reqBody || ''}`
+          }
           // 渗透前查重：从原始请求包提取目标（Host+路径）+ advice 提取渗透方式；同 API 同方式已渗透过/正在渗透 → 不重复执行
           // P0：targetKey 用 normalizeTargetKey 统一规范化（与发卡/成果写入格式一致）
           const rawT = (body.reqRaw || '').match(/^\S+\s+(\S+)\s+HTTP\/1\.[01]\r?\n(?:[^\r\n]*\r?\n)*?Host:\s*(\S+)/i)
@@ -2435,6 +2772,13 @@ ${out}`
           const penKey = targetKey ? `${targetKey}|${method}` : ''
           if (penKey && (this.penetratedKeys.has(penKey) || this.penetratingKeys.has(penKey))) {
             this.json(res, 200, { started: false, slot, reply: `该目标API渗透方式已进行过 不再重复渗透（${targetKey} ${method}）` })
+            break
+          }
+          // ---- 渗透审批（审批 Agent + 规则硬拦截双保险）：禁止删库等破坏性/不可逆操作 ----
+          const approve = await this.approvePenetration(targetKey || '', method, body.reqRaw || '', body.advice)
+          if (!approve.allowed) {
+            this.log('warn', `[渗透] ⛔ 被审批拦截: ${targetKey || '(目标未知)'} · ${method} — ${approve.reason}`)
+            this.json(res, 200, { started: false, blocked: true, slot, reason: approve.reason, reply: `渗透被审批拦截：${approve.reason}` })
             break
           }
           const sess = this.analyzeSlots[slot]
@@ -2451,13 +2795,16 @@ ${out}`
           const tkHost = targetKey ? targetKey.split(':')[0] : ''
           const tkPath = targetKey ? targetKey.replace(/^[^/]+/, '') : ''
           this.pushDigest({ kind: 'penetrating', host: tkHost || '', path: tkPath, data: `正在渗透（${pm2 || method}），由槽 ${slot} 执行`, persist: true })
+          this.log('info', `[渗透] 槽${slot} 开始: ${targetKey || '(目标未知)'} · 方式: ${pm2 || method}`)
           // 异步执行：立即返回（前端不再同步等待 4 分钟），完成经 SSE 推送 penetrate-done 更新任务/沟通窗口
           this.json(res, 200, { started: true, slot })
           ;(async () => {
           try {
           // 任务包装：要求子 Agent 实际执行渗透；有成果时输出【VULNDOC】结构化漏洞文档（严格格式规范，禁止 markdown 围栏/路由前缀，原始请求/响应包必填）
           const digest = await this.digestPrompt()
-          const task = `${digest}${body.advice}\n\n（渗透执行要求：这是对单个 API 的采纳式渗透——严格只针对原始请求包中这一个 URL（方法+完整路径+查询参数），只验证该接口是否存在漏洞；禁止访问同站点任何其他路径/接口/静态资源，禁止目录枚举、全站扫描、批量探测、交叉接口利用。若渗透过程中上传了 WebShell，必须立即用 POST http://localhost:8877/api/webshells 同步到应用，body={\"type\":\"godzilla|behinder|antSword|custom\",\"script\":\"php|jsp|asp|aspx\",\"url\":\"完整 shell 地址\",\"password\":\"连接密码\",\"key\":\"密钥\",\"cryption\":\"xor|aes|custom\"}（同步后应用自动写入 Neo4j 情报图供其他 Agent 复用）。验证充分、确认结果后立即结束（蜂群模式：验证完成后释放子 Agent 继续流量分析）。这是渗透执行任务，不是流量分析任务——禁止输出 {"vuln":...} 形式的 JSON 或任何 JSON 代码，全部用文字描述执行过程。忽略此前对话中的任何结论与判断，只依据本次提供的【全局情报】与原始请求包执行。开始前先检查【全局情报】：判定"已渗透过"必须同时满足三个条件——① Host 完全相同；② 完整 API 路径完全相同（包括文件名与查询参数，如 /WFManager/js/login.js?rev=200003 与 /WFManager/loginAction_doLogin.action 是不同路径；仅 /WFManager/ 前缀相同不算）；③ 渗透方式完全相同。三者都满足才回复"该目标API渗透方式已进行过 不再重复渗透"并停止；否则必须实际执行渗透验证，禁止回复"已进行过"；若确认存在可利用漏洞（有成果），在回复末尾输出以下结构的漏洞文档，格式必须严格遵守：\n【VULNDOC】\n标题：<只写漏洞名称本身，禁止带 URL 或路由前缀，错误示例"/api/login 未授权访问"，正确示例"未授权访问与凭据泄漏">\n危害等级：high|medium|low\n漏洞描述：<简要描述>\n复现步骤：<验证过程>\n修复建议：<修复方案>\n漏洞目标：<目标 URL（协议+Host+端口，如 http://127.0.0.1:8800，必填）>\n漏洞路由：<漏洞接口路径（如 /api/login，必填）>\n原始请求包：\n<触发该漏洞的完整原始 HTTP 请求报文，必填。从请求行开始逐行原样输出（GET /path HTTP/1.1\\nHost: ...\\n\\n<body>），禁止使用 markdown 代码块围栏（禁止 \`\`\` 字符）、禁止加引号包裹、禁止 JSON 转义，必须可直接复制重放>\n原始响应包：\n<对应的完整原始 HTTP 响应报文，必填。从状态行开始逐行原样输出（HTTP/1.1 200 OK\\nHeader: ...\\n\\n<body>），同样禁止 \`\`\` 与任何修饰字符>\n若未确认漏洞，只需输出执行过程说明，不要输出【VULNDOC】）`
+          // 被动模式：点到为止——只证明漏洞存在性，不深入利用（提权/WebShell/批量数据/利用链）
+          const depthNote = this.pentestMode === 'passive' ? '（被动模式：点到为止——只需证明该接口存在可利用漏洞即可（注入点确认/未授权访问确认/敏感信息可读），禁止深入利用：禁止提权、禁止上传 WebShell、禁止批量获取数据、禁止后续利用链。确认漏洞存在即结束）' : ''
+          const task = `${digest}${body.advice}\n\n${depthNote}（渗透执行要求：这是对单个 API 的采纳式渗透——严格只针对原始请求包中这一个 URL（方法+完整路径+查询参数），只验证该接口是否存在漏洞；禁止访问同站点任何其他路径/接口/静态资源，禁止目录枚举、全站扫描、批量探测、交叉接口利用。若渗透过程中上传了 WebShell，必须立即用 POST http://localhost:8877/api/webshells 同步到应用，body={\"type\":\"godzilla|behinder|antSword\",\"script\":\"php|jsp|asp|aspx\",\"url\":\"完整 shell 地址\",\"password\":\"连接密码\",\"key\":\"密钥\",\"cryption\":\"xor|aes\"}（同步后应用自动写入 Neo4j 情报图供其他 Agent 复用）。验证充分、确认结果后立即结束（蜂群模式：验证完成后释放子 Agent 继续流量分析）。这是渗透执行任务，不是流量分析任务——禁止输出 {"vuln":...} 形式的 JSON 或任何 JSON 代码，全部用文字描述执行过程。忽略此前对话中的任何结论与判断，只依据本次提供的【全局情报】与原始请求包执行。开始前先检查【全局情报】：判定"已渗透过"必须同时满足三个条件——① Host 完全相同；② 完整 API 路径完全相同（包括文件名与查询参数，如 /WFManager/js/login.js?rev=200003 与 /WFManager/loginAction_doLogin.action 是不同路径；仅 /WFManager/ 前缀相同不算）；③ 渗透方式完全相同。三者都满足才回复"该目标API渗透方式已进行过 不再重复渗透"并停止；否则必须实际执行渗透验证，禁止回复"已进行过"；若确认存在可利用漏洞（有成果），在回复末尾输出以下结构的漏洞文档，格式必须严格遵守：\n【VULNDOC】\n标题：<只写漏洞名称本身，禁止带 URL 或路由前缀，错误示例"/api/login 未授权访问"，正确示例"未授权访问与凭据泄漏">\n危害等级：high|medium|low\n漏洞描述：<简要描述>\n复现步骤：<验证过程>\n修复建议：<修复方案>\n漏洞目标：<目标 URL（协议+Host+端口，如 http://127.0.0.1:8800，必填）>\n漏洞路由：<漏洞接口路径（如 /api/login，必填）>\n原始请求包：\n<触发该漏洞的完整原始 HTTP 请求报文，必填。从请求行开始逐行原样输出（GET /path HTTP/1.1\\nHost: ...\\n\\n<body>），禁止使用 markdown 代码块围栏（禁止 \`\`\` 字符）、禁止加引号包裹、禁止 JSON 转义，必须可直接复制重放>\n原始响应包：\n<对应的完整原始 HTTP 响应报文，必填。从状态行开始逐行原样输出（HTTP/1.1 200 OK\\nHeader: ...\\n\\n<body>），同样禁止 \`\`\` 与任何修饰字符>\n若未确认漏洞，只需输出执行过程说明，不要输出【VULNDOC】）`
           const reply = await this.runViaGateway(task, sess, (abort) => { this.penetrateChildren.set(slot, abort) })  // 渗透经本地 gateway 执行（取消 = WebSocket abort，参考 hermes-studio chat-run）
           this.penetrateChildren.delete(slot)
           this.penetrateTargets.delete(slot)  // 渗透正常完成：清除目标记录（取消记录只由 cancel 路径写入全局情报）
@@ -2477,6 +2824,7 @@ ${out}`
           if (parsed) {
             const level = parsed.level
             const uri = parsed.uri
+            this.log('ok', `[渗透] ✓ 确认漏洞(${level}) ${uri} · ${parsed.name}`)
             // 复现步骤写入利用信息（exploit）；desc 只含漏洞描述 + 修复建议（不重复）
             const v: Vuln = { id: ++this.vulnSeq, name: parsed.name, level, cvss: '', uri, desc: parsed.desc, exploit: parsed.exploit, status: 'pending', reqRaw: parsed.reqRaw, resRaw: parsed.resRaw, ts: Date.now() }
             this.vulns.push(v)
@@ -2513,8 +2861,10 @@ ${out}`
             }
           }
           this.pushSse({ type: 'penetrate-done', slot, reply, vulnDoc: !!parsed })  // 异步完成通知（前端更新任务/沟通窗口）
+          if (!parsed) this.log('info', `[渗透] 槽${slot} 完成: ${targetKey || '(目标未知)'} · 未确认漏洞`)
           }
           } catch (e) {
+            this.log('err', `[渗透] 槽${slot} 执行失败: ${(e as Error).message.slice(0, 120)}`)
             this.pushSse({ type: 'penetrate-done', slot, reply: `（渗透执行失败：${(e as Error).message}）`, vulnDoc: false })
           } finally {
             this.penetrating = false  // 结束渗透窗口（无论成败都恢复审计）
@@ -2543,6 +2893,8 @@ ${out}`
         case '/api/penetrate/cancel': {
           const body = JSON.parse(await this.readBody(req)) as { slot?: number }
           const slot = typeof body.slot === 'number' ? body.slot : -1
+          const target = this.penetrateTargets.get(slot)
+          this.log('warn', `[渗透] 槽${slot} 已取消: ${target || '(目标未知)'}`)
           const child = this.penetrateChildren.get(slot)
           if (typeof child === 'function') {
             // gateway 模式：发 abort 信号（优雅停止，参考 hermes-studio chat-run）

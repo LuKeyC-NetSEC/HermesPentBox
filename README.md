@@ -1,19 +1,22 @@
 # HermesPentBox
 
-AI-powered local pentest workbench. Browser traffic flows through a built-in MITM proxy into an agent swarm that analyzes, advises, and executes single-endpoint exploitation — fully offline, integrated with the Hermes agent.
+> **README Version: [English](README.md) | [简体中文](README_cn.md)**
+
+AI-powered local pentest workbench. Browser traffic flows through a built-in MITM proxy into an agent swarm that audits, advises, and executes exploitation — fully offline, integrated with the Hermes agent.
 
 > For authorized security testing only.
 
 ## Features
 
 - **Traffic** — HTTP/HTTPS MITM capture, WebSocket frames, site map synced to Neo4j
-- **Analysis** — 10 parallel sub-agents audit traffic: vulnerability detection, credential extraction, Nday hints
-- **Exploitation** — one-click single-endpoint verification; results auto-written to the vulnerability library
-- **Shared intelligence** — Neo4j session graph (hosts/APIs/vulns/credentials/shells) shared across agents with same-target dedup
-- **WebShell** — generate, connect, virtual terminal, file manager, Suo5 forward proxy (Godzilla / Behinder / AntSword / custom)
-- **Proxy chain** — upstream proxy + Burp-style downstream proxy (HTTP/SOCKS5)
-- **Browser control** — one-click Chrome CDP / Firefox takeover
-- **Projects** — Burp-style project files: binary snapshots with auto-save, project management, per-project data isolation
+- **Agent swarm** — 10 parallel sub-agents audit traffic: vulnerability detection, credential extraction, Nday hints
+- **Three pentest modes** — Auto (main-agent full pentest via `/pentest`), Passive (advice cards, user-decided), Funnel (pure audit + compound exploitation)
+- **Approval officer** — dedicated approver agent audits every penetration & tool call (any target allowed; destructive ops always rejected)
+- **Role-based model management** — executor / auditor / approver each with independent LLM model config
+- **WebShell** — generate, connect, virtual terminal, file manager, Suo5 forward proxy (Godzilla / Behinder / AntSword)
+- **Proxy chain** — upstream + downstream proxy (HTTP/SOCKS5)
+- **Projects** — Burp-style binary snapshot files, auto-save every 10s, per-project isolation
+- **Operation log** — terminal-style panel recording all agent actions
 
 ## Quick Start
 
@@ -35,18 +38,18 @@ Requirements: Node.js 24+ and Hermes CLI with a configured model.
 
 ```
 Browser ──► MITM Proxy (8899) ──► Traffic panel / Site map (Neo4j)
-                 │  analysis queue (10 sub-agents)
+                 │  analysis queue (sub-agents: auditor profile)
                  ▼
           Advice cards ──► Agent Bridge (28766) ──► Hermes AIAgent
-                 │
+                 │                                   (executor / approver profiles)
                  ▼
           Vulnerability library (project snapshot)
 ```
 
-## Stack
-
-Electron · Node.js · esbuild · Neo4j · xterm.js · Hermes Agent · V8 binary project snapshots
-
 ## Compliance
 
-For authorized security testing only (SRC / bug bounty / self-hosted labs). You are solely responsible for having legal authorization for every target.
+For authorized security testing only. You are solely responsible for having legal authorization for every target.
+
+## License
+
+[MIT](LICENSE)

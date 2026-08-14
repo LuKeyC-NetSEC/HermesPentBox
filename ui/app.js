@@ -14,14 +14,45 @@ function setAppTitle(panel) {
     : base
 }
 
+// ---- 渗透模式三段式开关（全自动/被动/漏斗） ----
+let pentestMode = 'passive'
+let pendingAutoPen = null  // /pentest 全自动渗透状态（SSE pentest-auto-done 更新）
+let autoPenRunning = false  // 全自动模式意见卡自动渗透串行保护
+const PENTEST_MODE_LABEL = { auto: '全自动', passive: '被动', funnel: '漏斗' }
+function renderPentestModeSwitch() {
+  document.querySelectorAll('#pentestModeSwitch [data-pentest-mode]').forEach((btn) => {
+    const active = btn.dataset.pentestMode === pentestMode
+    btn.style.background = active ? '#1e3a5f' : 'transparent'
+    btn.style.color = active ? '#4fc3f7' : '#8b98a8'
+    btn.style.fontWeight = active ? '600' : '400'
+  })
+}
+async function loadPentestMode() {
+  try {
+    const r = await fetch(`${API}/api/pentest/mode`).then((x) => x.json())
+    pentestMode = r.mode === 'auto' || r.mode === 'funnel' ? r.mode : 'passive'
+  } catch { /* 保持默认 */ }
+  renderPentestModeSwitch()
+}
+document.querySelectorAll('#pentestModeSwitch [data-pentest-mode]').forEach((btn) => {
+  btn.onclick = async () => {
+    pentestMode = btn.dataset.pentestMode
+    renderPentestModeSwitch()
+    try {
+      await fetch(`${API}/api/pentest/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: pentestMode }) })
+    } catch { /* 切换失败下次重试 */ }
+  }
+})
+loadPentestMode()
+
 document.querySelectorAll('nav button').forEach((btn) => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('nav button').forEach((b) => b.classList.remove('active'))
     document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'))
     btn.classList.add('active')
     document.getElementById('panel-' + btn.dataset.panel).classList.add('active')
-    // 设置面板时隐藏左侧 Hermes Agent 对话框（设置界面不需要聊天框）
-    document.getElementById('aiChat').style.display = btn.dataset.panel === 'settings' ? 'none' : 'flex'
+    // 设置/日志面板铺满整个窗口（隐藏左侧 Hermes Agent 对话框）
+    document.getElementById('aiChat').style.display = (btn.dataset.panel === 'settings' || btn.dataset.panel === 'logs') ? 'none' : 'flex'
     setAppTitle(btn.dataset.panel)
     if (btn.dataset.panel === 'vulns') loadVulns()  // 切到漏洞面板时拉最新列表（Agent/外部可能已增改）
     if (btn.dataset.panel === 'webshell') { loadWsList(); setTimeout(() => { try { wsTermFit.fit() } catch { /* 容器刚显示 */ } }, 100) }  // 切到 WebShell 面板时拉列表 + 终端自适应
@@ -209,6 +240,22 @@ function refreshAiSendBtn() {
 }
 // 运行中监听输入变化切换 Steer/Stop
 aiInput.addEventListener('input', refreshAiSendBtn)
+// ---- "/" 命令提示（全自动/漏斗模式）：输入 "/" 时输入框上方显示 /pentest 选项 ----
+const aiCmdHint = document.getElementById('aiCmdHint')
+function updateAiCmdHint() {
+  const v = aiInput.value.trim()
+  const show = (pentestMode === 'auto' || pentestMode === 'funnel') && v.startsWith('/')
+  aiCmdHint.style.display = show ? 'block' : 'none'
+}
+aiInput.addEventListener('input', updateAiCmdHint)
+document.getElementById('aiCmdPentest').onclick = () => {
+  aiInput.value = '/pentest '
+  aiInput.focus()
+  const len = aiInput.value.length
+  aiInput.setSelectionRange(len, len)  // 光标移到末尾（用户补域名）
+  updateAiCmdHint()
+  refreshAiSendBtn()
+}
 function setAiSendBtn(running) {
   refreshAiSendBtn()
 }
@@ -217,6 +264,23 @@ async function aiSend() {
   const selIds = [...selFlowIds].filter((id) => smSelFlowIds.has(id) || !deletedFlowIds.has(id))  // 站点地图选中的可发（含假删除）；流量表选中的过滤假删除
   const selN = selIds.length
   if (!msg && !selN && !selVulnIds.size) return
+  // /pentest {domain} 指令：全自动渗透（全自动/漏斗模式；被动模式拒绝）
+  const penCmd = msg && msg.match(/^\/pentest\s+(\S+)/)
+  if (penCmd) {
+    if (pentestMode === 'passive') {
+      addAiMsg('ai', '被动模式不执行全自动渗透（请切换到 全自动/漏斗 模式）', false)
+      return
+    }
+    const domain = penCmd[1].replace(/^https?:\/\//, '').replace(/\/+$/, '')
+    addAiMsg('user', `/pentest ${domain}`)
+    const th = addAiMsg('ai', `🚀 ${PENTEST_MODE_LABEL[pentestMode]}渗透启动：${domain}…`, false)
+    try {
+      const r = await fetch(`${API}/api/pentest/auto`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ domain }) }).then((x) => x.json())
+      if (!r.ok) { th.textContent = `启动失败：${r.error || ''}`; return }
+      pendingAutoPen = { domain, el: th }
+    } catch (e) { th.textContent = '启动失败：' + e.message }
+    return
+  }
   // busy 并发保护：快速连发时消息入队（不丢弃、不产生假"思考中"气泡），当前轮结束后自动发送
   if (aiBusy) {
     if (msg && !selN && !selVulnIds.size) {
@@ -300,7 +364,7 @@ async function aiSend() {
     const wsSelItems = wsItems.filter((x) => wsSelSet.has(x.id))
     const fullWs = await Promise.all(wsSelItems.map((x) => fetch(`${API}/api/webshells/detail?id=${x.id}`).then((r) => r.json()).catch(() => null)))
     const wsBlocks = fullWs.filter(Boolean).map((w, i) =>
-      `【WebShell ${i + 1}】\nid：${w.id}\n类型：${w.type || 'custom'}\n脚本：${w.script || ''}\nURL：${w.url || ''}\n密码：${w.password || ''}\n密钥：${w.key || ''}\n加密方式：${w.cryption || ''}\nPayload：${w.payload || ''}\n状态：${w.status || 'unknown'}\n备注：${w.remark || '(无)'}\n${wsConnInfo(w)}\n执行命令方式（推荐）：直接调用本应用已实现的 WebShell 命令接口——POST http://localhost:8877/api/webshells/exec ，body 为 {"id": ${w.id}, "command": "<要执行的命令>"}，返回 {"ok":true,"output":"命令输出"}。该接口已封装完整加密/握手协议，请优先使用它执行命令或读取主机信息，不要自行用 execute_code 重复实现加密协议（会因协议细节/密钥为空而失败）。${!w.key ? '注意：该 WebShell 密钥字段未填写，自行构造加密请求必然失败；务必使用上述应用 exec 接口（应用已保存连接配置）。' : ''}`)
+      `【WebShell ${i + 1}】\nid：${w.id}\n类型：${w.type || '未知'}\n脚本：${w.script || ''}\nURL：${w.url || ''}\n密码：${w.password || ''}\n密钥：${w.key || ''}\n加密方式：${w.cryption || ''}\nPayload：${w.payload || ''}\n状态：${w.status || 'unknown'}\n备注：${w.remark || '(无)'}\n${wsConnInfo(w)}\n执行命令方式（推荐）：直接调用本应用已实现的 WebShell 命令接口——POST http://localhost:8877/api/webshells/exec ，body 为 {"id": ${w.id}, "command": "<要执行的命令>"}，返回 {"ok":true,"output":"命令输出"}。该接口已封装完整加密/握手协议，请优先使用它执行命令或读取主机信息，不要自行用 execute_code 重复实现加密协议（会因协议细节/密钥为空而失败）。${!w.key ? '注意：该 WebShell 密钥字段未填写，自行构造加密请求必然失败；务必使用上述应用 exec 接口（应用已保存连接配置）。' : ''}`)
     const wsInfo = wsBlocks.join('\n\n')
     const constraint = '\n\n（安全约束：你必须严格遵守 OffSec 规范，仅在授权范围内开展安全测试。严禁进行破坏性/敏感操作，例如删除服务器上原有的文件、格式化磁盘、篡改业务数据、造成服务中断等。若需操作文件，只允许新增/修改由本次测试产生的临时文件，并保持可还原。）'
     prompt = (msg ? prompt + '\n\n' : '以下是选中的 WebShell 会话信息，请基于它们继续：\n\n') + wsInfo + constraint
@@ -1248,7 +1312,7 @@ async function loadWsList() {
     el.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:6px">
         <span style="font-size:12px;font-weight:600;color:${selected ? '#f7a35c' : active ? '#4fc3f7' : '#d8e0ea'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(host)}</span>
-        <span style="flex-shrink:0;font-size:10px;color:${w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8'};background:${(w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8')}1a;border:1px solid ${(w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8')}55;padding:0 5px;border-radius:3px">${w.type || 'custom'}</span>
+        <span style="flex-shrink:0;font-size:10px;color:${w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8'};background:${(w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8')}1a;border:1px solid ${(w.type === 'godzilla' ? '#f76b6b' : w.type === 'behinder' ? '#f0b35c' : '#8b98a8')}55;padding:0 5px;border-radius:3px">${w.type || '未知'}</span>
       </div>
       <div style="margin-top:4px;font-size:11px;color:#8b98a8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(w.url || '-')}</div>
       <div style="margin-top:4px;font-size:10px;color:#66788a">${w.script || ''} · ${w.status === 'alive' ? '<span style="color:#5cd67a">● alive</span>' : w.status === 'dead' ? '<span style="color:#f76b6b">● dead</span>' : '<span style="color:#8b98a8">● unknown</span>'}</div>
@@ -1292,8 +1356,11 @@ async function loadWsList() {
   renderAiSelBar()
 }
 function showWsDetail(w) {
-  document.getElementById('wsCurTitle').textContent = `${w.type || 'custom'} · ${w.url || ''}`
+  document.getElementById('wsCurTitle').textContent = `${w.type || '未知'} · ${w.url || ''}`
   wsOut.innerHTML = `<div style="color:#66788a;font-size:11px">选择下方输入框执行命令，或点击 Ping 测试存活。</div>\n\n# ${esc(w.url || '')}\n`
+  // 掉线/未知状态：虚拟终端/文件管理/正向代理区域覆盖显示"WebShell 已掉线"（避免连接卡住）
+  const ov = document.getElementById('wsDeadOverlay')
+  if (ov) ov.style.display = (w.status === 'dead' || w.status === 'unknown') ? 'flex' : 'none'
 }
 // 新建/编辑弹窗（按类型动态显示字段）
 const wsModal = document.getElementById('wsModal')
@@ -1307,7 +1374,7 @@ function applyWsType(type) {
   // 字段组容器用 block（子 div 各自是 flex 行，避免 flex-direction 默认 row 导致字段横排成一行）
   gf.style.display = type === 'godzilla' ? 'block' : 'none'
   bf.style.display = type === 'behinder' ? 'block' : 'none'
-  cuf.style.display = (type === 'custom' || type === 'antsword') ? 'block' : 'none'
+  cuf.style.display = (type === 'antsword') ? 'block' : 'none'
   cf.style.display = 'block'
   title.textContent = type === 'godzilla' ? '添加 WebShell · 哥斯拉' : type === 'behinder' ? '添加 WebShell · 冰蝎' : type === 'antsword' ? '添加 WebShell · 蚁剑' : '添加 WebShell · 自定义'
 }
@@ -1391,7 +1458,7 @@ document.getElementById('btnWsEdit').onclick = () => {
   if (curWsId == null) return
   const w = wsItems.find((x) => x.id === curWsId)
   if (!w) return
-  document.getElementById('wsType').value = w.type || 'custom'
+  document.getElementById('wsType').value = w.type || 'behinder'
   document.getElementById('wsScript').value = w.script || 'php'
   document.getElementById('wsScript2').value = w.script || 'php'
   document.getElementById('wsScriptCustom').value = w.script || 'php'
@@ -1408,7 +1475,7 @@ document.getElementById('btnWsEdit').onclick = () => {
   document.getElementById('wsHeaders').value = w.headers || ''
   wsModal.dataset.editId = curWsId
   applyGodzillaScript(w.script || 'php')
-  applyWsType(w.type || 'custom')
+  applyWsType(w.type || 'behinder')
   clearWsError()
   wsModal.style.display = 'flex'
 }
@@ -1509,7 +1576,7 @@ document.getElementById('btnWsModalSave').onclick = async () => {
 document.getElementById('btnWsDel').onclick = async () => {
   if (curWsId == null) return
   if (!confirm('确认删除该 WebShell？')) return
-  await fetch(`${API}/api/webshells/${curWsId}`, { method: 'DELETE' })
+  await fetch(`${API}/api/webshells/detail?id=${curWsId}`, { method: 'DELETE' })
   curWsId = null
   loadWsList()
 }
@@ -1641,7 +1708,7 @@ document.getElementById('btnSuo5Stop').onclick = async () => {
 // 文件管理：执行命令获取原始输出（不渲染到终端）
 async function wsExecRaw(cmd) {
   if (curWsId == null) return ''
-  const r = await fetch(`${API}/api/webshells/exec`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: curWsId, command: cmd }) }).then((x) => x.json())
+  const r = await fetch(`${API}/api/webshells/exec`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-pentbox-user': '1' }, body: JSON.stringify({ id: curWsId, command: cmd }) }).then((x) => x.json())
   return r.output || r.result || ''
 }
 // 用 sh -c 执行命令：适配 JSP/冰蝎 的 exec 是参数数组（Runtime.exec 不解析 shell 语法，引号/重定向/管道会被当字面参数）
@@ -1678,11 +1745,10 @@ function wsConnInfo(w) {
     return `连接协议：冰蝎（脚本 ${s}），密钥=md5(密码)前16`
   }
   if (t === 'antsword') return `连接协议：蚁剑，POST ${w.url || ''}?id=1，body=shell=base64(要执行的 PHP 代码)（服务端 @eval(base64_decode($_POST["shell"]))）`
-  if (t === 'custom') return `连接协议：自定义一句话，GET ${w.url || ''}?pwd=${w.password || 'pass'}&cmd=<命令>（pwd 为访问口令，cmd 为要执行的命令）`
   return `连接协议：类型 ${t} / 脚本 ${s} / URL ${w.url || ''}`
 }
 async function wsFileOp(action, params) {
-  const r = await fetch(`${API}/api/webshells/fileop`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: curWsId, action, ...params }) }).then((x) => x.json())
+  const r = await fetch(`${API}/api/webshells/fileop`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-pentbox-user': '1' }, body: JSON.stringify({ id: curWsId, action, ...params }) }).then((x) => x.json())
   return r.output || ''
 }
 // 解析哥斯拉 getFile 输出：ok\n<path>\n<name>\t<isFile1/0>\t<time>\t<size>\t<perm>\n...
@@ -2117,7 +2183,19 @@ function flushFlowBuf() {
 }
 es.onmessage = (e) => {
   const f = JSON.parse(e.data)
-  if (f.type === 'analyze-advice') { renderAdviceCard(f); return }  // 子 Agent 渗透意见 → 聊天框意见卡
+  if (f.type === 'log') { appendLog(f); return }  // 操作日志（终端面板实时刷屏）
+  if (f.type === 'analyze-advice') {
+    // 意见卡去向：被动模式 → 智能审批开=子 Agent 自动渗透，关=渲染意见卡用户决策；全自动/漏斗模式后端不发卡（全自动无子 Agent 分析）
+    if (pentestMode === 'passive' && approvalMode === 'smart') { autoPenetrate(f); return }
+    renderAdviceCard(f); return
+  }  // 子 Agent 渗透意见 → 聊天框意见卡
+  if (f.type === 'pentest-auto-done') {
+    // /pentest 全自动渗透完成：更新启动气泡
+    const text = f.reply || `🚀 ${f.domain} 渗透完成`
+    if (pendingAutoPen) { pendingAutoPen.el.textContent = text; pendingAutoPen = null }
+    else addAiMsg('ai', text, false)
+    return
+  }
   if (f.type === 'vuln-doc') {
     // 有漏洞成果：用成果卡替换原渗透建议卡（同 API 路径匹配；成果卡不做超时删除，常驻可点击查详情）
     const vpath = (f.vuln.uri || '').replace(/^https?:\/\/[^/]+/i, '')
@@ -2238,6 +2316,20 @@ function renderAdviceCard(a) {
       const r = await fetch(`${API}/api/penetrate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ advice: a.advice, slot: a.slot, reqRaw, resRaw, id: a.id }) }).then((x) => x.json())
       think.remove()
       if (!r.started) {
+        // 审批拦截（破坏性操作/审批 Agent 拒绝）：删任务条 + 卡片显示拦截原因
+        if (r.blocked) {
+          aiTasks.delete(t.id)
+          renderAiTasks()
+          for (const w of document.querySelectorAll('#aiChatMsgs [data-role="ai"]')) {
+            if (t.advice && w.textContent.includes(t.advice.slice(0, 20))) {
+              const st = [...w.querySelectorAll('div')].find((d) => d.textContent.includes('已确认进行渗透') || d.textContent.includes('渗透执行中'))
+              if (st) { st.textContent = '⛔ 渗透被审批拦截：' + (r.reason || '破坏性/不可逆操作') }
+              setTimeout(() => { w.style.transition = 'opacity .5s'; w.style.opacity = '0'; setTimeout(() => w.remove(), 600) }, 8000)
+              break
+            }
+          }
+          return
+        }
         // 后端查重拒绝（该目标API渗透方式已进行过）：删任务条 + 意见卡状态改为"已有其他Agent渗透历史 自动跳过"
         aiTasks.delete(t.id)
         renderAiTasks()
@@ -2523,17 +2615,7 @@ document.getElementById('btnTestLocal').onclick = async () => {
     st.textContent = '工作台 API 不可达'
   }
 }
-// 查看本地 Hermes LLM 配置（只读 config.yaml）
-document.getElementById('btnLocalHermes').onclick = async () => {
-  const st = document.getElementById('llmState')
-  st.textContent = '读取中…'
-  try {
-    const r = await fetch(`${API}/api/hermes/local-config`)
-    const j = await r.json()
-    if (j.model) st.textContent = `本地 Hermes 模型: ${j.model.default}（provider: ${j.model.provider}${j.model.base_url ? ' @ ' + j.model.base_url : ''}，api_key: ${j.model.api_key || '无'}）`
-    else st.textContent = '失败: ' + (j.error || '')
-  } catch (e) { st.textContent = '读取异常: ' + e.message }
-}
+// 查看本地 Hermes LLM 配置（只读 config.yaml）——已并入角色模型管理（角色卡片展示），移除独立入口
 // 上游
 document.getElementById('btnSaveUp').onclick = async () => {
   const type = document.getElementById('setUpType').value
@@ -2614,143 +2696,129 @@ document.getElementById('btnEval').onclick = async () => {
   evalOut.textContent = '> ' + expression + '\n' + JSON.stringify(j.result ?? j.error ?? j, null, 2)
 }
 
-// ---- 远程 LLM 配置管理（已移除：SSH 方式被否决；改为 gateway 原生运行时模型覆盖，见 Hermes 对接卡片） ----
+// ================= 角色模型管理（每张角色卡片完整：配置文件/Provider/可用模型数 + 可用模型列表 + 编辑/删除） =================
+const ROLE_META = {
+  executor: { cn: '执行官', desc: '主对话/渗透执行' },
+  analyzer: { cn: '审计员', desc: '流量分析' },
+  approver: { cn: '审批官', desc: '渗透审批' },
+}
+let roleModels = {}   // role -> {role, cn, profile, desc, model}
+let roleLists = {}    // role -> {models: string[], current: string, count}
+let roleOpTarget = 'executor'  // 当前编辑/删除目标角色
 
-// ================= LLM 管理（参考 hermes-studio models store：多 LLM 配置 CRUD + 默认） =================
-// settings.llms: [{name, baseUrl, apiKey, model, reasoning, isDefault}]
-function llms() { return loadSettings().llms || [] }
-function saveLlms(list) { saveSettings({ llms: list }) }
-function renderLlms() {
-  const sel = document.getElementById('llmList')
-  const list = llms()
-  sel.innerHTML = ''
-  if (!list.length) {
-    const opt = document.createElement('option')
-    opt.value = ''
-    opt.textContent = '（无 LLM 配置）'
-    sel.appendChild(opt)
-    return
-  }
-  for (const [i, l] of list.entries()) {
-    const opt = document.createElement('option')
-    opt.value = String(i)
-    opt.textContent = `${l.isDefault ? '★ ' : ''}${l.name} — ${l.model}${l.reasoning ? ' [' + l.reasoning + ']' : ''}`
-    sel.appendChild(opt)
-  }
-}
-function llmFormValue() {
-  return {
-    name: document.getElementById('llmName').value.trim(),
-    baseUrl: document.getElementById('llmBase').value.trim(),
-    apiKey: document.getElementById('llmKey').value.trim(),
-    model: document.getElementById('llmModel').value.trim(),
-    provider: document.getElementById('llmProvider').value.trim(),
-    reasoning: document.getElementById('llmReasoning').value,
-  }
-}
-// Provider 推断：显式值优先，否则按端点域名（deepseek/minimax 等）
-function llmProviderOf(l) {
-  if (l.provider) return l.provider === 'minimax' ? 'minimax-cn' : l.provider  // Hermes 官方名 minimax-cn
-  const b = (l.baseUrl || '').toLowerCase()
-  if (b.includes('minimax')) return 'minimax-cn'
-  if (b.includes('deepseek')) return 'deepseek'
-  if (b.includes('openai')) return 'openai'
-  if (b.includes('anthropic')) return 'anthropic'
-  if (b.includes('moonshot')) return 'moonshot'
-  if (b.includes('siliconflow')) return 'siliconflow'
-  return ''
-}
-function llmFillForm(l) {
-  document.getElementById('llmName').value = l.name || ''
-  document.getElementById('llmBase').value = l.baseUrl || ''
-  document.getElementById('llmKey').value = l.apiKey || ''
-  document.getElementById('llmModel').value = l.model || ''
-  document.getElementById('llmProvider').value = l.provider || ''
-  document.getElementById('llmReasoning').value = l.reasoning || ''
-}
-function defaultLlm() { return llms().find((l) => l.isDefault) || llms()[0] }
-document.getElementById('btnLlmSave').onclick = () => {
-  const v = llmFormValue()
-  if (!v.name || !v.baseUrl || !v.model) { document.getElementById('llmState').textContent = '名称/端点/模型必填'; return }
-  const list = llms()
-  const idx = Number(document.getElementById('llmList').value)
-  if (Number.isInteger(idx) && list[idx]) list[idx] = { ...list[idx], ...v }
-  else list.push(v)
-  saveLlms(list)
-  renderLlms()
-  document.getElementById('llmState').textContent = '已保存'
-  document.getElementById('llmKey').value = '' // 防留明文
-}
-document.getElementById('llmList').onchange = () => {
-  const idx = Number(document.getElementById('llmList').value)
-  const l = llms()[idx]
-  if (l) llmFillForm(l)
-}
-document.getElementById('btnLlmDelete').onclick = () => {
-  const idx = Number(document.getElementById('llmList').value)
-  if (!Number.isInteger(idx)) return
-  const list = llms()
-  list.splice(idx, 1)
-  saveLlms(list)
-  renderLlms()
-  document.getElementById('llmState').textContent = '已删除'
-}
-document.getElementById('btnLlmApply').onclick = async () => {
-  const idx = Number(document.getElementById('llmList').value)
-  if (!Number.isInteger(idx)) return
-  const list = llms()
-  for (const l of list) l.isDefault = false
-  list[idx].isDefault = true
-  saveLlms(list)
-  renderLlms()
-  document.getElementById('llmState').textContent = `已设为默认：${list[idx].name}`
-  // 同步写入 hermespentbox 档案 config.yaml（模型/端点/Key 全量；应用 Agent 实际使用该配置）
+async function loadRoleModels() {
   try {
-    const llm = list[idx]
-    await fetch(`${API}/api/llms/set-default`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: llm.model, provider: llmProviderOf(llm), baseUrl: llm.baseUrl, apiKey: llm.apiKey }) })
-  } catch { /* 写入失败不影响本地 */ }
-
+    const r = await fetch(`${API}/api/roles/model`).then((x) => x.json())
+    roleModels = {}
+    for (const x of (r.roles || [])) roleModels[x.role] = x
+  } catch { /* 拉取失败 */ }
+  renderRoleCards()
+  loadRoleLists()
 }
-// 加载时：从 hermespentbox 档案 config 拉当前模型，无本地默认则用档案配置
-;(async () => {
-  try {
-    const r = await fetch(`${API}/api/hermes/local-config`)
-    const j = await r.json()
-    const cur = j.model?.default
-    if (cur && !llms().some((l) => l.isDefault)) {
-      const list = llms()
-      const hit = list.find((l) => l.model === cur) || list[0]
-      if (hit) {
-        for (const l of list) l.isDefault = false
-        hit.isDefault = true
-        saveLlms(list)
-        renderLlms()
-        document.getElementById('llmState').textContent = `默认模型（档案）：${cur}`
+async function loadRoleLists() {
+  for (const role of Object.keys(ROLE_META)) roleLists[role] = { models: [], count: -1, current: '' }
+  renderRoleCards()
+  // 三角色并行从 API 拉可用模型列表（每卡自带 chips）
+  await Promise.all(Object.keys(ROLE_META).map(async (role) => {
+    try {
+      const r = await fetch(`${API}/api/roles/model/list`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ role }) }).then((x) => x.json())
+      roleLists[role] = { models: r.models || [], count: Array.isArray(r.models) ? r.models.length : 0, current: r.current || '' }
+    } catch { roleLists[role] = { models: [], count: -1, current: '' } }
+    renderRoleCards()
+  }))
+}
+function renderRoleCards() {
+  const box = document.getElementById('roleCards')
+  box.innerHTML = ''
+  for (const [role, meta] of Object.entries(ROLE_META)) {
+    const r = roleModels[role]
+    const m = r?.model
+    const list = roleLists[role]
+    const card = document.createElement('div')
+    card.style.cssText = `min-width:0;border-radius:10px;padding:14px 16px;border:1px solid ${role === roleOpTarget ? '#4fc3f7' : '#2c3542'};background:${role === roleOpTarget ? '#14283d' : '#1c222c'};display:flex;flex-direction:column;gap:8px;transition:all .15s`
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:12px;font-weight:700;color:${role === roleOpTarget ? '#4fc3f7' : '#d7dde4'}">${meta.cn}</span>
+        <span style="font-size:10px;color:#8b98a8">${meta.desc}</span>
+        <div style="margin-left:auto;display:flex;gap:4px">
+          <button data-role-edit="${role}" style="background:#1e3a5f;border:1px solid #2c3542;color:#4fc3f7;cursor:pointer;padding:1px 8px;font-size:10px;border-radius:3px">编辑</button>
+        </div>
+      </div>
+      <div style="font-size:12px;color:#8b98a8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(r?.profile || '')}">${esc(r?.profile || role)}</div>
+      <div style="font-size:11px;color:#66788a">${esc(m?.provider || '未配置 Provider')}</div>
+      <div style="font-size:11px;color:${list?.count === -1 ? '#f7a35c' : '#5cd67a'}">${list?.count === undefined ? '…' : list.count === -1 ? '模型拉取失败' : `${list.count} 个可用模型`}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px;min-height:22px"></div>
+    `
+    box.appendChild(card)
+    // 渲染该角色模型 chips
+    const mc = card.lastElementChild
+    if (!list || !list.models.length) {
+      mc.innerHTML = `<span style="font-size:10px;color:#5c6b7a">${list?.count === -1 ? '（拉取失败，点「编辑」配置端点/Key）' : '（无可用模型）'}</span>`
+    } else {
+      const curModel = list.current || m?.default
+      for (const id of list.models) {
+        const chip = document.createElement('button')
+        const active = id === curModel
+        chip.textContent = id
+        chip.title = active ? '当前模型' : `切换 ${meta.cn} → ${id}`
+        chip.style.cssText = `background:${active ? '#1e3a5f' : '#151a21'};border:1px solid ${active ? '#4fc3f7' : '#2c3542'};color:${active ? '#4fc3f7' : '#8b98a8'};cursor:pointer;padding:1px 8px;font-size:10px;border-radius:10px;font-family:'Cascadia Code',Consolas,monospace;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap`
+        chip.onclick = () => switchRoleModel(role, id)
+        mc.appendChild(chip)
       }
     }
-  } catch { /* 拉取失败忽略 */ }
-})()
-document.getElementById('btnLlmTest').onclick = async () => {
-  const idx = Number(document.getElementById('llmList').value)
-  const l = llms()[idx]
-  if (!l) { document.getElementById('llmState').textContent = '请先选择 LLM'; return }
-  const st = document.getElementById('llmState')
-  st.textContent = '测试中…'
-  const r = await fetch(`${API}/api/llm/test`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ baseUrl: l.baseUrl, apiKey: l.apiKey, model: l.model }) })
-  const j = await r.json()
-  st.textContent = j.ok ? `直连 OK（${j.model}）` : '直连失败: ' + (j.error || '')
-}
-renderLlms()
-// 首个 LLM 自动设为默认（迁移历史配置：hermes.model/baseUrl/apiKey/reasoning → llms[0]）
-if (!llms().length) {
-  const h = loadSettings().hermes || {}
-  if (h.baseUrl || h.model) {
-    saveLlms([{ name: h.model || 'LLM-1', baseUrl: h.baseUrl || '', apiKey: h.apiKey || '', model: h.model || '', reasoning: h.reasoning || '', isDefault: true }])
-    renderLlms()
   }
+  // 绑定卡内编辑（stopPropagation 防误触其他）
+  document.querySelectorAll('[data-role-edit]').forEach((b) => { b.onclick = (e) => { e.stopPropagation(); openRoleEdit(b.dataset.roleEdit) } })
 }
+async function switchRoleModel(role, model) {
+  try {
+    const r = await fetch(`${API}/api/roles/model`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ role, model }) })
+    const j = await r.json()
+    if (!r.ok) throw new Error(j.error || '切换失败')
+    // 成功不显示提示（静默切换，卡片高亮即反馈）
+    if (roleModels[role]?.model) roleModels[role].model.default = model
+    if (roleLists[role]) roleLists[role].current = model
+    renderRoleCards()
+  } catch (e) { document.getElementById('roleOpState').textContent = '切换失败: ' + e.message }
+}
+function openRoleEdit(role) {
+  roleOpTarget = role
+  renderRoleCards()
+  const m = roleModels[role]?.model
+  document.getElementById('roleEditTitle').textContent = `${ROLE_META[role].cn}（${roleModels[role]?.profile || role}）`
+  document.getElementById('roleEditProvider').value = m?.provider || ''
+  document.getElementById('roleEditBase').value = m?.base_url || ''
+  document.getElementById('roleEditKey').value = ''
+  document.getElementById('roleEditModel').value = m?.default || ''
+  document.getElementById('roleEditReasoning').value = m?.reasoning || ''
+  document.getElementById('roleEditModal').style.display = 'flex'
+}
+document.getElementById('btnRoleEditCancel').onclick = () => { document.getElementById('roleEditModal').style.display = 'none' }
+document.getElementById('btnRoleEditSave').onclick = async () => {
+  const st = document.getElementById('roleOpState')
+  const role = roleOpTarget
+  const body = {
+    role,
+    model: document.getElementById('roleEditModel').value.trim(),
+    provider: document.getElementById('roleEditProvider').value.trim(),
+    baseUrl: document.getElementById('roleEditBase').value.trim(),
+    apiKey: document.getElementById('roleEditKey').value.trim(),
+    reasoning: document.getElementById('roleEditReasoning').value,
+  }
+  if (!body.model) { st.textContent = '模型名必填'; return }
+  st.textContent = `保存 ${ROLE_META[role].cn} 配置…`
+  try {
+    const r = await fetch(`${API}/api/roles/model`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const j = await r.json()
+    if (!r.ok) throw new Error(j.error || '保存失败')
+    st.textContent = `已保存 ${ROLE_META[role].cn} → ${body.model}`
+    document.getElementById('roleEditModal').style.display = 'none'
+    document.getElementById('roleEditKey').value = ''
+    loadRoleModels()
+  } catch (e) { st.textContent = '保存失败: ' + e.message }
+}
+loadRoleModels()
 
-// ---- AI 助手（对接 kali Hermes gateway，事件流渲染参考 hermes desktop 消息流） ----
 // ---- SSH 终端 ----
 const term = new Terminal({ cursorBlink: true, fontSize: 13, theme: { background: '#111418', foreground: '#d7dde4' } })
 term.open(document.getElementById('term'))
@@ -2865,3 +2933,76 @@ document.getElementById('btnProjNew').onclick = async () => {
 
 // 启动时恢复当前项目的聊天历史（Hermes Agent 对话框持久化）
 loadChatHistory()
+
+// ---- 操作日志（终端风格面板：Agent 渗透/流量分析/WebShell 操作实时刷屏） ----
+const logTerm = document.getElementById('logTerminal')
+let logSeq = 0          // 增量游标（后端 seq 单调递增）
+let logFollow = true    // 自动跟随底部（用户上滚时暂停）
+const LOG_COLOR = { info: '#8b98a8', ok: '#5cd67a', warn: '#f7a35c', err: '#f76b6b' }
+function fmtLogTime(ts) {
+  const d = new Date(ts)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+function appendLog(it) {
+  if (!it || it.seq <= logSeq) return  // 去重（SSE 与轮询可能重复投递）
+  logSeq = it.seq
+  const line = document.createElement('div')
+  line.style.cssText = 'white-space:pre-wrap;word-break:break-all'
+  const c = LOG_COLOR[it.level] || '#8b98a8'
+  line.innerHTML = `<span style="color:#3d4a57">[${fmtLogTime(it.ts)}]</span> <span style="color:${c}">${esc(it.msg)}</span>`
+  logTerm.appendChild(line)
+  while (logTerm.children.length > 2000) logTerm.removeChild(logTerm.firstChild)  // 防内存增长
+  if (logFollow) logTerm.scrollTop = logTerm.scrollHeight
+}
+async function loadLogs() {
+  try {
+    const r = await fetch(`${API}/api/logs?after=${logSeq}&limit=300`).then((x) => x.json())
+    for (const it of (r.items || [])) appendLog(it)
+    logSeq = Math.max(logSeq, r.seq || 0)
+  } catch { /* 日志拉取失败下次再试 */ }
+}
+logTerm.addEventListener('scroll', () => {
+  logFollow = logTerm.scrollTop + logTerm.clientHeight >= logTerm.scrollHeight - 40
+})
+document.getElementById('btnLogPause').onclick = () => {
+  logFollow = !logFollow
+  document.getElementById('btnLogPause').textContent = logFollow ? '暂停' : '跟随'
+  if (logFollow) logTerm.scrollTop = logTerm.scrollHeight
+}
+document.getElementById('btnLogClear').onclick = () => { logTerm.innerHTML = ''; logSeq = 0 }
+// 切到日志面板时拉取增量（面板常驻也可由 SSE 实时追加）
+document.querySelector('nav button[data-panel="logs"]').addEventListener('click', () => loadLogs())
+
+// ---- 渗透审批模式切换（智能=Agent 审批渗透意见与流量；手动=仅审计流量，不自动发送意见卡） ----
+const btnApproval = document.getElementById('btnApprovalMode')
+let approvalMode = null  // 未加载完成前保守：不自动渗透（意见卡走用户决策），加载后按后端实际值
+function renderApprovalBtn() {
+  const smart = approvalMode === 'smart'
+  btnApproval.textContent = `渗透审批: ${smart ? '智能' : '手动'}`
+  btnApproval.style.background = smart ? '#1e3a5f' : '#3a2d1e'
+  btnApproval.style.color = smart ? '#4fc3f7' : '#f7a35c'
+  btnApproval.title = smart ? '智能：Agent 审批渗透意见与流量（自动意见卡 + 执行前审批）' : '手动：仅审计渗透流量，不自动发送意见卡（规则拦截仍生效）'
+}
+async function loadApprovalMode() {
+  try { const r = await fetch(`${API}/api/approval/mode`).then((x) => x.json()); approvalMode = r.mode === 'manual' ? 'manual' : 'smart' } catch { /* 保持默认 */ }
+  renderApprovalBtn()
+}
+btnApproval.onclick = async () => {
+  approvalMode = approvalMode === 'smart' ? 'manual' : 'smart'
+  try { await fetch(`${API}/api/approval/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: approvalMode }) }) } catch { /* 切换失败下次重试 */ }
+  renderApprovalBtn()
+}
+loadApprovalMode()
+
+// ---- 意见卡自动渗透（被动 + 智能审批）：子 Agent 槽位渗透（/api/penetrate）——全自动模式无子 Agent 分析/意见卡，渗透纯由 /pentest 指令驱动主 Agent ----
+async function autoPenetrate(f) {
+  if (autoPenRunning) return  // 串行：一次只跑一个自动渗透
+  autoPenRunning = true
+  const msg = addAiMsg('ai', `🤖 子 Agent 自动渗透：${(f.advice || '').slice(0, 60)}…`, false)
+  try {
+    const r = await fetch(`${API}/api/penetrate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ advice: f.advice, slot: f.slot, id: f.id }) }).then((x) => x.json())
+    if (!r.started) msg.textContent = r.blocked ? `⛔ 自动渗透被审批拦截：${r.reason || ''}` : (r.reply || '自动渗透未启动')
+  } catch (e) { msg.textContent = '自动渗透失败：' + e.message }
+  autoPenRunning = false
+}

@@ -93,6 +93,10 @@ app.whenReady().then(async () => {
     webPreferences: { contextIsolation: true, nodeIntegration: false, preload: join(app.getAppPath(), 'electron', 'preload.js') },
   })
   win.on('close', () => { try { ApiServer.saveWinBounds(win!.getBounds()) } catch { /* 保存失败不影响退出 */ } })  // 记住窗口状态
+  // 诊断：捕获渲染器 console 错误（临时排查用）
+  win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    if (level >= 2) console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`)
+  })
   Menu.setApplicationMenu(null)  // 彻底移除默认菜单栏（File/Edit/View/Window）
   // 项目管理：保存项目 → 弹系统保存对话框选择路径/自定义文件名（renderer 经 preload invoke）
   ipcMain.handle('save-project-dialog', async (e, defaultPath?: string) => {
