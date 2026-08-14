@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { connect } from 'node:net'
-import { SOUL_PERSONA, USER_PROFILE } from './persona.ts'
+import { SOUL_PERSONA, SOUL_ANALYZER, USER_PROFILE } from './persona.ts'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import v8 from 'node:v8'
@@ -132,8 +132,8 @@ export class ApiServer {
     this.graph.migrateLegacyNodes().catch((e) => console.error('[pentbox] 旧图数据迁移失败:', String(e).slice(0, 120)))
     this.loadSession()  // 类 Burp 项目恢复：默认项目文件存在则自动加载上次会话（含流量/漏洞/WebShell/配置）
     this.sessionTimer = setInterval(() => this.queueSessionSave(), ApiServer.SESSION_AUTOSAVE_MS)  // Burp auto-save：定时异步快照
-    void this.ensureHermesProfile()  // 自动确保 hermespentbox 独立档案（含 persona/用户画像）
-    setTimeout(() => this.ensureSkills(), 3000)  // 档案就绪后确保内置红队技能库（102 技能）
+    void this.ensureHermesProfile()  // 自动确保 hermespentbox 独立档案（含 persona/用户画像；技能库在档案就绪后同步复制）
+    void this.ensureAnalyzerProfile()  // 自动确保 hermespentbox-analyzer 审计员档案（流量分析子 Agent 专用）
     this.startAnalyzeLoop()
     this.server = createServer((req, res) => void this.handle(req, res))
     await new Promise<void>((resolve, reject) => {
@@ -250,7 +250,7 @@ export class ApiServer {
     if (!found) { console.warn('[pentbox] pentbox_bridge.py 未找到，steer/对话桥接不可用'); return false }
     console.log('[pentbox] 启动 Agent Bridge broker…', found)
     this.bridgeProc = spawn(py, [found, '--port', String(this.bridgePort), '--hermes-home', this.hermesHome], {
-      env: { ...process.env, HERMES_HOME: this.hermesHome, HERMES_AGENT_ROOT: join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent'), PENTBOX_BRIDGE_LOG: join(process.cwd(), 'core', 'pentbox_bridge.log') }, cwd: this.agentCwd, detached: true, stdio: 'ignore', windowsHide: true,
+      env: { ...process.env, HERMES_HOME: this.hermesHome, PENTBOX_ANALYZER_HOME: this.analyzerHome, HERMES_AGENT_ROOT: join(homedir(), 'AppData', 'Local', 'hermes', 'hermes-agent'), PENTBOX_BRIDGE_LOG: join(process.cwd(), 'core', 'pentbox_bridge.log') }, cwd: this.agentCwd, detached: true, stdio: 'ignore', windowsHide: true,
     })
     this.bridgeProc.on('exit', () => { this.bridgeProc = null; this.bridgeReady = false })
     this.bridgeProc.unref()
@@ -345,8 +345,9 @@ export class ApiServer {
   }
 
   /** 通用 Agent Bridge 单轮对话（分析/渗透/沟通/主对话共用）：
-   * 无会话则新建（persist）；有则续传。返回完整回复文本。 */
-  private bridgeAsk(input: string, sessionId: string | null, opts: { onDelta?: (t: string) => void; onDone?: (sid: string, reply: string) => void; onSid?: (sid: string) => void; onTool?: (ev: { type: string; tool: string; preview: string }) => void; onError?: (msg: string) => void; onAbort?: (stop: () => void) => void } = {}, mainChat = false): Promise<string> {
+   * 无会话则新建（persist）；有则续传。返回完整回复文本。
+   * profile 决定会话使用的档案（'hermespentbox' 主档案 / 'hermespentbox-analyzer' 审计员档案——流量分析子 Agent 专用） */
+  private bridgeAsk(input: string, sessionId: string | null, opts: { onDelta?: (t: string) => void; onDone?: (sid: string, reply: string) => void; onSid?: (sid: string) => void; onTool?: (ev: { type: string; tool: string; preview: string }) => void; onError?: (msg: string) => void; onAbort?: (stop: () => void) => void } = {}, mainChat = false, profile = 'hermespentbox'): Promise<string> {
     return new Promise((resolve, reject) => {
       this.ensureBridge().then(async () => {
         try {
@@ -359,7 +360,7 @@ export class ApiServer {
             if (mainChat) this.chatSessionId = sid
           }
           opts.onSid?.(sid)  // 尽早通知会话 id（前端运行中 steer 需要）
-          const started = await this.bridge.chat(sid, input, 'hermespentbox')
+          const started = await this.bridge.chat(sid, input, profile)
           if (!started?.ok) return reject(new Error('bridge 对话启动失败'))
           // 会话已在运行（并发/串话）：等待当前 run 完成后自动续发（同 session 串行），避免丢失消息
           if (started.status === 'already_running') {
@@ -374,7 +375,7 @@ export class ApiServer {
                 } catch { clearInterval(iv); res() }
               }, 300)
             })
-            return this.bridgeAsk(input, sid, opts)  // 递归：上一轮完成后重发本条
+            return this.bridgeAsk(input, sid, opts, mainChat, profile)  // 递归：上一轮完成后重发本条（保持 profile/会话归属）
           }
           const runId = started.run_id
           let out = ''
@@ -386,12 +387,12 @@ export class ApiServer {
           // 避免分析槽/前端状态永久"分析中"（broker 端还有 240s watchdog 双保险）
           const timer = setTimeout(() => {
             if (!finished) {
-              this.bridge.interrupt(sid, undefined, 'hermespentbox').catch((e) => console.warn('[pentbox] bridge 中断失败:', String(e).slice(0, 100)))
+              this.bridge.interrupt(sid, undefined, profile).catch((e) => console.warn('[pentbox] bridge 中断失败:', String(e).slice(0, 100)))
               finish(new Error(`Agent 响应超时（180s），已自动中断`))
             }
           }, 180_000)
           const finish = (err?: Error) => { if (finished) return; finished = true; clearTimeout(timer); err ? reject(err) : resolve(out) }
-          opts.onAbort?.(() => { this.bridge.interrupt(sid, undefined, 'hermespentbox').catch((e) => console.warn('[pentbox] bridge 中断失败:', String(e).slice(0, 100))); setTimeout(finish, 1500) })
+          opts.onAbort?.(() => { this.bridge.interrupt(sid, undefined, profile).catch((e) => console.warn('[pentbox] bridge 中断失败:', String(e).slice(0, 100))); setTimeout(finish, 1500) })
           // 轮询 get_output（100ms 间隔）直到 done；delta 增量 + 工具进度转发
           const pump = async () => {
             while (!finished) {
@@ -511,10 +512,13 @@ export class ApiServer {
   /** 渗透执行窗口：期间经代理的流量直接标记跳过（不再次送子 Agent 审计，防循环） */
   private penetrating = false
 
+  /** 流量分析子 Agent 独立档案（hermespentbox-analyzer）：审计员 persona + 用户画像 + 红队技能库，与主档案的「猎隼」角色分离 */
+  private analyzerHome = join(homedir(), 'AppData', 'Local', 'hermes', 'profiles', 'hermespentbox-analyzer')
+
   /** 确保独立档案存在：无 hermespentbox 档案则自动创建（clone 配置保留模型）并写入猎隼 persona + 用户画像 */
   private async ensureHermesProfile(): Promise<void> {
     try {
-      if (existsSync(join(this.hermesHome, 'SOUL.md'))) return  // 档案已就绪
+      if (existsSync(join(this.hermesHome, 'SOUL.md'))) { this.ensureSkills(this.hermesHome); return }  // 档案已就绪，兜底补技能库
       console.log('[pentbox] hermespentbox 档案不存在，自动创建…')
       await new Promise<void>((resolve) => {
         const child = spawn(this.hermesCli, ['profile', 'create', 'hermespentbox', '--clone'], { env: this.hermesEnv, cwd: this.agentCwd, windowsHide: true })
@@ -524,23 +528,45 @@ export class ApiServer {
       writeFileSync(join(this.hermesHome, 'SOUL.md'), SOUL_PERSONA)
       mkdirSync(join(this.hermesHome, 'memories'), { recursive: true })
       writeFileSync(join(this.hermesHome, 'memories', 'user.md'), USER_PROFILE)
+      this.ensureSkills(this.hermesHome)  // 档案就绪后立即复制技能库（不再盲等 setTimeout）
       console.log('[pentbox] hermespentbox 档案创建完成（SOUL.md + memories/user.md）')
     } catch (e) {
       console.error('[pentbox] 档案创建失败:', String(e).slice(0, 200))
     }
   }
 
-  /** 确保内置红队技能库就位：档案 skills 无 hacker-* 技能时，从应用内置 assets/hack-skills 复制（102 个技能） */
-  private ensureSkills(): void {
+  /** 确保流量审计员档案（hermespentbox-analyzer）存在：审计员 persona + 用户画像 + 红队技能库（分析判断需识别攻击手法） */
+  private async ensureAnalyzerProfile(): Promise<void> {
     try {
-      const dst = join(this.hermesHome, 'skills')
-      if (existsSync(join(dst, 'hacker-web-injection'))) return  // 已就位
+      if (existsSync(join(this.analyzerHome, 'SOUL.md'))) { this.ensureSkills(this.analyzerHome); return }  // 已就绪，兜底补技能库
+      console.log('[pentbox] hermespentbox-analyzer 档案不存在，自动创建…')
+      await new Promise<void>((resolve) => {
+        const child = spawn(this.hermesCli, ['profile', 'create', 'hermespentbox-analyzer', '--clone'], { env: this.hermesEnv, cwd: this.agentCwd, windowsHide: true })
+        child.on('close', () => resolve())
+      })
+      mkdirSync(this.analyzerHome, { recursive: true })
+      writeFileSync(join(this.analyzerHome, 'SOUL.md'), SOUL_ANALYZER)
+      mkdirSync(join(this.analyzerHome, 'memories'), { recursive: true })
+      writeFileSync(join(this.analyzerHome, 'memories', 'user.md'), USER_PROFILE)
+      this.ensureSkills(this.analyzerHome)  // 档案就绪后立即复制技能库
+      console.log('[pentbox] hermespentbox-analyzer 档案创建完成（审计员 SOUL + user.md + 技能库）')
+    } catch (e) {
+      console.error('[pentbox] 审计员档案创建失败:', String(e).slice(0, 200))
+    }
+  }
+
+  /** 确保内置红队技能库就位（复制到指定档案）：skills 无 hacker-* 技能时，从应用内置 assets/hack-skills 复制（102 个技能） */
+  private ensureSkills(home = this.hermesHome): void {
+    try {
+      const dst = join(home, 'skills')
+      // 已就位判定：技能位于类别子目录下（如 skills/web-injection/hacker-sqli-sql-injection）
+      if (existsSync(join(dst, 'web-injection', 'hacker-sqli-sql-injection'))) return
       const src = join(process.cwd(), 'assets', 'hack-skills')
       if (!existsSync(src)) { console.warn('[pentbox] 内置技能库缺失:', src); return }
       const { cpSync } = require('node:fs') as typeof import('node:fs')
       mkdirSync(dst, { recursive: true })
       cpSync(src, dst, { recursive: true })
-      console.log('[pentbox] 内置红队技能库已就位（102 技能）')
+      console.log(`[pentbox] 内置红队技能库已就位（102 技能 → ${home}）`)
     } catch (e) {
       console.error('[pentbox] 技能库复制失败:', String(e).slice(0, 200))
     }
@@ -594,11 +620,12 @@ export class ApiServer {
       const batch = this.graphBroadcastBuf.splice(0)
       if (!batch.length) return
       const text = `（图实时更新）Neo4j 情报图刚新增以下条目，供你更新认知（无需回复，勿中断当前工作）：\n${batch.join('\n')}`
-      const targets = new Set<string>()
-      if (this.chatSessionId) targets.add(this.chatSessionId)
-      for (const sid of this.analyzeSlots) if (sid) targets.add(sid)
-      for (const sid of targets) {
-        this.bridge.steer(sid, text, 'hermespentbox').catch((e) => console.warn('[pentbox] 图变更广播 steer 失败:', String(e).slice(0, 100)))
+      // 主 Agent 会话用主档案（hermespentbox）；分析槽会话在审计员档案（hermespentbox-analyzer）——profile 必须匹配，否则 broker 找不到对应会话
+      if (this.chatSessionId) {
+        this.bridge.steer(this.chatSessionId, text, 'hermespentbox').catch((e) => console.warn('[pentbox] 图变更广播 steer 失败:', String(e).slice(0, 100)))
+      }
+      for (const sid of this.analyzeSlots) {
+        if (sid) this.bridge.steer(sid, text, 'hermespentbox-analyzer').catch((e) => console.warn('[pentbox] 图变更广播 steer 失败:', String(e).slice(0, 100)))
       }
     }, 2000)
   }
@@ -740,9 +767,10 @@ ${out}`
     const slot = busy.indexOf(Math.min(...busy))
     this.slotBusy[slot]++
     const sid = this.analyzeSlots[slot]  // bridge 会话 id（首次 null → 自动新建）
+    // 流量分析子 Agent 走独立审计员档案（hermespentbox-analyzer：审计员 persona + 红队技能库），与主 Agent 猎隼角色分离
     return this.bridgeAsk(prompt, sid, {
       onDone: (newSid) => { this.analyzeSlots[slot] = newSid },
-    }).then((out) => {
+    }, false, 'hermespentbox-analyzer').then((out) => {
       this.slotBusy[slot]--
       const p = extractJson(out)
       const sens: { type: string; value: string; level: string }[] = Array.isArray(p?.sensitive) ? p.sensitive.filter((s: unknown) => s && typeof s === 'object' && (s as { value?: unknown }).value != null).map((s) => {
@@ -1293,13 +1321,13 @@ ${out}`
   private projectSessionPrefix(): string {
     return `pentbox-${this.projectKeyOf()}`
   }
-  /** 销毁离开项目的 Agent 会话（切换/新建项目时）：释放 bridge broker 会话（隔离 + 防 broker 内存累积） */
+  /** 销毁离开项目的 Agent 会话（切换/新建项目时）：释放 bridge broker 会话（隔离 + 防 broker 内存累积）——profile 与各会话归属档案匹配 */
   private destroyAgentSessions(): void {
-    const sids = new Set<string>()
-    if (this.chatSessionId) sids.add(this.chatSessionId)
-    for (const s of this.analyzeSlots) if (s) sids.add(s)
-    for (const sid of sids) {
-      this.bridge.destroy(sid, 'hermespentbox').catch((e) => console.warn('[pentbox] 会话销毁失败:', String(e).slice(0, 100)))  // broker action:destroy（释放 AIAgent）
+    if (this.chatSessionId) {
+      this.bridge.destroy(this.chatSessionId, 'hermespentbox').catch((e) => console.warn('[pentbox] 会话销毁失败:', String(e).slice(0, 100)))
+    }
+    for (const s of this.analyzeSlots) {
+      if (s) this.bridge.destroy(s, 'hermespentbox-analyzer').catch((e) => console.warn('[pentbox] 会话销毁失败:', String(e).slice(0, 100)))
     }
   }
 
@@ -2508,7 +2536,7 @@ ${out}`
           const sid = this.analyzeSlots[slot]
           await this.ensureBridge()
           if (!sid || !this.bridgeReady) { this.json(res, 200, { accepted: false, status: 'rejected' }); break }
-          this.json(res, 200, await this.bridge.steer(sid, body.text, 'hermespentbox'))
+          this.json(res, 200, await this.bridge.steer(sid, body.text, 'hermespentbox-analyzer'))  // 分析槽会话在审计员档案
           break
         }
         // ---------------- 取消渗透任务（杀对应子 Agent 进程） ----------------

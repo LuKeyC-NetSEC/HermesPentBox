@@ -276,22 +276,34 @@ class AgentSession:
 
 
 class PentboxBridge:
-    def __init__(self, hermes_home: str, port: int):
+    def __init__(self, hermes_home: str, port: int, analyzer_home: str = ""):
         self.hermes_home = hermes_home
+        self.analyzer_home = analyzer_home or os.path.join(
+            os.path.dirname(os.path.dirname(hermes_home)), "hermespentbox-analyzer"
+        )
         self.port = port
-        self.sessions: dict[str, AgentSession] = {}
+        self.sessions: dict[tuple[str, str], AgentSession] = {}
         self.sessions_lock = threading.Lock()
 
-    def _get_session(self, session_id: str) -> AgentSession:
+    def _home_for(self, profile: str) -> str:
+        """profile → 档案目录：hermespentbox-analyzer 用独立审计员档案，其余用主档案"""
+        if profile == "hermespentbox-analyzer":
+            return self.analyzer_home
+        return self.hermes_home
+
+    def _get_session(self, session_id: str, hermes_home: str) -> AgentSession:
+        key = (session_id, hermes_home)
         with self.sessions_lock:
-            if session_id not in self.sessions:
-                self.sessions[session_id] = AgentSession(session_id, self.hermes_home)
-            return self.sessions[session_id]
+            if key not in self.sessions:
+                self.sessions[key] = AgentSession(session_id, hermes_home)
+            return self.sessions[key]
 
     def handle(self, req: dict) -> dict:
         action = req.get("action", "")
         sid = str(req.get("session_id") or "")
         text = str(req.get("text") or "")
+        # profile 决定该会话使用的档案（同 sid 不同档案相互独立）
+        hermes_home = self._home_for(str(req.get("profile") or ""))
 
         if action == "ping":
             return {"ok": True, "pong": True, "time": time.time(), "mode": "pentbox-bridge", "sessions": len(self.sessions)}
@@ -299,47 +311,48 @@ class PentboxBridge:
         if action == "chat":
             if not sid:
                 return {"ok": False, "error": "session_id required"}
-            return self._get_session(sid).start_chat(req.get("message"))
+            return self._get_session(sid, hermes_home).start_chat(req.get("message"))
 
         if action == "get_output":
             sid = str(req.get("session_id") or "")
             # 兼容：仅传 run_id 时按 run_id 反查 session
             if not sid:
                 run_id = str(req.get("run_id") or "")
-                for _s in list(self.sessions.values()):
-                    if _s.run_id == run_id:
-                        sid = _s.session_id
+                for (_s, _h), _sess in list(self.sessions.items()):
+                    if _sess.run_id == run_id:
+                        sid = _s
+                        hermes_home = _h
                         break
             if not sid:
                 return {"ok": False, "error": "session_id required"}
             cursor = int(req.get("cursor") or 0)
-            return self._get_session(sid).get_output(cursor)
+            return self._get_session(sid, hermes_home).get_output(cursor)
 
         if action == "steer":
             if not sid or not text:
                 return {"ok": False, "error": "session_id and text required"}
-            return self._get_session(sid).steer(text)
+            return self._get_session(sid, hermes_home).steer(text)
 
         if action == "redirect":
             if not sid or not text:
                 return {"ok": False, "error": "session_id and text required"}
-            return self._get_session(sid).redirect(text)
+            return self._get_session(sid, hermes_home).redirect(text)
 
         if action == "status":
             if not sid:
                 return {"ok": False, "error": "session_id required"}
-            return self._get_session(sid).status()
+            return self._get_session(sid, hermes_home).status()
 
         if action == "interrupt":
             if not sid:
                 return {"ok": False, "error": "session_id required"}
-            return self._get_session(sid).interrupt(req.get("message"))
+            return self._get_session(sid, hermes_home).interrupt(req.get("message"))
 
         if action == "destroy":
             if not sid:
                 return {"ok": False, "error": "session_id required"}
             with self.sessions_lock:
-                self.sessions.pop(sid, None)
+                self.sessions.pop((sid, hermes_home), None)
             return {"ok": True}
 
         return {"ok": False, "error": f"unknown action: {action}"}
@@ -391,6 +404,7 @@ def main():
     parser = argparse.ArgumentParser(description="HermesPentBox Agent Bridge")
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--hermes-home", default="")
+    parser.add_argument("--analyzer-home", default="")
     args = parser.parse_args()
 
     home = args.hermes_home or os.environ.get("HERMES_HOME", "")
@@ -403,7 +417,7 @@ def main():
     if agent_root and agent_root not in sys.path:
         sys.path.insert(0, agent_root)
 
-    bridge = PentboxBridge(home, args.port)
+    bridge = PentboxBridge(home, args.port, args.analyzer_home or os.environ.get("PENTBOX_ANALYZER_HOME", ""))
     bridge.serve()
 
 
